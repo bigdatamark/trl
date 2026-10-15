@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Example script: GRPO against the SETA environment served over the Open Reward Standard via
+# trl.experimental.openreward.OpenRewardSpec, which supplies the train dataset, environment factory and reward
+# functions. Defaults to the "Eigent/SETA" openreward.ai catalog entry (needs OPENREWARD_API_KEY) or a URL to a
+# self-hosted Space. Main contents: parse_args, main. Import-time side effects: none beyond imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,6 +64,12 @@ from trl.experimental.openreward import OpenRewardSpec
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Behavior: argparse for model (Qwen/Qwen3-4B), target (catalog name or URL), split ("train"), task count (64),
+    # learning rate (5e-7), batch size (1), grad accumulation (1), generations (2), completion length (2048), max steps (5),
+    # max tool-calling iterations (20), vLLM mode/server URL/GPU memory fraction (0.3), output dir and comma-separated
+    # report_to (default "none").
+    # Inputs: command line. Outputs: Namespace. Exceptions: SystemExit on bad args. Side effects: may print usage.
     parser = argparse.ArgumentParser(description="GRPO training against the SETA ORS environment.")
 
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B")
@@ -90,6 +102,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: builds an OpenRewardSpec for target, task count and split; assembles GRPOConfig kwargs (thinking
+    # disabled, completion logging, vLLM always on, report_to parsed into a list without blanks/"none" or falling back to
+    # "none"); adds output_dir when given, GPU memory fraction in colocate mode or server URL in server mode; trains
+    # GRPOTrainer with the spec's dataset, environment factory and reward functions; calls trainer.end().
+    # Inputs: command line. Outputs: none. Exceptions: propagates network/training errors.
+    # Side effects: remote environment traffic, GPU training, logging, output files.
     args = parse_args()
 
     # One spec object — fans out into TRL's three slots.

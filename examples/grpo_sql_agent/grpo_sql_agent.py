@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Example script: GRPO training of a tool-using SQL agent on BioGRID yes/no questions ("Does the gene ..."). Under
+# the main guard: parses ScriptArguments/GRPOConfig/ModelConfig, downloads qgallouedec/biogrid and writes it into a
+# local SQLite file biogrid.db (table "interactions", spaces in column names replaced by underscores), loads and
+# filters qgallouedec/biogrid_qa, formats prompts, disables thinking and trains GRPOTrainer with the query_biogrid tool
+# and three rewards (correctness, structure, query quality), then saves, optionally pushes, and calls trainer.end().
+# Main contents: query_reward, correctness_reward, structure_reward, TimeoutError, timeout, query_biogrid,
+# format_example. Import-time side effects: none (the module-level TimeoutError shadows the builtin within this file).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +57,16 @@ from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser
 
 
 def query_reward(completions, answer, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: per completion, collects lowercased "sql_command" arguments from all tool calls and the content of all
+    # tool messages. Starts at 0: subtracts 1.5 if more than 3 queries; per query subtracts 1.0 if it contains "limit 1"
+    # and 0.5 if it lacks " where ", counting WHERE queries; adds 0.4 per WHERE query capped at 3. Evidence: if any tool
+    # result is a dict with "error", subtract 2.0; else if no queries, subtract 1.5; else if (results non-empty and answer
+    # "yes") or (results empty and answer "no") add 2.0, otherwise subtract 1.5. Only list-typed results count as hits.
+    # Inputs: completions (message lists), answer list, kwargs ignored. Outputs: list of floats.
+    # KNOWN ISSUE: the docstring says more than 2 queries are penalized and PRAGMA queries are penalized, but the code
+    # penalizes more than 3 queries and has no PRAGMA-specific check (PRAGMA only loses the missing-WHERE 0.5).
+    # Exceptions: AttributeError if tool call arguments are not a dict. Side effects: none.
     """
     Reward query strategy:
     - Penalize more than 2 queries
@@ -115,6 +134,11 @@ def query_reward(completions, answer, **kwargs):
 
 
 def correctness_reward(completions, answer, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: lowercases the last message's content and searches for "*yes*" or "*no*"; no match gives -0.5, a match
+    # equal to the lowercased answer gives +0.6, a wrong match -1.0.
+    # Inputs: completions, answer list, kwargs ignored. Outputs: list of floats. Exceptions: none expected.
+    # Side effects: none.
     """
     Reward Yes/No correctness.
     Model must provide final answer enclosed in stars — *yes* or *no*.
@@ -143,6 +167,11 @@ def correctness_reward(completions, answer, **kwargs):
 
 
 def structure_reward(completions, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: per completion, flags whether any assistant message has tool calls, any tool message exists, and any other
+    # message has non-empty content other than "<think>". Reward 0.1 for call plus response plus other content, 0.05 for
+    # call plus response only, -0.15 for a call without response, else 0.0.
+    # Inputs: completions, kwargs ignored. Outputs: list of floats. Exceptions: none expected. Side effects: none.
     """
     Reward proper assistant structure.
     Encourages a logical sequence: tool call + response + optional extra content.
@@ -185,6 +214,9 @@ def structure_reward(completions, **kwargs):
 # Database tool function
 # ------------------------
 class TimeoutError(Exception):
+    # [CLASS DOC]
+    # Module-local Exception subclass raised by the timeout context manager when the alarm fires (shadows the builtin
+    # TimeoutError in this module). No extra state or methods.
     """Raised when a function call times out."""
 
     pass
@@ -192,9 +224,19 @@ class TimeoutError(Exception):
 
 @contextmanager
 def timeout(seconds):
+    # [FUNCTION DOC]
+    # HELPER: Context manager enforcing a wall-clock limit with SIGALRM.
+    # Behavior: installs a SIGALRM handler that raises TimeoutError, schedules an alarm in seconds, yields, and always
+    # cancels the alarm on exit (the previous handler is not restored).
+    # Inputs: seconds (int). Outputs: generator used as a context manager.
+    # Exceptions: TimeoutError raised inside the block on timeout; ValueError if used outside the main thread.
+    # Side effects: replaces the process SIGALRM handler.
     """Context manager that raises TimeoutError if execution exceeds time limit."""
 
     def timeout_handler(signum, frame):
+        # [FUNCTION DOC]
+        # HELPER: Signal handler that raises TimeoutError mentioning the number of seconds.
+        # Inputs: signum, frame. Outputs: never returns. Exceptions: TimeoutError always. Side effects: none.
         raise TimeoutError(f"Operation timed out after {seconds} seconds")
 
     signal.signal(signal.SIGALRM, timeout_handler)
@@ -206,6 +248,12 @@ def timeout(seconds):
 
 
 def query_biogrid(sql_command: str) -> list[tuple]:
+    # [FUNCTION DOC]
+    # Tool: executes a SQL command against biogrid.db opened read-only via a URI, within a 5 s timeout, fetching all
+    # rows and always closing the connection.
+    # Inputs: sql_command. Outputs: list of row tuples.
+    # Exceptions: sqlite3 errors (including writes rejected by read-only mode) and TimeoutError propagate to the trainer.
+    # Side effects: reads the local database file; installs a SIGALRM handler.
     """
     Execute a read-only SQL command on the BioGRID database.
 
@@ -232,6 +280,11 @@ def query_biogrid(sql_command: str) -> list[tuple]:
 # Dataset formatting
 # ------------------------
 def format_example(example):
+    # [FUNCTION DOC]
+    # Behavior: builds a single user prompt: a dedented preamble describing the BioGRID interactions table, where gene
+    # names may appear (alias/alt-id columns with "|"-separated synonyms), schema-inspection hints, the required starred
+    # Yes/No answer format and the human taxid 9606, followed by "Question: <question>".
+    # Inputs: example with "question". Outputs: dict with "prompt". Exceptions: KeyError if missing. Side effects: none.
     question = example["question"]
     preamble = textwrap.dedent("""\
     You have access to the BioGRID SQLite database.

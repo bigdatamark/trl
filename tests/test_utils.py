@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Tests for the helpers in trl.trainer.utils: adapter switching (use_adapter), padding (pad), parameter hashing
+# (hash_module), model loading device maps (create_model_from_path), PEFT config creation (get_peft_config), callable
+# naming/async detection, nanstd, model card generation, flush_left, RepeatSampler and repeat_iterable_dataset,
+# entropy_from_logits, rich table printing (print_prompt_completions_sample), selective log-softmax (+entropy, with
+# temperature and row mask), sequence-dict shuffling/splitting, splitting/unsplitting VLM pixel values, the fused LM
+# head patch (add_fused_lm_head) for many tiny models, and FLOPs/MFU utilities.
+# Module-level data: _FUSED_LM_HEAD_MODEL_IDS, _FUSED_LM_HEAD_LOSS_MODEL_IDS and _FUSED_LM_HEAD_VLM_MODEL_IDS list tiny
+# test models (some gated on transformers version).
+# Import-time side effects: imports peft classes when available.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,7 +87,12 @@ if is_peft_available():
 
 @require_peft
 class TestUseAdapter(TrlTestCase):
+    # [CLASS DOC]
+    # Tests the use_adapter context manager on a tiny PEFT model (requires peft).
     def test_disables_on_none(self):
+        # [FUNCTION DOC]
+        # With adapter None, outputs inside the context equal the disable_adapter outputs (and differ from the
+        # enabled outputs, guarding the test's validity).
         model = AutoPeftModelForCausalLM.from_pretrained(
             "trl-internal-testing/tiny-PeftModel", adapter_name="my_adapter"
         )
@@ -93,6 +109,9 @@ class TestUseAdapter(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_restores_previous_adapter(self):
+        # [FUNCTION DOC]
+        # Entering and leaving use_adapter with the active adapter and with None leaves the model output unchanged
+        # afterwards (previous adapter restored).
         model = AutoPeftModelForCausalLM.from_pretrained(
             "trl-internal-testing/tiny-PeftModel", adapter_name="my_adapter"
         )
@@ -109,6 +128,9 @@ class TestUseAdapter(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_with_multiple_adapters(self):
+        # [FUNCTION DOC]
+        # Loads a second adapter; inside use_adapter for each name, outputs match those obtained by set_adapter for that
+        # adapter (the two adapters' outputs differ).
         model = AutoPeftModelForCausalLM.from_pretrained(
             "trl-internal-testing/tiny-PeftModel", adapter_name="my_adapter_1"
         )
@@ -133,7 +155,11 @@ class TestUseAdapter(TrlTestCase):
 
 
 class TestPad(TrlTestCase):
+    # [CLASS DOC]
+    # Tests pad on 1D/2D tensors: left/right padding, padding of inner dimensions, and pad_to_multiple_of.
     def test_pad_1_dim_left(self):
+        # [FUNCTION DOC]
+        # Two 1D tensors (lengths 3, 2) padded left with 0 stack to the expected 2x3 tensor.
         x = torch.tensor([1, 2, 3])
         y = torch.tensor([4, 5])
         output = pad((x, y), padding_value=0, padding_side="left")
@@ -141,6 +167,8 @@ class TestPad(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_pad_1_dim_right(self):
+        # [FUNCTION DOC]
+        # Same as the left case but zeros are appended on the right.
         x = torch.tensor([1, 2, 3])
         y = torch.tensor([4, 5])
         output = pad((x, y), padding_value=0, padding_side="right")
@@ -148,6 +176,8 @@ class TestPad(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_pad_2_dim_left(self):
+        # [FUNCTION DOC]
+        # 2D tensors with different first dimensions: the shorter is padded with a zero row at the top.
         x = torch.tensor([[1, 2], [3, 4]])
         y = torch.tensor([[5, 6]])
         output = pad((x, y), padding_value=0, padding_side="left")
@@ -160,6 +190,8 @@ class TestPad(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_pad_2_dim_right(self):
+        # [FUNCTION DOC]
+        # 2D tensors: the shorter is padded with a zero row at the bottom.
         x = torch.tensor([[1, 2], [3, 4]])
         y = torch.tensor([[5, 6]])
         output = pad((x, y), padding_value=0, padding_side="right")
@@ -172,6 +204,8 @@ class TestPad(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_pad_2_dim_right_multidim(self):
+        # [FUNCTION DOC]
+        # Right padding pads every dimension to the max shape (a 1x1 tensor becomes 2x2 with zeros).
         x = torch.tensor([[1, 2], [3, 4]])
         y = torch.tensor([[5]])
         output = pad((x, y), padding_value=0, padding_side="right")
@@ -184,6 +218,8 @@ class TestPad(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_pad_to_multiple_of_1(self):
+        # [FUNCTION DOC]
+        # Max length 3 padded right to a multiple of 4 gives width 4.
         x = torch.tensor([1, 2, 3])
         y = torch.tensor([4, 5])
         # Max length is 3, pad to multiple of 4
@@ -192,6 +228,8 @@ class TestPad(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_pad_to_multiple_of_2(self):
+        # [FUNCTION DOC]
+        # Max length 5 padded right to a multiple of 4 gives width 8.
         x = torch.tensor([1, 2, 3, 4, 5])
         y = torch.tensor([6, 7, 8])
         # Max length is 3, pad to multiple of 4
@@ -200,6 +238,8 @@ class TestPad(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_pad_to_multiple_of_side_left(self):
+        # [FUNCTION DOC]
+        # Max length 5 padded left to a multiple of 4 gives width 8 with leading zeros.
         x = torch.tensor([1, 2, 3, 4, 5])
         y = torch.tensor([6, 7, 8])
         # Max length is 3, pad to multiple of 4
@@ -208,6 +248,8 @@ class TestPad(TrlTestCase):
         assert torch.equal(output, expected)
 
     def test_pad_to_multiple_of_no_extra_padding(self):
+        # [FUNCTION DOC]
+        # Lengths already a multiple of 4 receive no extra padding.
         x = torch.tensor([1, 2, 3, 4])
         y = torch.tensor([5, 6, 7, 8])
         # Already multiple of 4
@@ -217,15 +259,28 @@ class TestPad(TrlTestCase):
 
 
 class TestHashModule(TrlTestCase):
+    # [CLASS DOC]
+    # Tests hash_module: independent of parameter registration order, sensitive to values and dtype, stable across
+    # loads, and changed by weight updates.
     def test_hash_module_deterministic_across_order(self):
+        # [FUNCTION DOC]
+        # Two modules registering the same parameters a and b in opposite order hash identically.
         class ModAB(torch.nn.Module):
+            # [CLASS DOC]
+            # HELPER: Module registering parameter a then b.
             def __init__(self, a: torch.Tensor, b: torch.Tensor):
+                # [FUNCTION DOC]
+                # HELPER: Registers parameters a and b (in that order) from the given tensors. Side effects: sets attributes.
                 super().__init__()
                 self.a = torch.nn.Parameter(a)
                 self.b = torch.nn.Parameter(b)
 
         class ModBA(torch.nn.Module):
+            # [CLASS DOC]
+            # HELPER: Module registering parameter b then a.
             def __init__(self, a: torch.Tensor, b: torch.Tensor):
+                # [FUNCTION DOC]
+                # HELPER: Registers parameters b and a (in that order) from the given tensors. Side effects: sets attributes.
                 super().__init__()
                 self.b = torch.nn.Parameter(b)
                 self.a = torch.nn.Parameter(a)
@@ -235,28 +290,44 @@ class TestHashModule(TrlTestCase):
         assert hash_module(ModAB(a, b)) == hash_module(ModBA(a, b))
 
     def test_hash_module_changes_with_value(self):
+        # [FUNCTION DOC]
+        # Modules whose single weight differs in one value hash differently.
         class Mod(torch.nn.Module):
+            # [CLASS DOC]
+            # HELPER: Module with one weight parameter holding the given value and 2.0.
             def __init__(self, value: float):
+                # [FUNCTION DOC]
+                # HELPER: Creates the weight parameter from value (float). Side effects: sets self.weight.
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.tensor([value, 2.0]))
 
         assert hash_module(Mod(1.0)) != hash_module(Mod(1.5))
 
     def test_hash_module_includes_dtype(self):
+        # [FUNCTION DOC]
+        # Same values in float32 vs float16 hash differently.
         class Mod(torch.nn.Module):
+            # [CLASS DOC]
+            # HELPER: Module with weight [1.0, 2.0] in the given dtype.
             def __init__(self, dtype: torch.dtype):
+                # [FUNCTION DOC]
+                # HELPER: Creates the weight parameter in dtype. Side effects: sets self.weight.
                 super().__init__()
                 self.weight = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=dtype))
 
         assert hash_module(Mod(torch.float32)) != hash_module(Mod(torch.float16))
 
     def test_hash_module_tiny_model_twice(self):
+        # [FUNCTION DOC]
+        # Two loads of the tiny GPT-OSS model hash identically.
         model_id = "trl-internal-testing/tiny-GptOssForCausalLM"
         model_a = AutoModelForCausalLM.from_pretrained(model_id)
         model_b = AutoModelForCausalLM.from_pretrained(model_id)
         assert hash_module(model_a) == hash_module(model_b)
 
     def test_hash_module_tiny_model_change_layer(self):
+        # [FUNCTION DOC]
+        # Adding 0.01 to lm_head weights in place changes the hash.
         model_id = "trl-internal-testing/tiny-GptOssForCausalLM"
         model = AutoModelForCausalLM.from_pretrained(model_id)
         h1 = hash_module(model)
@@ -267,8 +338,13 @@ class TestHashModule(TrlTestCase):
 
 
 class TestCreateModelFromPath(TrlTestCase):
+    # [CLASS DOC]
+    # Tests the default device_map chosen by create_model_from_path (PartialState and from_pretrained are patched).
     @pytest.mark.parametrize(("device_type", "expected_device_map"), [("cpu", None), ("mps", None), ("cuda", "auto")])
     def test_default_device_map(self, device_type, expected_device_map):
+        # [FUNCTION DOC]
+        # Parametrized over device type: cpu and mps give device_map None, cuda gives "auto"; asserted from the
+        # kwargs passed to the patched from_pretrained.
         with (
             patch.object(trainer_utils, "PartialState") as mock_state,
             patch.object(AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
@@ -278,6 +354,8 @@ class TestCreateModelFromPath(TrlTestCase):
         assert mock_from_pretrained.call_args.kwargs["device_map"] == expected_device_map
 
     def test_explicit_device_map_is_kept(self):
+        # [FUNCTION DOC]
+        # An explicit device_map="auto" is forwarded unchanged even on mps.
         with (
             patch.object(trainer_utils, "PartialState") as mock_state,
             patch.object(AutoModelForCausalLM, "from_pretrained") as mock_from_pretrained,
@@ -291,13 +369,20 @@ class TestCreateModelFromPath(TrlTestCase):
 
 @require_peft
 class TestGetPEFTConfig(TrlTestCase):
+    # [CLASS DOC]
+    # Tests get_peft_config from ModelConfig (requires peft).
     def test_create_peft_config_use_peft_false(self):
+        # [FUNCTION DOC]
+        # use_peft False returns None.
         """Test that when use_peft is False, the function returns None."""
         model_args = ModelConfig(use_peft=False)
         peft_config = get_peft_config(model_args)
         assert peft_config is None
 
     def test_create_peft_config_use_peft_true(self):
+        # [FUNCTION DOC]
+        # use_peft True with non-default LoRA settings returns a LoraConfig whose r, lora_alpha, lora_dropout,
+        # task_type, use_rslora, target_modules (as a set) and modules_to_save match the inputs.
         """Test that when use_peft is True, the function returns a LoraConfig object."""
         # Provide non-default values to the model config for testing
         peft_kwargs = {
@@ -324,96 +409,163 @@ class TestGetPEFTConfig(TrlTestCase):
 
 
 class TestGetCallableName(TrlTestCase):
+    # [CLASS DOC]
+    # Tests get_callable_name for functions, partials (nested too), callable instances (class name) and lambdas.
     def test_function(self):
+        # [FUNCTION DOC]
+        # A plain function returns its name.
         def accuracy_reward(completions):
+            # [FUNCTION DOC]
+            # HELPER: Dummy reward returning zeros, one per completion.
             return [0.0] * len(completions)
 
         assert get_callable_name(accuracy_reward) == "accuracy_reward"
 
     def test_partial(self):
+        # [FUNCTION DOC]
+        # A functools.partial returns the wrapped function's name.
         def reward(completions, threshold):
+            # [FUNCTION DOC]
+            # HELPER: Dummy reward with a threshold argument returning zeros.
             return [0.0] * len(completions)
 
         assert get_callable_name(functools.partial(reward, threshold=0.5)) == "reward"
 
     def test_nested_partial(self):
+        # [FUNCTION DOC]
+        # A partial of a partial still returns the innermost function's name.
         def reward(completions, threshold):
+            # [FUNCTION DOC]
+            # HELPER: Dummy reward with a threshold argument returning zeros.
             return [0.0] * len(completions)
 
         assert get_callable_name(functools.partial(functools.partial(reward), threshold=0.5)) == "reward"
 
     def test_callable_instance(self):
+        # [FUNCTION DOC]
+        # An instance with __call__ returns its class name.
         class LengthReward:
+            # [CLASS DOC]
+            # HELPER: Callable class used as a reward function.
             def __call__(self, completions):
+                # [FUNCTION DOC]
+                # HELPER: Returns zeros, one per completion.
                 return [0.0] * len(completions)
 
         assert get_callable_name(LengthReward()) == "LengthReward"
 
     def test_lambda(self):
+        # [FUNCTION DOC]
+        # A lambda returns "<lambda>".
         assert get_callable_name(lambda completions: [0.0] * len(completions)) == "<lambda>"
 
 
 class TestIsAsyncCallable(TrlTestCase):
+    # [CLASS DOC]
+    # Tests is_async_callable for sync/async functions, partials, and callable instances.
     def test_function(self):
+        # [FUNCTION DOC]
+        # A sync function is not async.
         def reward(completions):
+            # [FUNCTION DOC]
+            # HELPER: Sync dummy reward returning zeros.
             return [0.0] * len(completions)
 
         assert not is_async_callable(reward)
 
     def test_async_function(self):
+        # [FUNCTION DOC]
+        # An async function is async.
         async def reward(completions):
+            # [FUNCTION DOC]
+            # HELPER: Async dummy reward returning zeros.
             return [0.0] * len(completions)
 
         assert is_async_callable(reward)
 
     def test_partial(self):
+        # [FUNCTION DOC]
+        # A partial of an async function is async.
         async def reward(completions, threshold):
+            # [FUNCTION DOC]
+            # HELPER: Async dummy reward with threshold returning zeros.
             return [0.0] * len(completions)
 
         assert is_async_callable(functools.partial(reward, threshold=0.5))
 
     def test_callable_instance(self):
+        # [FUNCTION DOC]
+        # An instance with a sync __call__ is not async.
         class LengthReward:
+            # [CLASS DOC]
+            # HELPER: Class with a sync __call__.
             def __call__(self, completions):
+                # [FUNCTION DOC]
+                # HELPER: Returns zeros, one per completion.
                 return [0.0] * len(completions)
 
         assert not is_async_callable(LengthReward())
 
     def test_async_callable_instance(self):
+        # [FUNCTION DOC]
+        # An instance with an async __call__ is async.
         class LengthReward:
+            # [CLASS DOC]
+            # HELPER: Class with an async __call__.
             async def __call__(self, completions):
+                # [FUNCTION DOC]
+                # HELPER: Async; returns zeros, one per completion.
                 return [0.0] * len(completions)
 
         assert is_async_callable(LengthReward())
 
     def test_partial_of_async_callable_instance(self):
+        # [FUNCTION DOC]
+        # A partial wrapping an instance with async __call__ is async.
         class LengthReward:
+            # [CLASS DOC]
+            # HELPER: Class with an async __call__ taking a threshold.
             async def __call__(self, completions, threshold):
+                # [FUNCTION DOC]
+                # HELPER: Async; returns zeros, one per completion.
                 return [0.0] * len(completions)
 
         assert is_async_callable(functools.partial(LengthReward(), threshold=0.5))
 
 
 class TestNanStd(TrlTestCase):
+    # [CLASS DOC]
+    # Tests nanstd (NaN-ignoring unbiased standard deviation).
     def test_nanstd_ignores_nans(self):
+        # [FUNCTION DOC]
+        # [1, 2, 3, NaN] gives 1.0.
         x = torch.tensor([1.0, 2.0, 3.0, float("nan")])
         result = nanstd(x)
         torch.testing.assert_close(result, torch.tensor(1.0))
 
     def test_nanstd_dim_and_keepdim(self):
+        # [FUNCTION DOC]
+        # Along dim 1 with keepdim: a row with a single non-NaN value gives NaN; row [3, 5] gives sqrt(2).
         x = torch.tensor([[1.0, float("nan")], [3.0, 5.0]])
         result = nanstd(x, dim=1, keepdim=True)
         assert torch.isnan(result[0, 0])
         torch.testing.assert_close(result[1, 0], torch.tensor(1.4142135), rtol=1e-5, atol=1e-6)
 
     def test_nanstd_all_nan(self):
+        # [FUNCTION DOC]
+        # All-NaN input gives NaN.
         x = torch.tensor([float("nan"), float("nan")])
         result = nanstd(x)
         assert torch.isnan(result)
 
 
 class TestGenerateModelCard(TrlTestCase):
+    # [CLASS DOC]
+    # Tests generate_model_card text content with all fields set and with optional fields None.
     def test_full(self):
+        # [FUNCTION DOC]
+        # All fields set: asserts base model link, model name, pipeline snippet with hub id, dataset metadata, wandb/
+        # trackio/comet links, trainer name, bibtex citation block and paper link appear.
         model_card = generate_model_card(
             base_model="username/my_base_model",
             model_name="my_model",
@@ -441,6 +593,8 @@ class TestGenerateModelCard(TrlTestCase):
         assert "[My Paper](https://huggingface.co/papers/1234.56789)" in card_text
 
     def test_val_none(self):
+        # [FUNCTION DOC]
+        # Optional fields None: asserts model name, pipeline snippet and trainer name still appear.
         model_card = generate_model_card(
             base_model=None,
             model_name="my_model",
@@ -462,7 +616,12 @@ class TestGenerateModelCard(TrlTestCase):
 
 
 class TestFlushLeft(TrlTestCase):
+    # [CLASS DOC]
+    # Tests flush_left, which shifts each row left so the mask starts at column 0 and trims all-zero trailing columns,
+    # applying the same shift to the extra tensors.
     def test_basic_case(self):
+        # [FUNCTION DOC]
+        # Two rows with different left padding plus two tensors: asserts trimmed, left-aligned mask and tensors.
         mask = torch.tensor([[0, 0, 1, 1, 1], [0, 1, 1, 0, 0]])
         tensor1 = torch.tensor([[0, 0, 2, 3, 4], [0, 5, 6, 0, 0]])
         tensor2 = torch.tensor([[0, 0, 7, 8, 9], [0, 10, 11, 0, 0]])
@@ -477,6 +636,8 @@ class TestFlushLeft(TrlTestCase):
         assert torch.equal(new_tensor2, expected_tensor2)
 
     def test_single_row(self):
+        # [FUNCTION DOC]
+        # Single row is shifted left and trimmed.
         mask = torch.tensor([[0, 0, 1, 1]])
         tensor1 = torch.tensor([[0, 0, 2, 3]])
         new_mask, new_tensor1 = flush_left(mask, tensor1)
@@ -488,6 +649,8 @@ class TestFlushLeft(TrlTestCase):
         assert torch.equal(new_tensor1, expected_tensor1)
 
     def test_no_shift_needed(self):
+        # [FUNCTION DOC]
+        # Already left-aligned rows are only trimmed.
         mask = torch.tensor([[1, 1, 0, 0], [1, 0, 0, 0]])
         tensor1 = torch.tensor([[5, 6, 0, 0], [7, 0, 0, 0]])
         new_mask, new_tensor1 = flush_left(mask, tensor1)
@@ -499,6 +662,8 @@ class TestFlushLeft(TrlTestCase):
         assert torch.equal(new_tensor1, expected_tensor1)
 
     def test_no_tensors(self):
+        # [FUNCTION DOC]
+        # With only a mask, returns just the new mask (not a tuple).
         mask = torch.tensor([[0, 0, 1, 1, 1], [0, 1, 1, 0, 0]])
         new_mask = flush_left(mask)
         expected_mask = torch.tensor([[1, 1, 1], [1, 1, 0]])
@@ -506,7 +671,12 @@ class TestFlushLeft(TrlTestCase):
 
 
 class TestRepeatRandomSampler(TrlTestCase):
+    # [CLASS DOC]
+    # Tests RepeatSampler index order: mini_repeat_count (consecutive duplicates), batch_size/repeat_count (whole
+    # batch repetition), shuffling, and dropping incomplete batches (also reflected by len).
     def test_sampler(self):
+        # [FUNCTION DOC]
+        # mini_repeat_count 2: length doubles, all indices present, consecutive pairs equal.
         dataset = ["a", "b", "c", "d", "e", "f", "g"]
         sampler = RepeatSampler(dataset, mini_repeat_count=2)
         # Should output something like [4, 4, 3, 3, 0, 0, 1, 1, 2, 2, 6, 6, 5, 5]
@@ -519,6 +689,8 @@ class TestRepeatRandomSampler(TrlTestCase):
         assert all(sampled[i] == sampled[i + 1] for i in range(0, len(sampled), 2))
 
     def test_sampler_no_shuffle(self):
+        # [FUNCTION DOC]
+        # shuffle False gives 0,0,1,1,...,6,6.
         dataset = ["a", "b", "c", "d", "e", "f", "g"]
         sampler = RepeatSampler(dataset, mini_repeat_count=2, shuffle=False)
         sampled = list(sampler)
@@ -526,6 +698,8 @@ class TestRepeatRandomSampler(TrlTestCase):
         assert sampled == expected
 
     def test_sampler_no_repeat(self):
+        # [FUNCTION DOC]
+        # mini_repeat_count 1: a permutation of all indices.
         dataset = ["a", "b", "c", "d", "e", "f", "g"]
         sampler = RepeatSampler(dataset, mini_repeat_count=1)
         # Should output something like [4, 3, 0, 1, 2, 6, 5]
@@ -536,6 +710,9 @@ class TestRepeatRandomSampler(TrlTestCase):
         assert set(sampled) == set(range(len(dataset)))
 
     def test_sampler_with_batch_size(self):
+        # [FUNCTION DOC]
+        # batch_size 2, repeat_count 2 on 8 items: length doubles, all indices present, and each 2-index batch is
+        # repeated (checked on the first element of each 4-index group).
         dataset = ["a", "b", "c", "d", "e", "f", "g", "h"]
         sampler = RepeatSampler(dataset, mini_repeat_count=1, batch_size=2, repeat_count=2)
         # Should output something like [4, 3, 4, 3, 0, 1, 0, 1, 2, 6, 2, 6, 5, 7, 5, 7]
@@ -548,6 +725,8 @@ class TestRepeatRandomSampler(TrlTestCase):
         assert all(sampled[i : i + 1] == sampled[i + 2 : i + 3] for i in range(0, len(sampled), 4))
 
     def test_sampler_with_batch_size_and_drop(self):
+        # [FUNCTION DOC]
+        # Same with 7 items: the leftover item is dropped, len matches, indices are a subset, batches repeat.
         dataset = ["a", "b", "c", "d", "e", "f", "g"]
         sampler = RepeatSampler(dataset, mini_repeat_count=1, batch_size=2, repeat_count=2)
         # Should output something like [4, 3, 4, 3, 0, 1, 0, 1, 2, 6, 2, 6]
@@ -563,6 +742,8 @@ class TestRepeatRandomSampler(TrlTestCase):
         assert all(sampled[i : i + 1] == sampled[i + 2 : i + 3] for i in range(0, len(sampled), 4))
 
     def test_sampler_with_mini_repeat_count_and_batch_size_1(self):
+        # [FUNCTION DOC]
+        # mini 2, batch 3, repeat 2 on 7 items: length 4 x 6, pairs equal, each 6-index block repeated.
         dataset = ["a", "b", "c", "d", "e", "f", "g"]
         sampler = RepeatSampler(dataset, mini_repeat_count=2, batch_size=3, repeat_count=2)
         # Should output something like [4, 4, 3, 3, 0, 0, 4, 4, 3, 3, 0, 0,
@@ -580,6 +761,8 @@ class TestRepeatRandomSampler(TrlTestCase):
         assert sampled[12:18] == sampled[18:24]
 
     def test_sampler_with_mini_repeat_count_and_batch_size_2(self):
+        # [FUNCTION DOC]
+        # mini 3, batch 2, repeat 2: length 6 x 6, triples equal, each 6-index block repeated.
         dataset = ["a", "b", "c", "d", "e", "f", "g"]
         sampler = RepeatSampler(dataset, mini_repeat_count=3, batch_size=2, repeat_count=2)
         # Should output something like [4, 4, 4, 3, 3, 3, 4, 4, 4, 3, 3, 3,
@@ -599,6 +782,8 @@ class TestRepeatRandomSampler(TrlTestCase):
         assert sampled[24:30] == sampled[30:36]
 
     def test_sampler_with_mini_repeat_count_and_batch_size_3(self):
+        # [FUNCTION DOC]
+        # mini 2, batch 2, repeat 3: length 6 x 6, pairs equal, each 4-index block repeated three times.
         dataset = ["a", "b", "c", "d", "e", "f", "g"]
         sampler = RepeatSampler(dataset, mini_repeat_count=2, batch_size=2, repeat_count=3)
         # Should output something like [4, 4, 3, 3, 4, 4, 3, 3, 4, 4, 3, 3,
@@ -618,12 +803,20 @@ class TestRepeatRandomSampler(TrlTestCase):
 
 
 class TestRepeatIterableDataset(TrlTestCase):
+    # [CLASS DOC]
+    # Tests repeat_iterable_dataset, the streaming counterpart of RepeatSampler for IterableDataset.
     @staticmethod
     def _make_dataset(n):
+        # [FUNCTION DOC]
+        # HELPER: Static method; IterableDataset yielding records with x = 0..n-1.
+        # Inputs: n (int). Outputs: IterableDataset. Side effects: none.
         return IterableDataset.from_generator(lambda: ({"x": i} for i in range(n)))
 
     @pytest.mark.parametrize("mini_repeat_count,batch_size,repeat_count", [(1, 1, 1), (2, 3, 4), (3, 2, 2), (2, 2, 3)])
     def test_matches_repeat_sampler(self, mini_repeat_count, batch_size, repeat_count):
+        # [FUNCTION DOC]
+        # Parametrized over (mini_repeat_count, batch_size, repeat_count): record order equals unshuffled RepeatSampler order
+        # for 12 items.
         # The streaming transform must yield records in exactly the same order as RepeatSampler yields indices for a
         # map-style dataset (unshuffled), across a representative range of arguments.
         n = 12
@@ -648,17 +841,23 @@ class TestRepeatIterableDataset(TrlTestCase):
         assert actual == expected
 
     def test_default_arguments(self):
+        # [FUNCTION DOC]
+        # mini_repeat_count 2 with defaults gives each record twice in order.
         dataset = self._make_dataset(4)
         sampled = [record["x"] for record in repeat_iterable_dataset(dataset, mini_repeat_count=2)]
         assert sampled == [0, 0, 1, 1, 2, 2, 3, 3]
 
     def test_drops_incomplete_batch(self):
+        # [FUNCTION DOC]
+        # batch_size 2 on 7 records drops the last one.
         dataset = self._make_dataset(7)
         sampled = [record["x"] for record in repeat_iterable_dataset(dataset, mini_repeat_count=1, batch_size=2)]
         # The last element is dropped because it can't form a full batch of size 2.
         assert sampled == [0, 1, 2, 3, 4, 5]
 
     def test_preserves_all_columns(self):
+        # [FUNCTION DOC]
+        # All columns of each record are kept in the repeats.
         dataset = IterableDataset.from_generator(lambda: ({"x": i, "answer": str(i)} for i in range(2)))
         sampled = list(repeat_iterable_dataset(dataset, mini_repeat_count=2))
         assert sampled == [
@@ -669,6 +868,8 @@ class TestRepeatIterableDataset(TrlTestCase):
         ]
 
     def test_repeats_are_independent_objects(self):
+        # [FUNCTION DOC]
+        # Repeats are distinct objects (deep copies): editing nested content of one does not affect the other.
         # Repeated records must be independent objects (like the map-style path, where the dataset re-materializes a
         # fresh object per access), so an in-place edit to one repeat doesn't corrupt the others.
         dataset = IterableDataset.from_generator(lambda: ({"prompt": [{"content": "hi"}]} for _ in range(1)))
@@ -679,6 +880,8 @@ class TestRepeatIterableDataset(TrlTestCase):
         assert sampled[1]["prompt"][-1]["content"] == "hi"
 
     def test_reshuffles_across_epochs(self):
+        # [FUNCTION DOC]
+        # With an upstream shuffle, set_epoch 0 and 1 give the same content in different orders.
         # The transform stays chained to the source, so `set_epoch` reaches an upstream `shuffle` and the order is
         # reshuffled every epoch, matching RepeatSampler (whose RNG advances on each `__iter__`).
         dataset = IterableDataset.from_generator(lambda: ({"x": i} for i in range(8))).shuffle(seed=42)
@@ -694,10 +897,15 @@ class TestRepeatIterableDataset(TrlTestCase):
 
 
 class TestEntropyFromLogits(TrlTestCase):
+    # [CLASS DOC]
+    # Tests entropy_from_logits against a direct softmax entropy for several shapes, chunk sizes and dtypes.
     @pytest.mark.parametrize("shape", [(768,), (32, 768), (8, 16, 768), (2, 4, 8, 768)])
     @pytest.mark.parametrize("chunk_size", [1, 16])
     @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
     def test_entropy_from_logits_2_dims(self, dtype, chunk_size, shape):
+        # [FUNCTION DOC]
+        # Random logits of the parametrized shape/dtype; reference entropy via softmax (float32/64) or log-softmax
+        # (half precision); asserts closeness within 1e-5 for chunk sizes 1 and 16.
         logits = torch.randn(*shape, dtype=dtype)
         if dtype in (torch.float64, torch.float32):
             p = logits.softmax(-1)
@@ -711,8 +919,13 @@ class TestEntropyFromLogits(TrlTestCase):
 
 @require_rich
 class TestPrintPromptCompletionsSample(TrlTestCase):
+    # [CLASS DOC]
+    # Tests the rich table printed by print_prompt_completions_sample (stdout patched to a StringIO). Requires rich.
     @patch("sys.stdout", new_callable=StringIO)
     def test_print_tool_only_assistant_with_null_content(self, mock_stdout):
+        # [FUNCTION DOC]
+        # An assistant message with content None, reasoning and a tool call prints the reasoning and never the text
+        # "None".
         completions = [
             [
                 {
@@ -735,6 +948,8 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_print_output(self, mock_stdout):
+        # [FUNCTION DOC]
+        # Text prompts/completions with two reward columns and advantages: exact expected table (values to 2 decimals).
         prompts = ["The sky is", "The sun is"]
         completions = [" blue.", " in the sky."]
         rewards = {"Correctness": [0.123, 0.456], "Format": [0.789, 0.101]}
@@ -762,6 +977,8 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_no_advantages(self, mock_stdout):
+        # [FUNCTION DOC]
+        # advantages None omits the Advantage column.
         # When `advantages` is None, the Advantage column is omitted (e.g. distillation, which has no advantages).
         prompts = ["The sky is", "The sun is"]
         completions = [" blue.", " in the sky."]
@@ -778,6 +995,8 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_no_rewards_no_advantages(self, mock_stdout):
+        # [FUNCTION DOC]
+        # Empty rewards and no advantages still prints Prompt and Completion columns.
         # Prompt/completion-only table: empty rewards and `advantages=None` (the distillation case).
         prompts = ["The sky is", "The sun is"]
         completions = [" blue.", " in the sky."]
@@ -792,6 +1011,8 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_extra_columns(self, mock_stdout):
+        # [FUNCTION DOC]
+        # extra columns are appended after Advantage; exact expected table.
         prompts = ["The sky is", "The sun is"]
         completions = [" blue.", " in the sky."]
         rewards = {"Correctness": [0.123, 0.456], "Format": [0.789, 0.101]}
@@ -820,6 +1041,8 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_num_samples(self, mock_stdout):
+        # [FUNCTION DOC]
+        # num_samples 1 prints exactly one randomly chosen row (either of two expected tables).
         prompts = ["A", "B"]
         completions = ["1", "2"]
         rewards = {"Score": [0.1, 0.2]}
@@ -855,6 +1078,8 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_print_messages(self, mock_stdout):
+        # [FUNCTION DOC]
+        # Conversational prompts/completions render role headers (SYSTEM, USER, ASSISTANT) with wrapped content; exact table.
         prompts = [
             [
                 {"role": "system", "content": "You are an helpful assistant."},
@@ -904,6 +1129,8 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_print_messages_with_tools(self, mock_stdout):
+        # [FUNCTION DOC]
+        # Tool-calling completions render tool calls as name(args) (truncated), TOOL messages and final ASSISTANT text.
         prompts = [
             [{"role": "user", "content": "What is the temperature in Paris?"}],
             [{"role": "user", "content": "What is the weather in London?"}],
@@ -968,6 +1195,8 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_print_messages_with_reasoning_content(self, mock_stdout):
+        # [FUNCTION DOC]
+        # reasoning_content is printed before the assistant content.
         prompts = [[{"role": "user", "content": "What color is the sky?"}]]
         completions = [[{"role": "assistant", "reasoning_content": "I think it is blue.", "content": "It is blue."}]]
         rewards = {"Score": [0.5]}
@@ -995,6 +1224,8 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_print_messages_with_thinking(self, mock_stdout):
+        # [FUNCTION DOC]
+        # A thinking field is printed like reasoning_content.
         prompts = [[{"role": "user", "content": "What color is the sky?"}]]
         completions = [[{"role": "assistant", "thinking": "I think it is blue.", "content": "It is blue."}]]
         rewards = {"Score": [0.5]}
@@ -1022,8 +1253,12 @@ class TestPrintPromptCompletionsSample(TrlTestCase):
 
 
 class TestSelectiveLogSoftmax(TrlTestCase):
+    # [CLASS DOC]
+    # Tests selective_log_softmax and selective_log_softmax_and_entropy against gather on log_softmax.
     @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
     def test_selective_log_softmax(self, dtype):
+        # [FUNCTION DOC]
+        # Per dtype: matches the reference (exactly for half precision, which uses the exact fallback; within 1e-5 otherwise).
         """Test selective_log_softmax with logits of different dtypes"""
         vocab_size = 1024
         batch_size = 4
@@ -1044,6 +1279,10 @@ class TestSelectiveLogSoftmax(TrlTestCase):
     # On an accelerator this takes the fused kernel, on CPU the torch path
     @pytest.mark.parametrize("device", ["cpu", pytest.param(torch_device, marks=require_torch_accelerator)])
     def test_temperature_and_row_mask(self, device):
+        # [FUNCTION DOC]
+        # On CPU (torch path) and on the accelerator (asserting the fused kernel is available and supported): with
+        # temperature 0.7 and a row mask, logprobs, entropy and logits gradients of logprobs + 0.1 entropy match a torch
+        # reference; masked rows get zero values and zero gradient.
         logits = torch.randn(2, 3, 257, device=device, requires_grad=True)
         index = torch.randint(257, (2, 3), device=device)
         row_mask = torch.tensor([[1, 0, 1], [0, 1, 1]], device=device, dtype=torch.bool)
@@ -1070,6 +1309,8 @@ class TestSelectiveLogSoftmax(TrlTestCase):
     @pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.float16, torch.bfloat16])
     @pytest.mark.parametrize("k", [1, 8])
     def test_selective_log_softmax_multi_index(self, dtype, k):
+        # [FUNCTION DOC]
+        # Index with k ids per position (k 1 or 8) returns shape (batch, seq, k) matching the reference per dtype.
         """Test selective_log_softmax with logits of different dtypes and index widths"""
         vocab_size = 1024
         batch_size = 4
@@ -1090,7 +1331,11 @@ class TestSelectiveLogSoftmax(TrlTestCase):
 
 
 class TestShuffleSequenceDict(TrlTestCase):
+    # [CLASS DOC]
+    # Tests shuffle_sequence_dict: same permutation across tensors and lists along dim 0; None values pass through.
     def test_shuffle_preserves_shape(self):
+        # [FUNCTION DOC]
+        # Shapes are unchanged.
         x = torch.arange(6).reshape(3, 2)
         y = torch.arange(3).reshape(3, 1)
         tensor_dict = {"x": x.clone(), "y": y.clone()}
@@ -1101,6 +1346,8 @@ class TestShuffleSequenceDict(TrlTestCase):
         assert shuffled["y"].shape == y.shape
 
     def test_shuffle_consistent_across_tensors(self):
+        # [FUNCTION DOC]
+        # Rows of x and y stay paired after shuffling.
         # Use known patterns to check alignment
         x = torch.tensor([[10, 11], [20, 21], [30, 31]])
         y = torch.tensor([[1], [2], [3]])
@@ -1123,6 +1370,8 @@ class TestShuffleSequenceDict(TrlTestCase):
                 pytest.fail("Unexpected x row in shuffled output.")
 
     def test_none_tensor_remains_none(self):
+        # [FUNCTION DOC]
+        # A None entry stays None.
         x = torch.arange(6).reshape(3, 2)
         tensor_dict = {"x": x.clone(), "y": None}
 
@@ -1132,6 +1381,8 @@ class TestShuffleSequenceDict(TrlTestCase):
         assert shuffled["x"].shape == x.shape
 
     def test_shuffle_with_list(self):
+        # [FUNCTION DOC]
+        # A Python list is permuted consistently with the tensor.
         x = torch.tensor([[10, 11], [20, 21], [30, 31]])
         y = ["a", "b", "c"]
 
@@ -1155,7 +1406,11 @@ class TestShuffleSequenceDict(TrlTestCase):
 
 
 class TestSplitTensorDict(TrlTestCase):
+    # [CLASS DOC]
+    # Tests split_tensor_dict into equal chunks along dim 0.
     def test_split_equal_chunks(self):
+        # [FUNCTION DOC]
+        # Chunks equal torch chunking of each tensor into 3.
         x = torch.arange(12).reshape(6, 2)
         y = torch.arange(6).reshape(6, 1)
         tensor_dict = {"x": x, "y": y}
@@ -1170,6 +1425,8 @@ class TestSplitTensorDict(TrlTestCase):
             assert torch.equal(result[i]["y"], expected_y_chunks[i])
 
     def test_with_none_tensor(self):
+        # [FUNCTION DOC]
+        # None values are copied as None into each chunk.
         x = torch.arange(12).reshape(6, 2)
         tensor_dict = {"x": x, "y": None}
 
@@ -1182,6 +1439,8 @@ class TestSplitTensorDict(TrlTestCase):
             assert result[i]["y"] is None
 
     def test_with_scalar(self):
+        # [FUNCTION DOC]
+        # 0-dim tensors are copied unchanged into each chunk.
         x = torch.arange(12).reshape(6, 2)
         tensor_dict = {"x": x, "y": torch.tensor(1)}
 
@@ -1195,7 +1454,12 @@ class TestSplitTensorDict(TrlTestCase):
 
 
 class TestSplitPixelValuesByGrid(TrlTestCase):
+    # [CLASS DOC]
+    # Tests split_pixel_values_by_grid, which turns flat batched image tensors into per-sample lists using
+    # image_grid_thw (patch counts), image_position_ids, num_tiles/spatial_shapes, or per-image indexing.
     def test_split_correctly_0(self):
+        # [FUNCTION DOC]
+        # Two samples with grids of 4 patches each split pixel rows 4/4 and grids 1/1.
         batch = {
             "image_grid_thw": torch.tensor([[1, 2, 2], [1, 2, 2]]),
             "num_images": [1, 1],
@@ -1212,6 +1476,8 @@ class TestSplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["image_grid_thw"][1], torch.tensor([[1, 2, 2]]))
 
     def test_split_correctly_1(self):
+        # [FUNCTION DOC]
+        # Grids of 4 and 8 patches split pixel rows 4/8.
         batch = {
             "image_grid_thw": torch.tensor([[1, 2, 2], [1, 2, 4]]),
             "num_images": [1, 1],
@@ -1228,11 +1494,15 @@ class TestSplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["image_grid_thw"][1], torch.tensor([[1, 2, 4]]))
 
     def test_missing_keys(self):
+        # [FUNCTION DOC]
+        # Without num_images the batch is returned unchanged.
         batch = {"pixel_values": torch.tensor([1.0])}
         result = split_pixel_values_by_grid(batch)
         assert result == batch
 
     def test_mismatched_length(self):
+        # [FUNCTION DOC]
+        # Pixel rows (3) not matching grid totals (4) raise ValueError.
         batch = {
             "image_grid_thw": torch.tensor([[1, 1, 2], [1, 2, 1]]),  # Total = 8
             "num_images": [1, 1],
@@ -1242,6 +1512,8 @@ class TestSplitPixelValuesByGrid(TrlTestCase):
             split_pixel_values_by_grid(batch)
 
     def test_multi_images(self):
+        # [FUNCTION DOC]
+        # num_images [1, 2] groups grids per sample; pixel rows split 2/6.
         batch = {
             "image_grid_thw": torch.tensor([[1, 1, 2], [1, 2, 2], [1, 2, 1]]),  # Total = 8
             "num_images": [1, 2],
@@ -1258,6 +1530,8 @@ class TestSplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["image_grid_thw"][1], torch.tensor([[1, 2, 2], [1, 2, 1]]))
 
     def test_split_by_image_position_ids(self):
+        # [FUNCTION DOC]
+        # Gemma-style (no grid): pixel_values and image_position_ids split per image count 1/2.
         # Gemma-style: no image_grid_thw, split by num_images using image_position_ids
         batch = {
             "num_images": [1, 2],
@@ -1275,6 +1549,8 @@ class TestSplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["image_position_ids"][1], batch["image_position_ids"][1:])
 
     def test_split_by_spatial_shapes(self):
+        # [FUNCTION DOC]
+        # Tiles per sample (3, 2) split pixel_values, pixel_attention_mask and spatial_shapes.
         batch = {
             "num_images": [2, 1],
             "num_tiles": [3, 2],
@@ -1295,6 +1571,8 @@ class TestSplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["spatial_shapes"][1], batch["spatial_shapes"][3:])
 
     def test_split_without_grid_metadata(self):
+        # [FUNCTION DOC]
+        # LLaVA-style: pixel_values and image_sizes split by image count 1/2.
         # LLaVA-style: no grid metadata at all, pixel_values and image_sizes are indexed by image
         batch = {
             "num_images": [1, 2],
@@ -1312,6 +1590,8 @@ class TestSplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["image_sizes"][1], batch["image_sizes"][1:])
 
     def test_no_split_when_padded_by_sample(self):
+        # [FUNCTION DOC]
+        # Pixel values already shaped per sample (3D with first dim = number of samples) are left unchanged.
         # Idefics-style: pixel_values is padded to (num_samples, max_num_images, ...), already sample-indexed
         batch = {
             "num_images": [1, 2],
@@ -1322,7 +1602,11 @@ class TestSplitPixelValuesByGrid(TrlTestCase):
 
 
 class TestUnsplitPixelValuesByGrid(TrlTestCase):
+    # [CLASS DOC]
+    # Tests unsplit_pixel_values_by_grid, which concatenates per-sample lists back into tensors.
     def test_unsplit_correctly(self):
+        # [FUNCTION DOC]
+        # pixel_values and image_grid_thw lists are concatenated; unrelated keys preserved.
         pixel_values = [torch.randn(4, 5), torch.randn(2, 5)]
         pixel_values_merged = torch.cat(pixel_values, dim=0)
         image_grid_thw = [torch.tensor([[1, 2, 2]]), torch.tensor([[1, 2, 1]])]
@@ -1336,6 +1620,8 @@ class TestUnsplitPixelValuesByGrid(TrlTestCase):
         assert "other_key" in result
 
     def test_unsplit_image_position_ids(self):
+        # [FUNCTION DOC]
+        # image_position_ids list is concatenated.
         image_position_ids = [torch.tensor([[0, 1]]), torch.tensor([[2, 3], [4, 5]])]
         image_position_ids_merged = torch.cat(image_position_ids, dim=0)
         pixel_values = [torch.randn(1, 4), torch.randn(2, 4)]
@@ -1345,6 +1631,8 @@ class TestUnsplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["image_position_ids"], image_position_ids_merged)
 
     def test_unsplit_spatial_shapes(self):
+        # [FUNCTION DOC]
+        # pixel_values, pixel_attention_mask and spatial_shapes lists are concatenated.
         pixel_values = [torch.randn(3, 4), torch.randn(2, 4)]
         pixel_attention_mask = [torch.randn(3, 6), torch.randn(2, 6)]
         spatial_shapes = [torch.tensor([[1, 2], [3, 4], [5, 6]]), torch.tensor([[7, 8], [9, 10]])]
@@ -1362,6 +1650,8 @@ class TestUnsplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["spatial_shapes"], torch.cat(spatial_shapes, dim=0))
 
     def test_unsplit_image_sizes(self):
+        # [FUNCTION DOC]
+        # image_sizes list is concatenated.
         pixel_values = [torch.randn(1, 4), torch.randn(2, 4)]
         image_sizes = [torch.tensor([[8, 8]]), torch.tensor([[4, 4], [2, 2]])]
         batch = {"pixel_values": pixel_values, "image_sizes": image_sizes}
@@ -1370,6 +1660,8 @@ class TestUnsplitPixelValuesByGrid(TrlTestCase):
         assert torch.equal(result["image_sizes"], torch.cat(image_sizes, dim=0))
 
     def test_no_op_if_not_list(self):
+        # [FUNCTION DOC]
+        # A tensor pixel_values is left unchanged.
         original = torch.randn(5, 3)
         batch = {"pixel_values": original}
         result = unsplit_pixel_values_by_grid(batch)
@@ -1435,9 +1727,15 @@ _FUSED_LM_HEAD_MODEL_IDS = [
 
 @require_torch_accelerator
 class TestAddFusedLMHead:
+    # [CLASS DOC]
+    # Tests add_fused_lm_head, which patches a causal LM so that forward with fused_lm_head=True returns per-token
+    # fields (log_probs, entropy, is_top1, log_sum_sq_probs, mean_logits) computed without materializing full logits.
+    # Requires an accelerator (some tests also run on CPU as a stand-in for non-Triton devices).
     # CPU tensors stand in for an accelerator without Triton (e.g. Trainium): TRL does not target CPU training
     @pytest.mark.parametrize("device", [torch_device, "cpu"])
     def test_masked_labels(self, device):
+        # [FUNCTION DOC]
+        # Positions labelled -100 give zero log_probs/entropy; other positions match an unmasked run.
         """Positions labelled `-100` are zero and the others match an unmasked run."""
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(device)
         add_fused_lm_head(model, outputs=("log_probs", "entropy"))
@@ -1454,6 +1752,8 @@ class TestAddFusedLMHead:
         assert (out["entropy"][~mask] == 0).all()
 
     def test_outputs(self):
+        # [FUNCTION DOC]
+        # Only requested outputs (log_probs, is_top1) are computed; others are None.
         """Only the requested per-token fields are computed; the others are `None`."""
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(torch_device)
         add_fused_lm_head(model, outputs=("log_probs", "is_top1"))
@@ -1465,6 +1765,8 @@ class TestAddFusedLMHead:
         assert out.entropy is None and out.log_sum_sq_probs is None and out.mean_logits is None
 
     def test_shift_labels(self):
+        # [FUNCTION DOC]
+        # Pre-shifted shift_labels give the same values as labels (one extra trailing zero position).
         """Pre-shifted `shift_labels` score the same tokens as `labels`, without shifting."""
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(torch_device)
         add_fused_lm_head(model, outputs=("log_probs", "entropy"))
@@ -1481,6 +1783,8 @@ class TestAddFusedLMHead:
     # CPU tensors stand in for an accelerator without Triton (e.g. Trainium): TRL does not target CPU training
     @pytest.mark.parametrize("device", [torch_device, "cpu"])
     def test_all_masked_labels_backward(self, device):
+        # [FUNCTION DOC]
+        # All labels masked: zero log_probs and an all-zero (but present) lm_head gradient after backward.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(device)
         add_fused_lm_head(model)
         input_ids = torch.randint(0, model.config.vocab_size, (2, 8), device=device)
@@ -1493,6 +1797,8 @@ class TestAddFusedLMHead:
         assert model.lm_head.weight.grad.count_nonzero() == 0
 
     def test_generate_unchanged(self):
+        # [FUNCTION DOC]
+        # Greedy generate output is identical before and after patching.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM").to(torch_device)
         input_ids = torch.randint(0, model.config.vocab_size, (2, 6), device=torch_device)
         expected = model.generate(input_ids, max_new_tokens=8, do_sample=False)
@@ -1502,6 +1808,8 @@ class TestAddFusedLMHead:
         torch.testing.assert_close(model.generate(input_ids, max_new_tokens=8, do_sample=False), expected)
 
     def test_log_sum_sq_probs(self):
+        # [FUNCTION DOC]
+        # log_sum_sq_probs equals logsumexp of 2 x logits minus 2 x logsumexp of logits, and has no grad.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM", dtype=torch.float32)
         model = model.to(torch_device)
         input_ids = torch.randint(0, model.config.vocab_size, (2, 16), device=torch_device)
@@ -1515,6 +1823,8 @@ class TestAddFusedLMHead:
         torch.testing.assert_close(out["log_sum_sq_probs"], expected, rtol=1e-5, atol=1e-5)
 
     def test_output_multiplier(self):
+        # [FUNCTION DOC]
+        # A config output_multiplier (0.5) is applied to logits before the log-softmax.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM", dtype=torch.float32)
         model = model.to(torch_device)
         model.config.output_multiplier = 0.5
@@ -1551,6 +1861,9 @@ class TestAddFusedLMHead:
         ],
     )
     def test_logits_scaling(self, model_type, config_kwargs):
+        # [FUNCTION DOC]
+        # Parametrized over granite, minicpm3, hyperclovax, falcon_h1 tiny configs with logit scaling: fused log_probs match
+        # the model's own forward.
         """Models that rescale the logits around the LM head get the same log-probabilities as their own forward."""
         config = AutoConfig.for_model(
             model_type,
@@ -1573,6 +1886,8 @@ class TestAddFusedLMHead:
         torch.testing.assert_close(out["log_probs"], expected, rtol=1e-5, atol=1e-5)
 
     def test_cast_lm_head_to_fp32(self):
+        # [FUNCTION DOC]
+        # With cast_lm_head_to_fp32 under bf16 autocast, log_probs match an fp32 projection of the hidden states.
         """Under bf16 autocast, the projection runs in fp32 and matches an fp32 projection of the same hidden states."""
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM", dtype=torch.float32)
         model = model.to(torch_device)
@@ -1591,6 +1906,8 @@ class TestAddFusedLMHead:
         "model_id", ["trl-internal-testing/tiny-Qwen3MoeForCausalLM", "trl-internal-testing/tiny-GptOssForCausalLM"]
     )
     def test_aux_loss(self, model_id):
+        # [FUNCTION DOC]
+        # MoE models: the router aux_loss with an attention mask equals the unpatched model's.
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32).to(torch_device)
         input_ids = torch.randint(0, model.config.vocab_size, (2, 12), device=torch_device)
         attention_mask = torch.ones_like(input_ids)
@@ -1611,6 +1928,9 @@ class TestAddFusedLMHead:
     @pytest.mark.parametrize("model_id", _FUSED_LM_HEAD_MODEL_IDS)
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_forward(self, model_id, temperature):
+        # [FUNCTION DOC]
+        # Every model in _FUSED_LM_HEAD_MODEL_IDS (bf16, eval), temperatures 1.0 and 0.7: log_probs and entropy match a
+        # reference from scaled logits within 5e-3.
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16).to(torch_device)
         model.eval()
 
@@ -1639,6 +1959,8 @@ class TestAddFusedLMHead:
     @pytest.mark.parametrize("model_id", _FUSED_LM_HEAD_MODEL_IDS)
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_backward(self, model_id, temperature):
+        # [FUNCTION DOC]
+        # Same models in fp32: the lm_head gradient of summed log_probs matches the reference within 1e-3.
         # Run in float32, not bfloat16. For models that tie their embeddings, `lm_head.weight.grad` is the sum of the
         # LM-head projection and the input-embedding lookup, so its absolute error is set by the larger of the two
         # rather than by the element's own value. In bfloat16 that error (~1 ULP at the gradient's scale) swamps the
@@ -1778,9 +2100,16 @@ _FUSED_LM_HEAD_VLM_MODEL_IDS = [
 
 @require_torch_accelerator
 class TestAddFusedLMHeadLoss:
+    # [CLASS DOC]
+    # Tests that the patched forward's loss (and gradients, aux loss) equals the standard Hugging Face causal-LM loss
+    # for text models, VLMs and PEFT-wrapped models. Requires an accelerator.
     """Patched `forward` must be numerically equivalent to the standard HF causal-LM loss path."""
 
     def _setup(self, model_id):
+        # [FUNCTION DOC]
+        # HELPER: Loads an fp32 text model on the device, deep-copies it and patches the copy, and builds random input ids
+        # (2x16) with labels whose first 4 positions are -100. Outputs: (ref_model, patched_model, input_ids, labels,
+        # num_items = number of unmasked shifted labels).
         ref_model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32, device_map=torch_device)
         chunked_model = copy.deepcopy(ref_model)
         add_fused_lm_head(chunked_model)
@@ -1793,6 +2122,8 @@ class TestAddFusedLMHeadLoss:
         return ref_model, chunked_model, input_ids, labels, num_items
 
     def _setup_vlm(self, model_id):
+        # [FUNCTION DOC]
+        # HELPER: Same as _setup for an image-text-to-text model (vocab from text_config).
         ref_model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=torch.float32, device_map=torch_device)
         chunked_model = copy.deepcopy(ref_model)
         add_fused_lm_head(chunked_model)
@@ -1807,6 +2138,8 @@ class TestAddFusedLMHeadLoss:
 
     @pytest.mark.parametrize("model_id", _FUSED_LM_HEAD_LOSS_MODEL_IDS)
     def test_forward_matches_reference(self, model_id):
+        # [FUNCTION DOC]
+        # Loss with num_items_in_batch matches the reference within 1e-5 for each text model.
         ref_model, chunked_model, input_ids, labels, num_items = self._setup(model_id)
 
         with torch.no_grad():
@@ -1823,6 +2156,8 @@ class TestAddFusedLMHeadLoss:
         ],
     )
     def test_forward_matches_reference_with_aux_loss(self, model_id):
+        # [FUNCTION DOC]
+        # MoE models with output_router_logits: loss and aux_loss match.
         """MoE models with `output_router_logits=True` add `router_aux_loss_coef * load_balancing_loss`
         to the main loss. The chunked path must match the reference loss and expose `aux_loss`."""
         ref_model = AutoModelForCausalLM.from_pretrained(
@@ -1846,6 +2181,8 @@ class TestAddFusedLMHeadLoss:
 
     @pytest.mark.parametrize("model_id", _FUSED_LM_HEAD_LOSS_MODEL_IDS)
     def test_backward_matches_reference(self, model_id):
+        # [FUNCTION DOC]
+        # After backward, lm_head and every inner-model parameter gradient match (including gradient presence).
         ref_model, chunked_model, input_ids, labels, num_items = self._setup(model_id)
 
         ref_out = ref_model(input_ids=input_ids, labels=labels, num_items_in_batch=num_items)
@@ -1870,6 +2207,8 @@ class TestAddFusedLMHeadLoss:
 
     @pytest.mark.parametrize("model_id", _FUSED_LM_HEAD_VLM_MODEL_IDS)
     def test_forward_matches_reference_vlm(self, model_id):
+        # [FUNCTION DOC]
+        # VLM loss matches the reference.
         ref_model, chunked_model, input_ids, labels, num_items = self._setup_vlm(model_id)
 
         with torch.no_grad():
@@ -1891,6 +2230,8 @@ class TestAddFusedLMHeadLoss:
         ],
     )
     def test_forward_matches_reference_vlm_with_aux_loss(self, model_id):
+        # [FUNCTION DOC]
+        # Qwen3.5-MoE VLM with router logits: loss and aux_loss match.
         ref_model = AutoModelForImageTextToText.from_pretrained(model_id, dtype=torch.float32, device_map=torch_device)
         chunked_model = copy.deepcopy(ref_model)
         add_fused_lm_head(chunked_model)
@@ -1920,6 +2261,8 @@ class TestAddFusedLMHeadLoss:
 
     @pytest.mark.parametrize("model_id", _FUSED_LM_HEAD_VLM_MODEL_IDS)
     def test_backward_matches_reference_vlm(self, model_id):
+        # [FUNCTION DOC]
+        # VLM gradients (lm_head and inner model) match.
         ref_model, chunked_model, input_ids, labels, num_items = self._setup_vlm(model_id)
 
         ref_out = ref_model(input_ids=input_ids, labels=labels, num_items_in_batch=num_items)
@@ -1943,6 +2286,8 @@ class TestAddFusedLMHeadLoss:
                 )
 
     def test_forward_without_fused_lm_head_matches_reference(self):
+        # [FUNCTION DOC]
+        # Without fused_lm_head the patched model behaves like the original: logits and loss match.
         """Without `fused_lm_head=True` the patched forward is the original one: same logits (including per-model
         post-processing such as `final_logit_softcapping` and `logit_scale`) and same loss."""
         ref_model, chunked_model, input_ids, labels, num_items = self._setup(
@@ -1983,6 +2328,9 @@ class TestAddFusedLMHeadLoss:
         ],
     )
     def test_forward_matches_reference_with_peft(self, peft_config_factory):
+        # [FUNCTION DOC]
+        # Requires peft. For LoRA, LoRA + modules_to_save, prompt tuning, P-tuning and prefix tuning (xfail on old peft),
+        # patching the base model of a PeftModel gives matching loss and matching gradients for all trainable parameters.
         """Patching the inner causal LM (`peft_model.get_base_model()`) must produce a forward whose loss matches
         the unpatched PEFT reference for both LoRA-style (adapters live in the module tree) and prompt-learning
         (`PeftModel.forward` injects virtual tokens, then delegates into the patched inner forward)."""
@@ -2020,6 +2368,9 @@ class TestAddFusedLMHeadLoss:
     @require_peft
     @pytest.mark.filterwarnings("ignore:Model has `tie_word_embeddings=True`")
     def test_label_mask_with_prompt_learning_peft(self):
+        # [FUNCTION DOC]
+        # Requires peft. With prompt tuning (virtual tokens prepended with -100 labels), the returned label_mask counts
+        # the valid shifted labels plus one per row (the first real token is scored from the last virtual token).
         """For prompt-learning PEFT (PromptTuning, P-Tuning), `PeftModel.forward` prepends `-100`-padded virtual
         tokens before delegating into the patched inner forward. The patched output's `label_mask` must reflect the
         padded labels — when original `label[0] != -100`, it counts as a valid target paired with the last virtual
@@ -2045,10 +2396,14 @@ class TestAddFusedLMHeadLoss:
 
 
 class TestComputeFlopsPerToken(TrlTestCase):
+    # [CLASS DOC]
+    # Tests compute_flops_per_token on tiny dense and MoE configs.
     DENSE_MODEL_ID = "trl-internal-testing/tiny-Qwen3ForCausalLM"
     MOE_MODEL_ID = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
 
     def test_seq_scaling_linear(self):
+        # [FUNCTION DOC]
+        # FLOPs grow linearly with sequence length (the 16k-to-32k increment is twice the 8k-to-16k increment).
         # Attention-score FLOPs per token scale linearly with seq_len; everything else
         # is seq-len-independent. Doubling seq_len should double the seq-dependent delta,
         # which differences cancel out from. `F(32k) - F(16k) == 2 * (F(16k) - F(8k))`.
@@ -2059,6 +2414,8 @@ class TestComputeFlopsPerToken(TrlTestCase):
         assert f_32k - f_16k == 2 * (f_16k - f_8k)
 
     def test_tied_vs_untied_lm_head(self):
+        # [FUNCTION DOC]
+        # Tying embeddings does not change FLOPs.
         # Tying shares weights, not compute: lm_head is still a 2*V*h matmul.
         cfg = AutoConfig.from_pretrained(self.DENSE_MODEL_ID)
         cfg.tie_word_embeddings = True
@@ -2068,6 +2425,8 @@ class TestComputeFlopsPerToken(TrlTestCase):
         assert f_tied == f_untied
 
     def test_vocab_size_scaling(self):
+        # [FUNCTION DOC]
+        # Adding 1000 vocab entries adds 3 x 2 x 1000 x hidden_size FLOPs.
         # Only the lm_head scales with vocab: 3 * 2 * ΔV * h (fwd + bwd).
         cfg = AutoConfig.from_pretrained(self.DENSE_MODEL_ID)
         cfg.tie_word_embeddings = False
@@ -2077,6 +2436,8 @@ class TestComputeFlopsPerToken(TrlTestCase):
         assert f_hi - f_lo == 3 * 2 * 1000 * cfg.hidden_size
 
     def test_moe_active_vs_total_experts(self):
+        # [FUNCTION DOC]
+        # Going from 1 to 2 active experts adds 3 x MoE layers x 2 x 3 x hidden x moe_intermediate FLOPs.
         # Doubling `num_experts_per_tok` (active experts) changes FLOPs by exactly the
         # routed-experts contribution: `num_experts_per_tok × 3 matmuls × 2 × h × moe_intermediate`
         # per MoE layer, ×3 for fwd+bwd. Holding `num_local_experts` constant pins the
@@ -2092,6 +2453,8 @@ class TestComputeFlopsPerToken(TrlTestCase):
         assert f_hi - f_lo == expected_delta
 
     def test_config_without_head_dim(self):
+        # [FUNCTION DOC]
+        # A config without head_dim gives the same result as setting head_dim = hidden_size / num_heads.
         # `head_dim` is optional on configs: Qwen2 doesn't declare it. Falling back to `hidden_size //
         # num_attention_heads` must give the same result as setting it explicitly.
         cfg = AutoConfig.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
@@ -2101,6 +2464,8 @@ class TestComputeFlopsPerToken(TrlTestCase):
 
 
 class TestGetPeakFlops:
+    # [CLASS DOC]
+    # Tests get_peak_flops lookup of peak dense FLOP/s by device name and dtype.
     @pytest.mark.parametrize(
         ("device_name", "dtype", "expected"),
         [
@@ -2129,6 +2494,8 @@ class TestGetPeakFlops:
         ],
     )
     def test_known_device(self, device_name, dtype, expected):
+        # [FUNCTION DOC]
+        # Known NVIDIA/AMD device names (exact or prefixed variants) map to the expected peak for the dtype.
         assert get_peak_flops(device_name, dtype) == expected
 
     @pytest.mark.parametrize(
@@ -2143,11 +2510,17 @@ class TestGetPeakFlops:
         ],
     )
     def test_unsupported_device_or_dtype(self, device_name, dtype):
+        # [FUNCTION DOC]
+        # Unsupported dtypes, unknown names, and names that only partially match return None.
         assert get_peak_flops(device_name, dtype) is None
 
 
 class TestComputeMfu(TrlTestCase):
+    # [CLASS DOC]
+    # Tests compute_mfu.
     def test_perfect_utilization(self):
+        # [FUNCTION DOC]
+        # Tokens/s equal to peak x world_size / FLOPs-per-token gives 100% MFU.
         # If aggregate TPS is exactly `peak * world_size / flops_per_token`, MFU is 100%.
         flops = 100e9
         peak = 989.5e12
@@ -2157,9 +2530,13 @@ class TestComputeMfu(TrlTestCase):
 
 
 class TestAdjustedMfu(TrlTestCase):
+    # [CLASS DOC]
+    # Tests adjusted_mfu, which rescales MFU to discount half of the attention FLOPs (causal masking).
     MOE_MODEL_ID = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
 
     def test_consistent_with_formula(self):
+        # [FUNCTION DOC]
+        # Equals mfu x (full FLOPs minus half attention FLOPs) / full FLOPs.
         # `adjusted_mfu(mfu, cfg, seq_len) == mfu * (full - half_attn) / full`, with
         # `full = compute_flops_per_token(cfg, seq_len)` and
         # `half_attn = L * 3 * 2 * n_heads * head_dim * seq_len`. Cross-check the two helpers.
@@ -2171,6 +2548,8 @@ class TestAdjustedMfu(TrlTestCase):
         assert adjusted_mfu(100.0, cfg, seq_len) == pytest.approx(expected)
 
     def test_proportional_to_input(self):
+        # [FUNCTION DOC]
+        # Linear in the input MFU.
         # The correction is purely multiplicative in `mfu`. `adjusted_mfu(2*x, ...)` should
         # equal `2 * adjusted_mfu(x, ...)`.
         cfg = AutoConfig.from_pretrained(self.MOE_MODEL_ID)
@@ -2179,6 +2558,8 @@ class TestAdjustedMfu(TrlTestCase):
         assert b == pytest.approx(2 * a)
 
     def test_decreases_with_seq_len(self):
+        # [FUNCTION DOC]
+        # Decreases as sequence length grows (4k > 16k > 64k).
         # Longer sequences → attention takes a larger share of total compute → causal
         # correction subtracts a larger absolute amount → factor strictly decreases.
         cfg = AutoConfig.from_pretrained(self.MOE_MODEL_ID)
@@ -2188,6 +2569,8 @@ class TestAdjustedMfu(TrlTestCase):
         assert f_short > f_med > f_long
 
     def test_config_without_head_dim(self):
+        # [FUNCTION DOC]
+        # Missing head_dim gives the same result as the derived head_dim.
         # `head_dim` is optional on configs: Qwen2 doesn't declare it. Falling back to `hidden_size //
         # num_attention_heads` must give the same result as setting it explicitly.
         cfg = AutoConfig.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")

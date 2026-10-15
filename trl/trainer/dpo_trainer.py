@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Direct Preference Optimization trainer (paper 2305.18290) and its data collators.
+# Contents: DataCollatorForPreference (text: pre-tokenized prompt/chosen/rejected ids into a stacked
+# [chosen; rejected] batch), DataCollatorForVisionPreference (vision: raw examples processed on the fly with the
+# processor), and DPOTrainer (offline preference training with many loss variants, f-divergences, LD-DPO,
+# WPO weighting, MoE aux loss, PEFT or separate reference model, optional precomputed reference log-probs).
+# Log-probs are computed with a fused LM head (add_fused_lm_head) that never materializes full logits.
+# Import-time side effects: imports peft when available; creates an accelerate logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,6 +93,11 @@ logger = get_logger(__name__)
 
 @dataclass
 class DataCollatorForPreference(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator (DataCollatorMixin, torch_call used) for tokenized text preference data.
+    # Fields: pad_token_id (required), max_length (None means no truncation), truncation_mode "keep_start" or
+    # "keep_end", pad_to_multiple_of, return_tensors "pt". Produces a batch of size 2B with all chosen sequences
+    # first, then all rejected sequences.
     """
     Data collator used for preference data. Inputs are dynamically padded to the maximum length of a batch.
 
@@ -144,6 +158,16 @@ class DataCollatorForPreference(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: for each example builds prompt+chosen and prompt+rejected id lists and completion masks (0 over the
+        # prompt, 1 over the completion). If max_length is set truncates each sequence (and mask) keeping the start or the
+        # end. Attention masks are all ones. Concatenates chosen list then rejected list, converts to tensors and right-pads
+        # input_ids (pad_token_id), attention_mask and completion_mask (0) honoring pad_to_multiple_of. Passes through
+        # ref_chosen_logps / ref_rejected_logps as tensors when present in the examples.
+        # Inputs: examples (list of dicts with prompt_ids, chosen_ids, rejected_ids, optional ref logps).
+        # Outputs: dict with input_ids, attention_mask, completion_mask (each 2B rows) and optional ref logps (B each).
+        # Exceptions: ValueError for an unknown truncation_mode.
+        # Side effects: none.
         prompt_chosen_ids = [example["prompt_ids"] + example["chosen_ids"] for example in examples]
         prompt_rejected_ids = [example["prompt_ids"] + example["rejected_ids"] for example in examples]
         chosen_mask = [[0] * len(example["prompt_ids"]) + [1] * len(example["chosen_ids"]) for example in examples]
@@ -209,6 +233,10 @@ class DataCollatorForPreference(DataCollatorMixin):
 
 @dataclass
 class DataCollatorForVisionPreference(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator for raw vision preference examples (prompt/chosen/rejected plus image or images).
+    # Fields: processor (ProcessorMixin), max_length, pad_to_multiple_of (unsupported, must be None), return_tensors.
+    # Output batch is 2B rows ordered [chosen; rejected] and includes the processor's image tensors.
     """
     Data collator for vision-preference tasks.
 
@@ -295,6 +323,21 @@ class DataCollatorForVisionPreference(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: rejects pad_to_multiple_of. Converts a single "image" field into an "images" list (mutating examples);
+        # image lists are duplicated for chosen and rejected, set to None when all empty. For conversational examples,
+        # injects images into the prompt messages, normalizes chosen/rejected to content blocks and applies the chat
+        # template. Processes prompts (repeated twice, with images, left padding) and chosen / rejected texts (right
+        # padding), all without special tokens. Pads chosen and rejected to a common width (pad id is the tokenizer pad id,
+        # or EOS id when that is falsy) and concatenates after the prompts; completion mask is zero over prompts. Extends
+        # token_type_ids (Gemma: chosen/rejected type ids padded) and mm_token_type_ids (Qwen: zeros for completions).
+        # Flushes left to remove leading padding (all aligned tensors together), truncates every tensor to the first
+        # max_length positions when set, and returns the prompt processor output updated with input_ids, attention_mask,
+        # completion_mask and type ids.
+        # Inputs: examples (list of raw dicts). Outputs: dict of tensors (2B rows) including pixel inputs.
+        # Exceptions: NotImplementedError when pad_to_multiple_of is set; processor errors.
+        # Side effects: mutates the example dicts (images, prompt, chosen, rejected).
+        # KNOWN ISSUE: a pad_token_id of 0 is treated as missing (falsy check) and replaced by the EOS id.
         if self.pad_to_multiple_of is not None:
             raise NotImplementedError(
                 "Padding to a multiple of a value is not yet implemented for vision-language modeling and "
@@ -402,6 +445,18 @@ class DataCollatorForVisionPreference(DataCollatorMixin):
 
 
 class DPOTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer (inherits _BaseTrainer) for DPO and related offline preference losses. Class attributes:
+    # loss_is_scaled_for_ga False, _tag_names ["trl", "dpo"], _name "DPO", _paper (title, id, BibTeX).
+    # Key state: _tokenizer, _is_vlm, _is_vision_dataset, padding_free (always forced False), beta, loss_types and
+    # loss_weights, ld_alpha, f_divergence_type and f_alpha_divergence_coef, label_smoothing, use_weighting,
+    # precompute_ref_logps, router_aux_loss_coef and aux_loss_enabled, ref_model (separate model, or None when PEFT
+    # adapters are toggled or ref log-probs are precomputed), maybe_activation_offload_context, _metrics per mode,
+    # _total_train_tokens, _tp_size, _precompute_model_hash, _precompute_engine.
+    # Flow: __init__ loads/wraps models, prepares (tokenizes) datasets and optionally precomputes reference log-probs;
+    # the collator builds stacked [chosen; rejected] batches; compute_loss/_compute_loss run policy and reference
+    # forwards with the fused LM head and combine the selected losses; log averages metrics; evaluate prepares ad-hoc
+    # eval datasets; prediction_step forces loss computation.
     """
     Trainer for Direct Preference Optimization (DPO) method. This algorithm was initially proposed in the paper [Direct
     Preference Optimization: Your Language Model is Secretly a Reward Model](https://huggingface.co/papers/2305.18290).
@@ -530,6 +585,52 @@ class DPOTrainer(_BaseTrainer):
         quantization_config: "BitsAndBytesConfig | None" = None,
         peft_config: "PeftConfig | None" = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior, in order:
+        # - Default args DPOConfig("<model basename>-DPO"). train_dataset is required; IterableDataset forces
+        #   dispatch_batches False (warning if it was True); other non-Dataset types raise TypeError.
+        # - set_seed. String model: inject quantization_config (error if duplicated in model_init_kwargs), device_map
+        #   None when distributed, default trust_remote_code, load via create_model_from_path. Instance model: warn about
+        #   ignored model_init_kwargs; quantization_config is an error. ref_model must not be the same object as model.
+        # - Processing class: AutoProcessor from the model id if None; ProcessorMixin means VLM, tokenizer means text,
+        #   else TypeError. Pad token defaults to EOS and is mirrored into model config/generation config.
+        # - PEFT: with peft_config, same validations/wrapping as other trainers (ZeRO-3 autocast fix, prefix-tuning
+        #   version check). With an existing PEFT model and no ref_model: adds a frozen "ref" adapter copied from
+        #   "default" (skipped with a warning on peft 0.17 to 0.19 with target_parameters, falling back to disabled
+        #   adapters). PEFT plus ZeRO-3 plus checkpointing forces reentrant; enables input grads; quantized models cast
+        #   trainable non-DoRA params to bf16.
+        # - padding_free is warned and forced False. Detects a vision dataset from the first train example ("image" or
+        #   "images"), requiring a VLM; VLMs set ddp_find_unused_parameters True unless reentrant. Vision datasets reject
+        #   keep_end truncation (with max_length) and precompute_ref_log_probs.
+        # - Default collator: pad token from args.pad_token, tokenizer pad or EOS (must be in vocab), mirrored to model
+        #   configs; vision collator or text collator with max_length/truncation_mode/pad_to_multiple_of.
+        # - Stores loss settings; loss_weights default to 1.0 each. Non-reverse-KL f-divergence only with sigmoid,
+        #   sigmoid_norm, hinge, ipo, exo_pair, robust, discopop, sft. WPO weighting not with aot/aot_unpaired. Warns for
+        #   robust with label_smoothing outside [0, 0.5); exo_pair requires label_smoothing > 0. Rejects PEFT adapters on
+        #   lm_head.
+        # - Non-vision datasets are prepared via _prepare_dataset (train, eval or dict of evals). On transformers below
+        #   5.0.0 defaults use_reentrant False. Calls Trainer init; rejects n_gpu > 1.
+        # - Activation offloading context (or null context). MoE: router_aux_loss_coef from args or the config (0.0
+        #   default); setting it on a non-MoE model is an error; aux loss enabled when the config has
+        #   output_router_logits and the coefficient is non-zero.
+        # - Reference model: none for PEFT, or for precompute without FSDP; otherwise created from the policy's model id
+        #   with model_init_kwargs, quantization, device_map, trust_remote_code and the policy's dtype and attention
+        #   implementation (unless a ref_model is given). Disables dropout in both when configured.
+        # - Deprecated use_liger_kernel: FutureWarning, forbids fused_linear_cross_entropy and forces it off.
+        # - Installs fused LM heads (policy outputs log_probs, entropy, mean_logits, is_top1, plus log_sum_sq_probs
+        #   with WPO; on the PEFT base model when PEFT), reference head default outputs.
+        # - Initializes metrics, tp size, model tags, model hash for precompute caching (before sharding); prepares the
+        #   reference model with DeepSpeed, FSDP or accelerator (eval mode). sync_ref_model (not with PEFT or
+        #   precompute) adds SyncRefModelCallback.
+        # - Precompute: replaces train/eval datasets with versions carrying ref logps (batch size from
+        #   precompute_ref_batch_size or per-device batch size); under FSDP with no user ref_model frees the temporary
+        #   reference model afterwards.
+        # Inputs: model, ref_model, args, data_collator, train_dataset, eval_dataset, processing_class, compute_metrics,
+        # callbacks, optimizers, quantization_config, peft_config.
+        # Outputs: none.
+        # Exceptions: ValueError, TypeError, ImportError, NotImplementedError for the invalid combinations above.
+        # Side effects: model loading, dataset mapping and caching to disk, args mutation, tokenizer/model config
+        # mutation, telemetry, collective ops during precompute.
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
@@ -1040,6 +1141,18 @@ class DPOTrainer(_BaseTrainer):
         args: DPOConfig,
         dataset_name: str,
     ) -> Dataset | IterableDataset:
+        # [FUNCTION DOC]
+        # HELPER: Tokenizes a text preference dataset.
+        # Behavior (under global_then_local_main_first so the main process maps first and others reuse the cache;
+        # num_proc and progress desc for map-style datasets only):
+        # - If the first example lacks "prompt", extracts the shared prompt from chosen/rejected (extract_prompt).
+        # - For non-conversational data appends the EOS token to chosen and rejected if missing.
+        # - Tokenizes with tokenize_fn and, for keep_start truncation with max_length, drops examples whose prompt alone
+        #   has at least max_length tokens.
+        # Inputs: dataset, processing_class, args, dataset_name (used in progress messages).
+        # Outputs: the mapped dataset with prompt_ids, chosen_ids, rejected_ids columns added.
+        # Exceptions: KeyError for missing columns; tokenizer errors.
+        # Side effects: datasets cache files; warning-once on prompt/completion boundary mismatch.
         # Build the kwargs for the `map` function
         map_kwargs = {}
         if isinstance(dataset, Dataset):  # IterableDataset does not support num_proc
@@ -1060,6 +1173,9 @@ class DPOTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
                 def add_eos(example, eos_token):
+                    # [FUNCTION DOC]
+                    # HELPER: Appends eos_token to example chosen and rejected strings when not already ending with it.
+                    # Inputs: example dict, eos_token. Outputs: the mutated example. Exceptions: none. Side effects: mutates example.
                     if not example["chosen"].endswith(eos_token):
                         example["chosen"] = example["chosen"] + eos_token
                     if not example["rejected"].endswith(eos_token):
@@ -1073,6 +1189,15 @@ class DPOTrainer(_BaseTrainer):
                 map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
             def tokenize_fn(example, processing_class):
+                # [FUNCTION DOC]
+                # HELPER: Tokenizes one example into prompt_ids, chosen_ids, rejected_ids.
+                # Behavior: parses "tools" from JSON if a string, merges per-example chat_template_kwargs. Conversational: chat
+                # template tokenization of the prompt (with generation prompt) and of prompt+chosen / prompt+rejected; plain
+                # text otherwise. The prompt length is the shortest common prefix between prompt ids and each prompt+completion
+                # ids; when shorter than the prompt ids a one-time warning reports the dropped prompt tail. Completion ids are
+                # what follows that prefix.
+                # Inputs: example, processing_class. Outputs: dict with the three id lists.
+                # Exceptions: tokenizer errors; JSON errors for malformed tools. Side effects: possible warning.
                 tools = example.get("tools")
                 tools = json.loads(tools) if isinstance(tools, str) else tools
                 apply_chat_template_kwargs = {"tools": tools, **example.get("chat_template_kwargs", {})}
@@ -1142,6 +1267,10 @@ class DPOTrainer(_BaseTrainer):
         return dataset
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets _signature_columns (columns kept by Trainer) when unset: raw columns prompt, chosen, rejected,
+        # image, images, tools, chat_template_kwargs for vision datasets; otherwise prompt_ids, chosen_ids, rejected_ids,
+        # ref_chosen_logps, ref_rejected_logps. Inputs: none. Outputs: none. Exceptions: none. Side effects: sets attr.
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs (usually, "input_ids"
         # and "attention_mask").
@@ -1166,6 +1295,18 @@ class DPOTrainer(_BaseTrainer):
                 ]
 
     def _precompute_ref_logps(self, dataset: Dataset, name: str, batch_size: int) -> Dataset:
+        # [FUNCTION DOC]
+        # HELPER: Adds reference log-prob columns to a map-style dataset, cached on disk.
+        # Behavior: rejects IterableDataset. Fingerprint = hash of dataset fingerprint and model hash, broadcast from rank
+        # 0; if the cache file exists, concatenates it column-wise and returns. Otherwise iterates an accelerator-prepared
+        # unshuffled DataLoader with the trainer collator; the model is the ref model, else the policy (wrapped once in a
+        # DeepSpeed inference engine when DeepSpeed is enabled and kept in _precompute_engine). For each batch computes
+        # reference chosen/rejected log-probs, gathers them and moves to CPU. The main process writes them via a batched
+        # indexed map into the cache file; all ranks wait, then concatenate the cache to the dataset.
+        # Inputs: dataset, name (for progress), batch_size.
+        # Outputs: dataset with ref_chosen_logps and ref_rejected_logps columns.
+        # Exceptions: ValueError for iterable datasets.
+        # Side effects: forward passes, cache file write, collectives, progress bar (disabled by TQDM_DISABLE).
         if isinstance(dataset, IterableDataset):
             raise ValueError(
                 "`precompute_ref_log_probs=True` is not supported with IterableDataset. Please use a map-style "
@@ -1222,6 +1363,9 @@ class DPOTrainer(_BaseTrainer):
         if self.accelerator.is_main_process:
 
             def add_ref_logps(batch, indices):
+                # [FUNCTION DOC]
+                # HELPER: Batched map function returning the precomputed chosen/rejected reference log-probs at the given
+                # indices. Inputs: batch (ignored), indices. Outputs: dict of two tensors. Exceptions: none. Side effects: none.
                 return {
                     "ref_chosen_logps": ref_chosen_logps[indices],
                     "ref_rejected_logps": ref_rejected_logps[indices],
@@ -1241,6 +1385,16 @@ class DPOTrainer(_BaseTrainer):
         return concatenate_datasets([dataset, Dataset.from_file(cache_file)], axis=1)
 
     def compute_ref_log_probs(self, model, inputs):
+        # [FUNCTION DOC]
+        # Behavior: computes reference sequence log-probs for one stacked batch. Model kwargs are the batch minus
+        # completion_mask and ref logps, with use_cache False; labels are input ids with non-completion positions set to
+        # -100. With PEFT and no ref model, activates the "ref" adapter if present else disables adapters. Runs the given
+        # model without grad, with checkpointing disabled and autocast, using the fused LM head; keeps the last
+        # sequence-length-minus-one positions (prompt-learning virtual tokens dropped). Sums token log-probs, or with
+        # ld_alpha sums the shared-length part (positions up to the shorter of the pair's completion lengths) plus ld_alpha
+        # times the remaining tail.
+        # Inputs: model, inputs (collated batch). Outputs: tuple (ref chosen logps, ref rejected logps), each of size B.
+        # Exceptions: model errors. Side effects: none beyond temporary adapter/checkpointing switches.
         """Computes reference log probabilities for a single padded batch."""
         device = self.accelerator.device
         _non_model_keys = {"completion_mask", "ref_chosen_logps", "ref_rejected_logps"}
@@ -1283,6 +1437,33 @@ class DPOTrainer(_BaseTrainer):
         return ref_logps.chunk(2, dim=0)
 
     def _compute_loss(self, model, inputs, return_outputs):
+        # [FUNCTION DOC]
+        # HELPER: Core DPO loss and metric computation for a stacked [chosen; rejected] batch.
+        # Behavior:
+        # - Policy forward (fused LM head, labels from completion mask, router logits when aux loss enabled); per-token
+        #   log-probs aligned to the shifted completion mask; sequence log-probs summed or LD-DPO weighted as in
+        #   compute_ref_log_probs; split into chosen / rejected.
+        # - Reference log-probs from the batch when precomputed, else a no-grad forward of the ref model, or of the policy
+        #   with the "ref" adapter / adapters disabled, using the same reduction.
+        # - Log ratios chosen/rejected minus reference. Scores by f_divergence_type: reverse_kl (log ratio), forward_kl
+        #   (1 - exp(-r)), js_divergence (log 2 + logsigmoid(r)), alpha_divergence ((exp((a-1) r) - 1)/(a-1) with float
+        #   clamping per dtype; a near 1 falls back to reverse KL); unknown raises.
+        # - For each loss type (weighted sum of per-sequence means): sigmoid, hinge, ipo (per-token averaged scores,
+        #   squared distance to 1/(2 beta)), exo_pair (label_smoothing as epsilon), nca_pair, robust, bco_pair, sppo_hard,
+        #   aot and aot_unpaired (sorted log ratios with label smoothing), apo_zero, apo_down, discopop (discopop_tau),
+        #   sft (mean negative log-likelihood of chosen tokens), sigmoid_norm (length-normalized sigmoid); unknown raises.
+        #   With use_weighting multiplies by WPO weights exp(mean of log p minus log sum of squared probs) of chosen times
+        #   rejected (computed without grad).
+        # - Adds router_aux_loss_coef times the model aux loss when enabled (metric "aux_loss").
+        # - Metrics in _metrics[mode]: entropy (token-weighted), num_tokens (cumulative attention-mask tokens in train,
+        #   divided by tp size), logits/chosen, logits/rejected (mean logits over completion tokens), mean_token_accuracy
+        #   (chosen top-1 accuracy), rewards/chosen, rewards/rejected (beta times log ratios), rewards/accuracies,
+        #   rewards/margins, logps/chosen, logps/rejected.
+        # - With return_outputs, warns (deprecated) and recomputes full outputs with a plain no-grad forward.
+        # Inputs: model, inputs (batch), return_outputs (bool).
+        # Outputs: loss, or (loss, model outputs).
+        # Exceptions: ValueError for unknown f-divergence or loss type; KeyError if precomputed logps are missing.
+        # Side effects: metrics, _total_train_tokens, collective gathers.
         mode = "train" if self.model.training else "eval"
         device = self.accelerator.device
 
@@ -1622,6 +1803,18 @@ class DPOTrainer(_BaseTrainer):
         ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Behavior: for non-vision trainers given an actual eval dataset (not a name): if precomputing with full
+        # fine-tuning, no ref model and training already started, raises; prepares (tokenizes) the dataset(s), precomputes
+        # reference log-probs when enabled, and for a dict calls Trainer.evaluate per split with prefix
+        # "<metric_key_prefix>_<name>" merging results. Otherwise delegates to Trainer.evaluate.
+        # Inputs: eval_dataset (dataset, dict, name or None), ignore_keys, metric_key_prefix ("eval").
+        # Outputs: dict of metrics.
+        # Exceptions: ValueError described above; evaluation errors.
+        # Side effects: dataset mapping/caching, logging of metrics.
+        # KNOWN ISSUE: the inline comment says _prepare_dataset is idempotent and skips already-tokenized datasets, but
+        # _prepare_dataset has no such check: it always re-runs prompt extraction, EOS appending and tokenization, so an
+        # already-prepared dataset passed here is tokenized again from its text columns.
         # When a dataset is passed directly to `evaluate` (e.g. a held-out test set), preprocess it the same way
         # `__init__` does, so that `evaluate` accepts the same dataset types as the trainer. `_prepare_dataset` is
         # idempotent: it skips datasets that are already tokenized. A `str` selects a dataset that was already prepared
@@ -1680,6 +1873,11 @@ class DPOTrainer(_BaseTrainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Behavior: calls _compute_loss; converts a ValueError about mismatched image features/tokens into a clearer
+        # ValueError suggesting a larger max_length (when max_length is set); re-raises other errors.
+        # Inputs: model, inputs, return_outputs (False), num_items_in_batch (ignored).
+        # Outputs: as _compute_loss. Exceptions: ValueError. Side effects: as _compute_loss.
         try:
             return self._compute_loss(model, inputs, return_outputs)
         except ValueError as e:
@@ -1693,10 +1891,20 @@ class DPOTrainer(_BaseTrainer):
 
     # Override training step to add activation offloading context.
     def training_step(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: runs Trainer.training_step inside the activation offloading context (null context when disabled).
+        # Inputs: forwarded positional/keyword args. Outputs: the step loss. Exceptions: from training.
+        # Side effects: as Trainer.training_step.
         with self.maybe_activation_offload_context:
             return super().training_step(*args, **kwargs)
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: averages each list in _metrics[mode], prefixes keys with "eval_" in eval mode, merges into logs,
+        # calls Trainer.log and clears the mode's metrics.
+        # Inputs: logs dict, start_time (optional). Outputs: none.
+        # Exceptions: ZeroDivisionError impossible in practice (lists are non-empty when present).
+        # Side effects: logging to configured backends; clears metrics.
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
@@ -1710,6 +1918,12 @@ class DPOTrainer(_BaseTrainer):
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and
     # returns logits. We override prediction_step to force compute_loss, because this trainer doesn't involve labels.
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Behavior: prepares inputs and, without grad under the loss context manager, computes the loss; when not
+        # prediction_loss_only also gets outputs (deprecated path) and returns logits and input_ids as labels.
+        # Inputs: model, inputs, prediction_loss_only, ignore_keys (unused).
+        # Outputs: tuple (loss, logits or None, labels or None).
+        # Exceptions: from compute_loss. Side effects: metrics.
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad(), self.compute_loss_context_manager():
             if prediction_loss_only:
@@ -1722,6 +1936,10 @@ class DPOTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Behavior: writes the model card (name from hub_model_id basename or output_dir name), then saves the
+        # checkpoint via Trainer. Inputs: model, trial. Outputs: none. Exceptions: I/O errors.
+        # Side effects: writes README.md and checkpoint files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:
