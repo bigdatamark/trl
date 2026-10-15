@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Module trl.kernels.chunked_divergence: memory-efficient per-token divergence (forward KL, reverse KL or
+# generalized JSD) between a student and a teacher next-token distribution, plus the student entropy,
+# computed directly from hidden states and LM-head weights in [TOKEN_CHUNK_SIZE, VOCAB_CHUNK_SIZE] tiles so
+# neither model's full [N, V] logits is ever materialized. Used by distillation trainers.
+# Main contents: Triton kernels (_stats_kernel, _jsd_kernel, _backward_kernel) with torch fallbacks
+# (_stats_tile, _jsd_tile, _backward_tile) selected by _use_triton; projection helpers _compute_dtype and
+# _project; and ChunkedDivergenceFunction (torch.autograd.Function). Reuses _transform/_torch_transform
+# (logit scale, optional softcap tanh, temperature), _jit, _BLOCK_SIZE, _MM_OUT_DTYPE and _addmm_fp32 from
+# chunked_logprob.
+# Import-time side effects: imports triton when available; defines TOKEN_CHUNK_SIZE 4096 and VOCAB_CHUNK_SIZE
+# 32768; kernels are JIT-wrapped (compiled lazily).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -57,6 +70,17 @@ def _stats_kernel(
     T_HAS_SOFTCAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Triton kernel, one program per token row, folding one vocab tile of student and teacher logits into
+    # running online-logsumexp statistics.
+    # Behavior: load the running stats for the row; iterate over the tile in BLOCK_SIZE blocks; transform both
+    # logit blocks (scale, optional softcap, divide by temperature); gap is teacher minus student transformed
+    # logit (0 outside the mask). For the student, update the running max, rescale and accumulate the exp-sum,
+    # the exp-weighted sum of logits (for entropy) and the exp-weighted negative gap (for reverse KL). For the
+    # teacher, update max, exp-sum and exp-weighted gap (for forward KL). Store all stats back.
+    # Inputs: pointers/strides of the two tiles, pointers to seven per-row float32 stat vectors, n_cols, scale and
+    # softcap per model, inv_t, softcap flags and BLOCK_SIZE (compile-time).
+    # Outputs: none (stats updated in place). Exceptions: none. Side effects: writes the stat buffers.
     # One program per token: fold one vocabulary chunk of both models' logits into online-logsumexp statistics
     row = tl.program_id(0).to(tl.int64)
     s_row = s_ptr + row * s_stride
@@ -123,6 +147,15 @@ def _jsd_kernel(
     T_HAS_SOFTCAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Triton kernel for the second pass of the generalized JSD, one program per row.
+    # Behavior: cast float arguments to fp32. Using precomputed log-normalizers, compute log student and teacher
+    # probabilities per block, the log mixture as a stable logsumexp of log(1 - beta) plus log p_s and log(beta)
+    # plus log p_t, then accumulate beta times p_t times (log p_t minus log m) plus (1 - beta) times the student
+    # term into jsd, and the student term p_s times (log p_s minus log m) into kl_student.
+    # Inputs: tile pointers/strides, s_log_z and t_log_z pointers, jsd and kl_student pointers, n_cols, beta,
+    # transform parameters, flags, BLOCK_SIZE. Outputs: none. Exceptions: none.
+    # Side effects: accumulates into jsd and kl_student.
     # Second pass of the generalized JSD, which needs both normalizers to form the mixture m = (1 - beta) p_s + beta p_t
     # Before torch 2.15, torch.compile passes Python float arguments as fp64; keep the math in fp32
     beta = tl.cast(beta, tl.float32)
@@ -184,6 +217,17 @@ def _backward_kernel(
     T_HAS_SOFTCAP: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Triton kernel, grid (rows, column blocks), overwriting the student tile with the gradient of the
+    # per-token divergence with respect to the raw projection output.
+    # Behavior: recompute student transformed logits keeping the tanh value for softcap, the teacher logits, and
+    # log-probabilities. Gradient with respect to the student's transformed logit: MODE 0 (forward KL) p_s minus
+    # p_t; MODE 1 (reverse KL) p_s times (log p_s minus log p_t minus aux), aux being the per-token KL; MODE 2 (JSD)
+    # (1 - beta) times p_s times (log p_s minus log m minus aux), aux being KL(p_s, m). Multiply by the upstream
+    # per-token gradient and inv_t, by the softcap derivative (1 minus tanh squared) when enabled, and by the
+    # student scale; store in the tile's dtype.
+    # Inputs: as _jsd_kernel plus aux_ptr, grad_ptr and MODE. Outputs: none. Exceptions: none.
+    # Side effects: overwrites the student tile.
     # Overwrite one block of the student tile with the gradient of the divergence with respect to the projection output
     # Before torch 2.15, torch.compile passes Python float arguments as fp64; keep the math in fp32
     beta = tl.cast(beta, tl.float32)
@@ -254,6 +298,12 @@ def _stats_tile(
     T_HAS_SOFTCAP,
     BLOCK_SIZE,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Torch fallback of _stats_kernel operating on the whole tile at once (vectorized over rows), updating
+    # the stat tensors in place with the same online-logsumexp recurrences. Stride, n_cols and BLOCK_SIZE are
+    # accepted for signature compatibility and unused.
+    # Inputs: same as _stats_kernel with tensors instead of pointers. Outputs: none.
+    # Exceptions: none. Side effects: mutates the stat tensors.
     # `_stats_kernel` in torch, for devices without Triton: the whole tile at once instead of one program per token
     zs = _torch_transform(s_tile, s_scale, s_softcap, inv_t, S_HAS_SOFTCAP)
     zt = _torch_transform(t_tile, t_scale, t_softcap, inv_t, T_HAS_SOFTCAP)
@@ -295,6 +345,10 @@ def _jsd_tile(
     T_HAS_SOFTCAP,
     BLOCK_SIZE,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Torch fallback of _jsd_kernel on the whole tile; uses logaddexp for the mixture and accumulates into
+    # jsd and kl_student in place. Unused args kept for signature compatibility.
+    # Inputs: as _jsd_kernel (tensors). Outputs: none. Exceptions: none. Side effects: mutates jsd, kl_student.
     # `_jsd_kernel` in torch, for devices without Triton: the whole tile at once instead of one program per token
     log_ps = _torch_transform(s_tile, s_scale, s_softcap, inv_t, S_HAS_SOFTCAP) - s_log_z.unsqueeze(-1)
     log_pt = _torch_transform(t_tile, t_scale, t_softcap, inv_t, T_HAS_SOFTCAP) - t_log_z.unsqueeze(-1)
@@ -325,6 +379,10 @@ def _backward_tile(
     T_HAS_SOFTCAP,
     BLOCK_SIZE,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Torch fallback of _backward_kernel on the whole tile, with the same three MODE formulas; the result is
+    # copied into s_tile. Unused args kept for signature compatibility.
+    # Inputs: as _backward_kernel (tensors). Outputs: none. Exceptions: none. Side effects: overwrites s_tile.
     # `_backward_kernel` in torch, for devices without Triton: the whole tile at once instead of one block per program
     y = s_tile * s_scale
     if S_HAS_SOFTCAP:
@@ -353,11 +411,22 @@ def _backward_tile(
 
 
 def _compute_dtype(hidden: torch.Tensor) -> torch.dtype:
+    # [FUNCTION DOC]
+    # HELPER: The dtype matmuls should run in: the autocast dtype of the tensor's device type when autocast is
+    # enabled there, else the tensor's own dtype.
+    # Inputs: hidden (tensor). Outputs: torch.dtype. Exceptions: none. Side effects: none.
     device_type = hidden.device.type
     return torch.get_autocast_dtype(device_type) if torch.is_autocast_enabled(device_type) else hidden.dtype
 
 
 def _project(tile, hidden_chunk, weight, bias, start, end, dtype):
+    # [FUNCTION DOC]
+    # HELPER: Compute one logits tile in fp32: hidden_chunk times the transposed weight rows start to end.
+    # Behavior: cast the weight slice to dtype; on CUDA with half/bf16 dtype and _MM_OUT_DTYPE support, use mm with
+    # float32 output written into tile; otherwise upcast both operands to float32 and mm into tile. Add the bias
+    # slice (fp32) when given.
+    # Inputs: tile (preallocated fp32 [n, end - start]), hidden_chunk, weight [V, H], bias (optional), start, end,
+    # dtype. Outputs: none. Exceptions: shape errors. Side effects: writes tile.
     # FP32 projection output avoids rounding logits before computing the divergence.
     w = weight[start:end].to(dtype).t()
     if _MM_OUT_DTYPE and tile.device.type == "cuda" and dtype in (torch.float16, torch.bfloat16):
@@ -369,6 +438,10 @@ def _project(tile, hidden_chunk, weight, bias, start, end, dtype):
 
 
 class ChunkedDivergenceFunction(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd function returning per-token divergence (differentiable for the student only) and student entropy
+    # (non-differentiable). beta 0 is forward KL(teacher, student), 1 reverse KL(student, teacher), in between the
+    # generalized JSD. Supports per-model logit scale and final-logit softcapping and a shared temperature.
     """
     Per-token divergence between the student's and the teacher's next-token distributions, and the student's entropy,
     computed from both models' hidden states and LM heads without materializing either `[N, V]` logits.
@@ -394,6 +467,22 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
         teacher_logit_scale: float = 1.0,
         teacher_final_logit_softcapping: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: disable grad materialization. Compute dtypes per model and kernel args (softcap defaults to 1.0
+        # when disabled, inv_t is 1 over temperature). Allocate per-token fp32 stats (max initialized to negative
+        # infinity) and two reusable fp32 tile buffers. Inside lm-head gather contexts (for ZeRO-3 sharded heads),
+        # loop over token chunks; for each vocab chunk project both tiles and fold stats (Triton or torch). Compute
+        # log-normalizers for the chunk; if 0 < beta < 1 do a second vocab pass with the JSD fold. Afterwards: entropy
+        # = student log Z minus the exp-weighted mean logit; divergence for beta 0 is teacher-weighted mean gap minus
+        # teacher log Z plus student log Z (aux = divergence); for beta 1 the student-weighted mean negative gap minus
+        # student log Z plus teacher log Z (aux = divergence); otherwise jsd with aux = kl_student. Save inputs,
+        # log-normalizers and aux for backward, plus dtypes, beta, mode (0, 1, 2) and kernel args; mark entropy
+        # non-differentiable.
+        # Inputs: ctx, student_hidden [N, H_s], student_weight [V, H_s], student_bias, teacher_hidden [N, H_t],
+        # teacher_weight [V, H_t], teacher_bias, beta, temperature (1.0), student_logit_scale (1.0),
+        # student_final_logit_softcapping (None), teacher_logit_scale (1.0), teacher_final_logit_softcapping (None).
+        # Outputs: (divergence [N], entropy [N]) in fp32.
+        # Exceptions: none explicit. Side effects: may gather sharded LM-head weights temporarily.
         ctx.set_materialize_grads(False)
         device = student_hidden.device
         N = student_hidden.shape[0]
@@ -409,6 +498,9 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
         }
 
         def zeros():
+            # [FUNCTION DOC]
+            # HELPER: Return a new fp32 zero vector of length N on the input device. Inputs: none. Outputs: tensor.
+            # Exceptions: none. Side effects: allocation.
             return torch.zeros((N,), device=device, dtype=torch.float32)
 
         s_max, t_max = zeros() - math.inf, zeros() - math.inf
@@ -509,6 +601,16 @@ class ChunkedDivergenceFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_divergence: torch.Tensor | None, _):  # type: ignore
+        # [FUNCTION DOC]
+        # Behavior: return all None if the divergence received no gradient. Otherwise, inside lm-head gather contexts,
+        # allocate fp32 accumulators for the student hidden, weight and bias gradients as required by
+        # needs_input_grad; for each token chunk and vocab chunk, re-project both tiles, overwrite the student tile with
+        # the per-logit gradient (Triton grid of rows by column blocks, or torch fallback), cast to the student compute
+        # dtype and accumulate: hidden grad += tile times weight slice, weight grad += tile transposed times hidden,
+        # bias grad += column sums. Return the gradients cast to the input dtypes and None for the nine remaining
+        # inputs (teacher inputs and scalars get no gradient).
+        # Inputs: ctx, grad_divergence ([N] or None), ignored entropy grad.
+        # Outputs: tuple of 12 gradients. Exceptions: none explicit. Side effects: temporary gathers, allocations.
         (
             student_hidden,
             student_weight,

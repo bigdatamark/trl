@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental SDPO (self-distillation policy optimization) trainer. Defines SDPOConfig,
+# a _BaseConfig (TrainingArguments subclass) combining GRPO-style policy-gradient options with self-distillation,
+# reprompting, diagnostics, generation and vLLM settings. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +27,18 @@ from ...trainer.base_config import _BaseConfig
 
 @dataclass
 class SDPOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass of SDPO hyperparameters consumed by SDPOTrainer.
+    # Groups: policy objective (beta 0.0 KL coefficient, epsilon 0.2 / epsilon_high clipping, importance_sampling_level
+    # token/sequence, reward_weights, scale_rewards group/batch/none, loss_type grpo/bnpo/dr_grpo/dapo default dapo,
+    # mask_truncated_completions); distillation (distillation_weight 1.0 blending policy and distillation losses,
+    # distillation_alpha 1.0, distillation_mode default sampled_token, distillation_topk, distillation_is_clip 2.0,
+    # distillation_add_tail); teacher (teacher_model_kind default ema, teacher_update_rate 0.05, teacher_sync_steps 1,
+    # use_teacher_server); reprompting (use_successful_as_teacher, success_reward_threshold 1.0,
+    # dont_reprompt_on_self_success, max_reprompt_len 10240, reprompt/solution/feedback templates,
+    # include_environment_feedback, environment_feedback_only_without_solution, remove_thinking_from_demonstration);
+    # diagnostics (diagnostics_warning_interval 10, diagnostics_flat_tolerance 1e-8); plus model loading, data, generation,
+    # vLLM and batching fields shared with SDFTConfig.
     r"""
     Configuration class for the [`experimental.sdpo.SDPOTrainer`].
 
@@ -604,6 +621,15 @@ class SDPOConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs base post-init, validates, and derives fields.
+        # Behavior: distillation_weight must be within [0, 1]; sampled_token mode requires distillation_alpha 1.0; derives
+        # generation_batch_size / steps_per_generation exactly as SDFTConfig (defaults from gradient_accumulation_steps,
+        # divisibility by global batch, both set is an error); generation_batch_size must be divisible by num_generations; the
+        # global eval batch must be divisible by the eval generation count when evaluating; maps boolean scale_rewards to
+        # "group"/"none"; epsilon_high defaults to epsilon.
+        # Inputs: none. Outputs: none. Exceptions: ValueError for violated rules.
+        # Side effects: mutates derived fields.
         super().__post_init__()
         if not 0.0 <= self.distillation_weight <= 1.0:
             raise ValueError(f"`distillation_weight` must be in [0, 1], got {self.distillation_weight}.")

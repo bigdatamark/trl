@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental IW-OPD (importance-weighted on-policy distillation) trainer.
+# Main content: IWOPDConfig, used by iw_opd_trainer.IWOPDTrainer. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +25,17 @@ from ...trainer.base_config import _BaseConfig
 
 @dataclass
 class IWOPDConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Standalone training config extending trl's _BaseConfig (not SFTConfig). Field groups (defaults): model loading
+    # (model_init_kwargs, trust_remote_code False), lengths (max_length 1024, max_completion_length 512, max_prompt_length
+    # derived), learning_rate 1e-6; distillation: temperature 1.0, lmbda 1.0 (on-policy fraction), beta 1.0 (0 forward
+    # KL, 1 reverse KL), distillation_objective "iw_opd" or "jsd", iw_opd_gamma 0.5, iw_opd_epsilon 1e-8,
+    # reverse_kl_top_1_mode "sampled" or "argmax", disable_dropout True; teacher: name/path, revision, init kwargs,
+    # use_teacher_server False, teacher_model_server_url; loss support: loss_top_k 1, loss_add_tail True; generation:
+    # num_generations 1, generation_batch_size (derived), top_p 0.95, top_k 0; vLLM settings (use_vllm False, mode
+    # "colocate", server URL/host/port 8001/timeout 240, group port 51216, gpu memory 0.3, tensor parallel 1, max model
+    # length, impl "vllm", structured regex, sync frequency 1, sleep mode False); logging (log_completions False,
+    # log_completions_steps 100, num_completions_to_print).
     r"""
     Configuration class for the [`experimental.iw_opd.IWOPDTrainer`].
 
@@ -400,6 +415,18 @@ class IWOPDConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs the parent post-init, then validates ranges: lmbda and beta in [0, 1], objective in jsd/iw_opd,
+        # gamma non-negative, epsilon positive, top-1 mode in sampled/argmax, max_completion_length below max_length. Derives
+        # max_prompt_length as max_length minus max_completion_length when unset. Validates num_generations at least 1 and
+        # derives generation_batch_size (per-device batch times accumulation steps, integer-divided by num_generations), which
+        # must be at least 1 and multiply back exactly. iw_opd requires lmbda 1.0, sampled top-1 mode and, with vLLM, sync
+        # frequency 1. Teacher server requires a non-blank URL, positive loss_top_k when beta is 0, no argmax mode, and
+        # loss_top_k 1 when beta is positive. Warns when a non-sampled top-1 mode has no effect (beta 0 or loss_top_k not 1)
+        # and when num_generations above 1 is used with lmbda below 1.
+        # Inputs: none. Outputs: none.
+        # Exceptions: ValueError for each failed constraint.
+        # Side effects: sets max_prompt_length and generation_batch_size; UserWarnings.
         super().__post_init__()
 
         if self.lmbda < 0.0 or self.lmbda > 1.0:
