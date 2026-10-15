@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Synchronous HTTP client for the external `vllm serve` instance used by the async GRPO trainer.
+# Main contents: VLLMClient, a thin stateless wrapper around the server's REST endpoints (health, model info,
+# server info, LoRA adapter load/unload, world size, pause/resume, and the NCCL weight-transfer lifecycle).
+# Used by the async GRPO trainer and by WeightTransferClient (weight_transfer.py).
+# Import-time side effects: imports `requests` only when it is installed; creates a module-level accelerate logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +34,12 @@ logger = get_logger(__name__)
 
 
 class VLLMClient:
+    # [CLASS DOC]
+    # Stateless HTTP client for a vLLM OpenAI-compatible server running in dev mode.
+    # State: server_url (trailing slash stripped) and server_timeout (seconds used only by wait_for_server_ready).
+    # Construction: server_url, server_timeout (default 240.0).
+    # Methods map one-to-one onto server endpoints; most POST helpers raise a generic Exception on a non-200 status.
+    # No base class; picklable because it only stores two plain attributes.
     """Synchronous HTTP client for the vLLM server used by async GRPO.
 
     The trainer and [`WeightTransferClient`] both talk to the same `vllm serve` instance, so this client is the single
@@ -43,6 +56,12 @@ class VLLMClient:
     """
 
     def __init__(self, server_url: str, server_timeout: float = 240.0):
+        # [FUNCTION DOC]
+        # Behavior: verifies `requests` is installed, then stores the URL (with trailing "/" removed) and timeout.
+        # Inputs: server_url (str), server_timeout (float, default 240.0).
+        # Outputs: none.
+        # Exceptions: ImportError if `requests` is not available.
+        # Side effects: sets self.server_url and self.server_timeout.
         if not is_requests_available():
             raise ImportError("requests is not installed. Please install it with `pip install requests`.")
 
@@ -50,6 +69,15 @@ class VLLMClient:
         self.server_timeout = server_timeout
 
     def wait_for_server_ready(self, poll_interval_s: float = 2.0) -> None:
+        # [FUNCTION DOC]
+        # Behavior: polls GET {server_url}/health (5 s request timeout) in a loop until it returns status 200.
+        # Connection errors, timeouts and OSError are swallowed. After each failed attempt, if elapsed time has reached
+        # server_timeout it raises; otherwise logs a "still waiting" message when the integer elapsed seconds modulo 10 is
+        # below poll_interval_s, then sleeps poll_interval_s.
+        # Inputs: poll_interval_s (float, default 2.0).
+        # Outputs: none (returns once healthy).
+        # Exceptions: TimeoutError after server_timeout seconds without a healthy response.
+        # Side effects: network requests, info logs, sleeping.
         """Block until the server answers `/health`, or raise `TimeoutError` after `server_timeout` seconds."""
         logger.info(f"Waiting for vLLM server at {self.server_url} ...")
         start = time.time()
@@ -73,12 +101,23 @@ class VLLMClient:
             time.sleep(poll_interval_s)
 
     def get_max_model_len(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: GET {server_url}/v1/models and return the max_model_len of the first listed model.
+        # Inputs: none. Outputs: int.
+        # Exceptions: requests.HTTPError on a non-2xx status; KeyError/IndexError on unexpected payload.
+        # Side effects: one network request (no timeout).
         """Return the served model's `max_model_len` (the cap on prompt + completion tokens)."""
         response = requests.get(f"{self.server_url}/v1/models")
         response.raise_for_status()
         return response.json()["data"][0]["max_model_len"]
 
     def get_dtype(self) -> str:
+        # [FUNCTION DOC]
+        # Behavior: GET {server_url}/server_info with config_format=json and return vllm_config.model_config.dtype, a
+        # string such as "torch.bfloat16". Endpoint requires VLLM_SERVER_DEV_MODE=1 on the server.
+        # Inputs: none. Outputs: str.
+        # Exceptions: requests.HTTPError on a non-2xx status; KeyError on unexpected payload.
+        # Side effects: one network request (no timeout).
         """Return the dtype the server holds its weights in, e.g. `"torch.bfloat16"`.
 
         Read from vLLM's `/server_info`, which dumps the resolved `VllmConfig` (`config_format=json` keeps it a JSON
@@ -91,12 +130,25 @@ class VLLMClient:
         return response.json()["vllm_config"]["model_config"]["dtype"]
 
     def get_server_info(self) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: GET {server_url}/server_info with config_format=json and return the whole vllm_config dict.
+        # Inputs: none. Outputs: dict.
+        # Exceptions: requests.HTTPError on a non-2xx status; KeyError if vllm_config is missing.
+        # Side effects: one network request (no timeout).
         """Return the server's resolved `vllm_config`, as reported by `/server_info`."""
         response = requests.get(f"{self.server_url}/server_info", params={"config_format": "json"})
         response.raise_for_status()
         return response.json()["vllm_config"]
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, timeout: int = 1800) -> None:
+        # [FUNCTION DOC]
+        # Behavior: POST {server_url}/v1/load_lora_adapter with lora_name, lora_path and load_inplace False, registering a
+        # PEFT adapter directory (readable by the server process) under a model name usable in generation requests.
+        # Inputs: lora_name (str), lora_path (str), timeout (int seconds, default 1800).
+        # Outputs: none.
+        # Exceptions: RuntimeError on 404 (server lacks VLLM_ALLOW_RUNTIME_LORA_UPDATING=1); generic Exception on any other
+        # non-200 status; requests exceptions on network failure.
+        # Side effects: network request; server loads the adapter.
         """Register a PEFT adapter directory under `lora_name`, making it selectable as a model name.
 
         Args:
@@ -122,27 +174,55 @@ class VLLMClient:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
     def unload_lora_adapter(self, lora_name: str, timeout: int = 1800) -> None:
+        # [FUNCTION DOC]
+        # Behavior: POST {server_url}/v1/unload_lora_adapter with lora_name; the response status is ignored.
+        # Inputs: lora_name (str), timeout (int, default 1800).
+        # Outputs: none.
+        # Exceptions: only network-level requests exceptions.
+        # Side effects: network request; server drops the adapter if present.
         """Remove a previously registered adapter. Missing names are not an error."""
         requests.post(f"{self.server_url}/v1/unload_lora_adapter", json={"lora_name": lora_name}, timeout=timeout)
 
     def get_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: GET {server_url}/get_world_size and return its world_size field (number of inference processes).
+        # Inputs: none. Outputs: int.
+        # Exceptions: KeyError / JSON decode errors on bad responses (status is not checked); requests network errors.
+        # Side effects: one network request (no timeout).
         """Return the vLLM server's inference world size (tensor/pipeline parallel processes)."""
         response = requests.get(f"{self.server_url}/get_world_size")
         return response.json()["world_size"]
 
     def pause(self, timeout: int = 1800) -> None:
+        # [FUNCTION DOC]
+        # Behavior: POST {server_url}/pause with query mode=keep, freezing in-flight requests before a weight swap.
+        # Inputs: timeout (int, default 1800). Outputs: none.
+        # Exceptions: generic Exception on non-200 status.
+        # Side effects: network request; server pauses generation.
         """Freeze in-flight requests and clear caches before replacing the model weights."""
         response = requests.post(f"{self.server_url}/pause", params={"mode": "keep"}, timeout=timeout)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
     def resume(self, timeout: int = 1800) -> None:
+        # [FUNCTION DOC]
+        # Behavior: POST {server_url}/resume to restart generation after a weight update.
+        # Inputs: timeout (int, default 1800). Outputs: none.
+        # Exceptions: generic Exception on non-200 status.
+        # Side effects: network request; server resumes.
         """Resume generation after a weight update."""
         response = requests.post(f"{self.server_url}/resume", timeout=timeout)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
     def init_weight_transfer_engine(self, init_info: dict, timeout: int = 1800) -> None:
+        # [FUNCTION DOC]
+        # Behavior: POST {server_url}/init_weight_transfer_engine with body {init_info: init_info} so the server joins the
+        # NCCL group (the trainer side must join concurrently, see WeightTransferClient).
+        # Inputs: init_info (dict: master address/port, rank offset, world size, optionally packed), timeout (default 1800).
+        # Outputs: none.
+        # Exceptions: generic Exception on non-200 status.
+        # Side effects: network request; server sets up NCCL communicator.
         """Initialise the server side of the NCCL weight-transfer group."""
         response = requests.post(
             f"{self.server_url}/init_weight_transfer_engine", json={"init_info": init_info}, timeout=timeout
@@ -151,6 +231,11 @@ class VLLMClient:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
     def start_weight_update(self, timeout: int = 1800) -> None:
+        # [FUNCTION DOC]
+        # Behavior: POST {server_url}/start_weight_update with is_checkpoint_format True; must finish before weights are sent.
+        # Inputs: timeout (default 1800). Outputs: none.
+        # Exceptions: generic Exception on non-200 status.
+        # Side effects: network request; server workers prepare to reload.
         """Prepare the workers for a weight reload; must complete before any weights are sent."""
         response = requests.post(
             f"{self.server_url}/start_weight_update", json={"is_checkpoint_format": True}, timeout=timeout
@@ -159,6 +244,12 @@ class VLLMClient:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
     def update_weights(self, update_info: dict, timeout: int = 1800) -> None:
+        # [FUNCTION DOC]
+        # Behavior: POST {server_url}/update_weights with body {update_info: update_info}; the call blocks until the server
+        # has received all broadcast chunks over NCCL.
+        # Inputs: update_info (dict of parameter names, dtypes, shapes), timeout (default 1800). Outputs: none.
+        # Exceptions: generic Exception on non-200 status.
+        # Side effects: network request; server weights replaced.
         """Drive the workers' blocking NCCL recv; returns once the server has received every chunk."""
         response = requests.post(
             f"{self.server_url}/update_weights", json={"update_info": update_info}, timeout=timeout
@@ -167,6 +258,11 @@ class VLLMClient:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
     def finish_weight_update(self, timeout: int = 1800) -> None:
+        # [FUNCTION DOC]
+        # Behavior: POST {server_url}/finish_weight_update to finalise a weight reload.
+        # Inputs: timeout (default 1800). Outputs: none.
+        # Exceptions: generic Exception on non-200 status.
+        # Side effects: network request.
         """Finalise the weight update on the server."""
         response = requests.post(f"{self.server_url}/finish_weight_update", timeout=timeout)
         if response.status_code != 200:

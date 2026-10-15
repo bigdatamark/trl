@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# HELPER: Compatibility shims for third-party dependencies, applied automatically when trl is imported.
+# Contents: version-comparison helpers (_is_package_version_below, _is_package_version_at_least) and patch functions
+# (_patch_vllm_logging, _patch_transformers_hybrid_cache).
+# Import-time side effects: runs both patches at import - may set the VLLM_LOGGING_LEVEL environment variable and may
+# monkeypatch transformers.cache_utils and transformers' _LazyModule.__init__.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,6 +35,12 @@ from .import_utils import _is_package_available
 
 
 def _is_package_version_below(package_name: str, version_threshold: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True when package_name is installed and its version is strictly below version_threshold.
+    # Inputs: package_name (str), version_threshold (str, PEP 440 version).
+    # Outputs: bool; False when the package is missing or the check fails.
+    # Exceptions: none - any exception during lookup/parsing is caught, a warning is emitted, and False is returned.
+    # Side effects: may emit a UserWarning.
     """
     Check if installed package version is below the given threshold.
 
@@ -54,6 +67,9 @@ def _is_package_version_below(package_name: str, version_threshold: str) -> bool
 
 
 def _is_package_version_at_least(package_name: str, version_threshold: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True when package_name is installed and its version is greater than or equal to version_threshold.
+    # Inputs/outputs/exceptions/side effects: same as _is_package_version_below, with the comparison reversed.
     """
     Check if installed package version is at least the given threshold.
 
@@ -80,6 +96,10 @@ def _is_package_version_at_least(package_name: str, version_threshold: str) -> b
 
 
 def _patch_vllm_logging() -> None:
+    # [FUNCTION DOC]
+    # HELPER: When vLLM is installed, sets VLLM_LOGGING_LEVEL to ERROR unless the user already set it.
+    # Inputs: none. Outputs: none. Exceptions: none.
+    # Side effects: writes os.environ["VLLM_LOGGING_LEVEL"].
     """Set vLLM logging level to ERROR by default to reduce noise."""
     if _is_package_available("vllm"):
         import os
@@ -88,6 +108,15 @@ def _patch_vllm_logging() -> None:
 
 
 def _patch_transformers_hybrid_cache() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Restores the removed transformers HybridCache name for peft<0.18 on transformers>=5.
+    # Behavior: only when transformers>=5.0.0 and peft<0.18.0: alias transformers.cache_utils.HybridCache to Cache (for
+    # liger_kernel), then wrap transformers' _LazyModule.__init__ so that, when the "transformers" lazy module is built,
+    # "HybridCache" is registered in its import structure under cache_utils, in its class-to-module map, in __all__, and
+    # set as an attribute equal to Cache.
+    # Inputs: none. Outputs: none.
+    # Exceptions: none - failures are caught and reported as a warning.
+    # Side effects: monkeypatches transformers.cache_utils and _LazyModule.__init__ globally.
     """
     Fix HybridCache import for transformers v5 compatibility.
 
@@ -110,6 +139,12 @@ def _patch_transformers_hybrid_cache() -> None:
             _original_lazy_module_init = _LazyModule.__init__
 
             def _patched_lazy_module_init(self, name, *args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Replacement for _LazyModule.__init__; calls the original and, if the module name is "transformers", injects
+                # HybridCache into _import_structure["cache_utils"], _class_to_module, __all__ (each only if present / not already
+                # there) and as an attribute aliasing Cache.
+                # Inputs: self, name, and the original init's args/kwargs. Outputs: none.
+                # Exceptions: whatever the original init raises. Side effects: mutates the lazy module instance.
                 _original_lazy_module_init(self, name, *args, **kwargs)
                 if name == "transformers":
                     # Update _LazyModule's internal structures

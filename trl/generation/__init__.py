@@ -1,3 +1,11 @@
+# [PACKAGE DOC]
+# Package trl.generation: generation backends used by TRL online trainers.
+# Exports VLLMGeneration (from vllm_generation) only when vLLM is installed, as checked by
+# is_vllm_available at import time; otherwise the public list is empty. The vllm_client module is not
+# re-exported and must be imported directly.
+# Side effects on import: when vLLM is available, importing the package eagerly imports vllm_generation
+# (and therefore vLLM and its dependencies).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

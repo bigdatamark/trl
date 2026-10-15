@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Package trl.extras: grab-bag of auxiliary utilities used by trainers (for example the profiling helpers in
+# trl.extras.profiling). The package init itself is empty (license header only) and exports nothing;
+# submodules must be imported explicitly. Side effects on import: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

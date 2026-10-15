@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# HELPER: Shared test utilities for the TRL test suite.
+# Contents: a set of pytest skip markers named require_<feature> (bitsandbytes, comet, harbor, kernels, liger kernel,
+# math_verify, mergekit, openreward, peft, peft with LoraConfig.target_parameters (peft>=0.17.0), requests, response
+# parsing (needs jmespath only when transformers lacks the new response_template parser), rich, accelerator, multiple
+# accelerators, triton, vision, vllm, wandb, no wandb, and at least 3 accelerators); hardware probes
+# (is_ampere_or_newer, is_bf16_supported); the TrlTestCase base class giving each test a temporary directory; the
+# ignore_warnings decorator; and kill_process for tearing down subprocesses (e.g. a vLLM server).
+# Import-time side effects: imports peft when available (to read its version) and evaluates every skip condition once,
+# including querying the accelerator device count.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -91,6 +102,14 @@ require_3_accelerators = pytest.mark.skipif(
 
 
 def is_ampere_or_newer(device_index=0):
+    # [FUNCTION DOC]
+    # HELPER: Reports whether a CUDA GPU is NVIDIA Ampere (compute capability 8.0) or newer.
+    # Behavior: return False if CUDA is unavailable; return False on ROCm builds (torch.version.hip set), since the
+    # capability there is a gfx version; otherwise compare the (major, minor) capability of the device to (8, 0).
+    # Inputs: device_index (int, default 0) - CUDA device to query.
+    # Outputs: bool.
+    # Exceptions: none expected (CUDA query errors propagate).
+    # Side effects: none.
     if not torch.cuda.is_available():
         return False
 
@@ -105,6 +124,11 @@ def is_ampere_or_newer(device_index=0):
 
 
 def is_bf16_supported() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Reports whether the hardware supports bf16 training, so tests can pass bf16=is_bf16_supported().
+    # Behavior: true if transformers reports bf16 GPU support (CUDA Ampere+, XPU, HPU, NPU, ...) or an XLA device is
+    # available. Deliberately ignores the CPU opt-in (use_cpu=True) accepted by TrainingArguments.
+    # Inputs: none. Outputs: bool. Exceptions: none. Side effects: none.
     """Whether the current device has hardware bf16 support for `bf16=True` training.
 
     `is_torch_bf16_gpu_available` already covers CUDA (Ampere or newer), XPU, HPU, NPU, etc., and XLA devices are added
@@ -119,12 +143,25 @@ def is_bf16_supported() -> bool:
 
 
 class TrlTestCase:
+    # [CLASS DOC]
+    # HELPER: Base class for pytest-style test classes; provides self.tmp_dir, a fresh per-test temporary directory path
+    # (string) via an autouse fixture. No other state or methods. Not a unittest.TestCase.
     @pytest.fixture(autouse=True)
     def set_tmp_dir(self, tmp_path):
+        # [FUNCTION DOC]
+        # HELPER: Autouse pytest fixture that stores the pytest tmp_path as a string in self.tmp_dir.
+        # Inputs: tmp_path (pathlib.Path from pytest). Outputs: none. Exceptions: none.
+        # Side effects: sets self.tmp_dir on the test instance.
         self.tmp_dir = str(tmp_path)
 
 
 def ignore_warnings(message: str = None, category: type[Warning] = Warning) -> Callable:
+    # [FUNCTION DOC]
+    # HELPER: Decorator factory that suppresses matching warnings while the decorated test runs.
+    # Inputs: message (regex str or None - None matches any message), category (Warning subclass, default Warning).
+    # Outputs: a decorator that wraps a function so it runs inside a warnings.catch_warnings context with an "ignore"
+    # filter for the given message/category, returning the function's result.
+    # Exceptions: none of its own. Side effects: none outside the wrapped call (warning filters are restored on exit).
     """
     Decorator to ignore warnings with a specific message and/or category.
 
@@ -136,8 +173,15 @@ def ignore_warnings(message: str = None, category: type[Warning] = Warning) -> C
     """
 
     def decorator(test_func):
+        # [FUNCTION DOC]
+        # HELPER: Wraps test_func (preserving its metadata via functools.wraps) in the warning-suppressing wrapper.
+        # Inputs: test_func (callable). Outputs: the wrapper callable. Exceptions: none. Side effects: none.
         @functools.wraps(test_func)
         def wrapper(*args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Calls test_func with the given args/kwargs inside a catch_warnings block with the ignore filter installed.
+            # Inputs: arbitrary positional/keyword args forwarded. Outputs: test_func's return value.
+            # Exceptions: whatever test_func raises. Side effects: temporarily changes warning filters.
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=message, category=category)
                 return test_func(*args, **kwargs)
@@ -148,6 +192,17 @@ def ignore_warnings(message: str = None, category: type[Warning] = Warning) -> C
 
 
 def kill_process(process):
+    # [FUNCTION DOC]
+    # HELPER: Gracefully terminates a subprocess and all of its descendants.
+    # Behavior: for each recursive child (via psutil), send SIGTERM and wait up to 5 s; if it times out, SIGKILL it;
+    # ignore children that already exited. Then terminate the parent and wait up to 5 s, killing it on timeout and
+    # ignoring it if already gone.
+    # Inputs: process - an object with a pid attribute that also supports terminate/wait/kill (e.g. subprocess.Popen).
+    # Outputs: none.
+    # Exceptions: psutil.NoSuchProcess if the parent pid no longer exists when first looked up.
+    # KNOWN ISSUE: for the parent, process.wait(timeout=5) on a subprocess.Popen raises subprocess.TimeoutExpired, not
+    # psutil.TimeoutExpired, so the kill fallback for the parent is never reached and the timeout error propagates.
+    # Side effects: sends signals to processes.
     parent = psutil.Process(process.pid)
     children = parent.children(recursive=True)
     for child in children:

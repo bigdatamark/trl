@@ -1,3 +1,19 @@
+# [PACKAGE DOC]
+# Top-level package of TRL (Transformer Reinforcement Learning): post-training of transformer language models with
+# SFT, DPO, GRPO, RLOO, KTO, reward modeling, distillation and related methods.
+# Exports (lazily): chat template helpers (add_response_schema, clone_chat_template, get_training_chat_template,
+# supports_tool_calling), dataset helpers from data_utils (apply_chat_template, extract_prompt, is_conversational,
+# pack_dataset, unpair_preference_dataset, etc.), create_reference_model, script utilities (TrlParser, ScriptArguments,
+# DatasetMixtureConfig, get_dataset, init_zero_verbose), and trainers/configs/callbacks from trl.trainer (SFTTrainer,
+# DPOTrainer, GRPOTrainer, RLOOTrainer, KTOTrainer, RewardTrainer, DistillationTrainer, their configs, ModelConfig,
+# callbacks, get_peft_config, get_quantization_config). Also __version__ (installed distribution version, or "unknown"
+# when the package metadata is missing).
+# Lazy imports: at runtime the module object in sys.modules is replaced by a _LazyModule built from _import_structure,
+# so submodules are only imported on first attribute access; under TYPE_CHECKING the real imports are done instead for
+# static analysis.
+# Side effects on import: imports trl._compat, which applies compatibility patches (sets VLLM_LOGGING_LEVEL default
+# to ERROR when vLLM is installed; patches transformers HybridCache for old peft), and replaces sys.modules["trl"].
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for the experimental GMPO (Geometric-Mean Policy Optimization) config and trainer
+# (trl.experimental.gmpo). Covers config defaults (log-space clipping epsilon), basic training,
+# eval-dataset handling, conversational prompts, and the KL-regularized path. Uses tiny Qwen2 policy
+# and sequence-classification reward models and the "zen" prompt-only datasets.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +29,13 @@ from ..testing_utils import TrlTestCase
 
 
 class TestGMPOConfig:
+    # [CLASS DOC]
+    # Unit tests for GMPOConfig defaults; no model is loaded. Plain pytest class (no TrlTestCase).
     def test_default_epsilon_is_log_space(self):
+        # [FUNCTION DOC]
+        # Tests that GMPOConfig defaults epsilon to 0.4 (log-space clip range) and leaves the inherited
+        # epsilon_high as None (symmetric range).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # GMPO expresses the clip range in log space; default is the paper's (exp(-0.4), exp(0.4)).
         args = GMPOConfig("dummy")
         assert args.epsilon == 0.4
@@ -31,7 +44,16 @@ class TestGMPOConfig:
 
 
 class TestGMPOTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # Integration tests for GMPOTrainer. Inherits TrlTestCase (self.tmp_dir for outputs). Each test
+    # builds a GMPOConfig with tiny batch/generation/completion sizes and a GMPOTrainer from hub model ids.
     def test_train(self):
+        # [FUNCTION DOC]
+        # Tests that training on standard prompt-only data (lr 0.1, batch 3, 3 generations, 8 completion
+        # tokens, num_iterations 2) logs a train_loss and changes every model parameter.
+        # Setup: snapshot all named parameters before training. Assertions: final log has train_loss; each
+        # parameter differs from its snapshot.
+        # Exceptions: AssertionError. Side effects: writes to tmp_dir; downloads models.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = GMPOConfig(
@@ -63,6 +85,11 @@ class TestGMPOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("eval_dataset_type", ["dataset", "dataset_dict", "dict_of_dataset", "none"])
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over eval_dataset_type in dataset, dataset_dict, dict_of_dataset, none. Tests that the
+        # trainer stores eval_dataset correctly: None stays None; DatasetDict or dict becomes a dict with
+        # keys data1 and data2; a single Dataset is stored as the identical object. No training is run.
+        # Inputs: eval_dataset_type (str). Outputs: none. Exceptions: AssertionError. Side effects: downloads.
         # Streaming datasets are not yet supported in GMPO
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
 
@@ -93,6 +120,10 @@ class TestGMPOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     def test_train_conversational(self, config_name):
+        # [FUNCTION DOC]
+        # Parametrized over standard and conversational prompt-only configs; tests that training completes
+        # and logs a train_loss with the small GMPO settings (num_iterations 2).
+        # Inputs: config_name (str). Outputs: none. Exceptions: AssertionError. Side effects: tmp_dir writes.
         dataset = load_dataset("trl-internal-testing/zen", config_name, split="train")
 
         training_args = GMPOConfig(
@@ -116,6 +147,10 @@ class TestGMPOTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
     def test_train_with_kl(self):
+        # [FUNCTION DOC]
+        # Tests the KL-regularized path (beta=0.1): training logs train_loss, the final log entry contains
+        # a "kl" key, and every parameter changes from its pre-training snapshot.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: tmp_dir writes; downloads.
         # GMPO sequence-averages the KL when beta > 0; exercise that path.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 

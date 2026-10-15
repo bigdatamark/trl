@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Example script: AsyncGRPO training on Harbor coding tasks where an off-the-shelf agent (default mini-swe-agent)
+# runs inside sandboxes managed by an OpenEnv Harbor server; the server's capture proxy records token ids/logprobs of
+# every model call to vLLM, and AsyncGRPOTrainer trains on them via a HarnessRolloutWorker.
+# Main contents: reward shaping constants (W_TOOL_EFFICIENCY 0.3, TOOL_BUDGET 15.0), tool_efficiency, harbor_reward,
+# task_indices, parse_args, main. Not part of the trl package.
+# Import-time side effects: configures root logging at WARNING with a timestamped format; requires the harbor_env
+# package (from the pinned OpenEnv checkout) to be importable.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -96,6 +105,12 @@ TOOL_BUDGET = 15.0
 
 
 def tool_efficiency(n_tool_calls: int | None) -> float | None:
+    # [FUNCTION DOC]
+    # HELPER: Scores how frugally the agent used tools.
+    # Behavior: returns None if the count is None or TOOL_BUDGET is not positive; otherwise one minus count divided by
+    # TOOL_BUDGET, clamped to the range 0 to 1.
+    # Inputs: n_tool_calls (int or None). Outputs: float in [0, 1] or None.
+    # Exceptions: none. Side effects: none.
     """`clip(1 - n/TOOL_BUDGET, 0, 1)`, or `None` when the tool count is unknown."""
     if n_tool_calls is None or TOOL_BUDGET <= 0:
         return None
@@ -103,6 +118,14 @@ def tool_efficiency(n_tool_calls: int | None) -> float | None:
 
 
 def harbor_reward(outcome: HarnessRolloutOutcome) -> float | None:
+    # [FUNCTION DOC]
+    # Behavior: rollout reward function. If outcome.env_reward (verifier score) is None, logs a warning and returns None
+    # (rollout excluded from the group baseline). If outcome.timed_out, logs a warning but keeps the score. Reward is the
+    # float correctness, plus W_TOOL_EFFICIENCY times tool_efficiency(outcome.tool_call_count) only when correctness is at
+    # least 1.0 and efficiency is known.
+    # Inputs: outcome, a HarnessRolloutOutcome. Outputs: float reward or None.
+    # Exceptions: ValueError/TypeError if env_reward cannot be cast to float.
+    # Side effects: warning log lines.
     """Reward for one rollout, or `None` when it is unscorable.
 
     Args:
@@ -132,6 +155,13 @@ def harbor_reward(outcome: HarnessRolloutOutcome) -> float | None:
 
 
 def task_indices(spec: str) -> list[int] | None:
+    # [FUNCTION DOC]
+    # HELPER: Parses the --task-indices option.
+    # Behavior: strips the spec (None treated as empty); empty returns None. A leading "@" means read the rest as a file
+    # path and use its text. Newlines are treated as commas; non-blank comma-separated items are converted to int.
+    # Inputs: spec string. Outputs: list of ints or None.
+    # Exceptions: ValueError on non-integer items; OSError if the file cannot be read.
+    # Side effects: file read when "@path" is used.
     """Read comma-separated task indices, directly or from `@path` (safe for Slurm exports)."""
     spec = (spec or "").strip()
     if not spec:
@@ -142,6 +172,13 @@ def task_indices(spec: str) -> list[int] | None:
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Behavior: builds an argparse parser (description is the module docstring) with options for the OpenEnv server URL,
+    # vLLM URL (required), model, task split (required), harness, sandbox backend, reward key, task count/indices,
+    # generation count, in-flight task limit, completion length, steps, learning rate, temperature, max staleness,
+    # agent timeout/step limit, per-device batch size, output dir, trackio project/space and run name; parses sys.argv.
+    # Inputs: command line. Outputs: argparse.Namespace.
+    # Exceptions: SystemExit on invalid arguments or --help. Side effects: may print usage.
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--server", default="http://127.0.0.1:8200", help="a running `openenv harbor serve`")
     p.add_argument("--vllm-url", required=True, help="the engine AsyncGRPO generates from and syncs weights into")
@@ -172,6 +209,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: parses args; builds a run stamp from SLURM_JOB_ID, HF_JOB_ID, JOB_ID or "local" plus 8 random hex chars;
+    # derives run_name and output_dir (runs/async_grpo_harbor/<run_name>) unless given. Creates a partial
+    # HarborSessionFactory with all harness/sandbox/agent settings, instantiates one to fetch prompt rows as a Dataset,
+    # and closes its private _env in a finally block. Prints a summary, loads the tokenizer, builds AsyncGRPOConfig
+    # (checkpoint every 50 steps keeping 3, full-vocab sampling top_p 1 / top_k -1, bf16, non-reentrant gradient
+    # checkpointing, trackio, log every step, seed 0), builds a HarnessRolloutWorker using harbor_reward as rollout reward
+    # (no reward_funcs, thinking disabled), then trains an AsyncGRPOTrainer with that worker and saves the model.
+    # Inputs: command line. Outputs: none.
+    # Exceptions: propagates server/network/training errors.
+    # Side effects: network calls to OpenEnv and vLLM servers, sandbox creation, stdout prints, trackio logging,
+    # checkpoints and final model written to output_dir.
     args = parse_args()
     stamp = os.environ.get("SLURM_JOB_ID") or os.environ.get("HF_JOB_ID") or os.environ.get("JOB_ID") or "local"
     stamp = f"{stamp}-{uuid.uuid4().hex[:8]}"

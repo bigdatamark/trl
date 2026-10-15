@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# Package trl.kernels: memory-efficient custom compute kernels for log-probability style computations.
+# Always exports ChunkedLogProbFunction (chunked autograd log-prob, from chunked_logprob). When Triton is
+# available (transformers is_triton_available), also exports selective_log_softmax_and_entropy (Triton
+# fused kernel, from logprob_entropy). chunked_divergence is not re-exported.
+# Side effects on import: eagerly imports chunked_logprob, and logprob_entropy (thus Triton) when available.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

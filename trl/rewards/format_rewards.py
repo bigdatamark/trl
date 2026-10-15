@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Format-based reward functions. Contains think_format_reward, which scores whether a completion wraps its
+# reasoning in a single leading think-tag pair. Part of trl.rewards; no import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +20,15 @@ import re
 
 
 def think_format_reward(completions: list[list[dict[str, str]]], **kwargs) -> list[float]:
+    # [FUNCTION DOC]
+    # Behavior: for each completion takes the "content" of its first message and regex-matches (DOTALL and
+    # MULTILINE) a pattern requiring the text to start with "<think>", contain no second "<think>" opening tag
+    # before the first "</think>", then "</think>" followed by anything. Match gives 1.0, else 0.0.
+    # Inputs: completions - list of conversational completions (each a list whose first element is a dict with
+    # "content"); kwargs ignored (accepted for trainer compatibility).
+    # Outputs: list of floats (1.0 or 0.0), one per completion.
+    # Exceptions: KeyError/IndexError if a completion lacks a first message or "content".
+    # Side effects: none.
     r"""
     Reward function that checks if the reasoning process is enclosed within `"<think>"` and `"</think>"` tags. The
     function returns a reward of 1.0 if the format is correct, otherwise 0.0.

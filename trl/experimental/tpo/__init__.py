@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Package trl.experimental.tpo: experimental implementation of TPO (Triple Preference Optimization) training.
+# Exports: TPOConfig (training arguments) and TPOTrainer (the trainer).
+# Imports are eager (no lazy loading). Side effects on import: none beyond those of the submodules.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

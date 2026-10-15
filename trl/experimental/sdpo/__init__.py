@@ -1,3 +1,9 @@
+# [PACKAGE DOC]
+# Experimental package for SDPO (self-distillation policy optimization, a GRPO-style online RL trainer augmented with a self-distillation signal from a feedback-conditioned teacher).
+# Re-exports SDPOConfig (training configuration dataclass) and SDPOTrainer (the trainer) from its submodules; __all__ lists both.
+# Imports are eager (no lazy loading); importing the package imports the trainer module and its heavy dependencies
+# (torch, transformers). No other side effects on import.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -1,3 +1,11 @@
+# [PACKAGE DOC]
+# Package trl.experimental.server_distillation: experimental on-policy distillation where teacher
+# log-probabilities come from a remote server instead of a locally loaded teacher model.
+# Exports: ServerDistillationConfig (training config), ServerDistillationTrainer (the trainer) and
+# build_teacher_request_inputs (helper that builds the token payload sent to the teacher server).
+# Imports are eager (no lazy loading); importing pulls in the config and trainer modules and their dependencies.
+# Side effects on import: none beyond those of the submodules.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

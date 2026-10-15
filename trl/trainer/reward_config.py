@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Defines RewardConfig, the TrainingArguments subclass (via _BaseConfig) used to configure
+# RewardTrainer (Bradley-Terry style reward model training on chosen/rejected pairs).
+# Inputs/Outputs: none at module level. Exceptions: none. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +26,15 @@ from .base_config import _BaseConfig
 
 @dataclass
 class RewardConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass extending _BaseConfig (TRL's TrainingArguments base, which supplies shared default
+    # overrides such as logging_steps, gradient_checkpointing and bf16) with reward-modeling options.
+    # Adds model_init_kwargs to _VALID_DICT_FIELDS so it can be passed as a JSON string on the CLI.
+    # Fields: learning_rate (1e-4 override); model: model_init_kwargs (None), trust_remote_code (False),
+    # chat_template_path (None), disable_dropout (True); data: dataset_num_proc (None), eos_token
+    # (None), max_length (1024, pairs longer than this are filtered out), pad_to_multiple_of ("auto");
+    # training: center_rewards_coefficient (None), activation_offloading (False); deprecated: pad_token.
+    # Construction: keyword args; normalization in __post_init__. Side effects: none beyond that.
     r"""
     Configuration class for the [`RewardTrainer`].
 
@@ -178,6 +192,15 @@ class RewardConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs the parent post-init, then normalizes fields.
+        # Behavior: (1) if pad_to_multiple_of is a string other than "auto" (CLI input), converts "none"/
+        # "null" (case-insensitive) to None and anything else to int; (2) if it is "auto", resolves to 128
+        # when self.device.type is "neuron", else None; (3) emits a FutureWarning when pad_token is set.
+        # Inputs: self. Outputs: none.
+        # Exceptions: ValueError from int conversion of a non-numeric string; whatever the parent raises.
+        # Side effects: mutates pad_to_multiple_of; accessing self.device may initialize the distributed
+        # state; may emit a FutureWarning.
         super().__post_init__()
         # The CLI passes the value as a string
         if isinstance(self.pad_to_multiple_of, str) and self.pad_to_multiple_of != "auto":

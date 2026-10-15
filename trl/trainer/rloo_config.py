@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Defines RLOOConfig, the dataclass of hyperparameters for RLOOTrainer (REINFORCE Leave-One-Out).
+# Main contents: the RLOOConfig dataclass (extends _BaseConfig, itself a TrainingArguments subclass) with
+# fields for model loading, data preprocessing, generation (plain transformers, continuous batching, vLLM
+# colocate/server), the RLOO loss (beta, epsilon clipping, num_iterations, reward weighting/clipping,
+# advantage normalization), reference model syncing and completion logging.
+# Fits in the package as the config consumed by trl.trainer.rloo_trainer and parsed by the CLI through
+# HfArgumentParser.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +31,18 @@ from .base_config import _BaseConfig
 
 @dataclass
 class RLOOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Configuration dataclass for RLOOTrainer; every field is a dataclass field with help metadata for CLI parsing.
+    # Inheritance: _BaseConfig -> transformers.TrainingArguments. Overrides learning_rate default to 1e-6.
+    # Key defaults: num_generations 2, max_completion_length 512, temperature 1.0, top_p 1.0, top_k 0,
+    # beta 0.05, num_iterations 1, epsilon 0.2, epsilon_high None (falls back to epsilon in the trainer),
+    # normalize_advantages False, mask_truncated_completions False, vllm_mode "colocate",
+    # vllm_gpu_memory_utilization 0.3, vllm_server_port 8000, vllm_group_port 51216, ref_model_sync_steps 512,
+    # ref_model_mixup_alpha 0.6, pad_to_multiple_of "auto", shuffle_dataset True, disable_dropout False.
+    # Derived state (filled in __post_init__): generation_batch_size and steps_per_generation are resolved
+    # from each other; pad_to_multiple_of becomes an int or None.
+    # Inputs: keyword arguments for any field. Outputs: the config instance.
+    # Exceptions: see __post_init__. Side effects: see __post_init__ (warnings).
     r"""
     Configuration class for the [`RLOOTrainer`].
 
@@ -617,6 +639,29 @@ class RLOOConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: validates and normalizes the config after dataclass init, in this order:
+        # 1. Calls the parent __post_init__.
+        # 2. If pad_to_multiple_of is a string other than "auto", maps "none"/"null" (case-insensitive) to None,
+        #    otherwise converts it to int. If it is "auto", sets 128 when the device type is "neuron", else None.
+        # 3. If use_transformers_paged is set, emits a FutureWarning (deprecated) and sets
+        #    use_transformers_continuous_batching to True.
+        # 4. Rejects a parallelism_config with context or sequence parallelism enabled.
+        # 5. Rejects auto_find_batch_size (would break full prompt groups).
+        # 6. Resolves the generation batch with world_size processes: if neither generation_batch_size nor
+        #    steps_per_generation is given, steps_per_generation = gradient_accumulation_steps and
+        #    generation_batch_size = per-device train batch size * processes * steps_per_generation; if only
+        #    generation_batch_size is given, it must be divisible by the global batch (per-device * processes) and
+        #    steps_per_generation is the quotient; if only steps_per_generation is given, generation_batch_size is
+        #    derived from it; if both are given, error.
+        # 7. When do_eval is true and eval_strategy is not "no", the global eval batch must be divisible by
+        #    num_generations_eval (or num_generations if unset).
+        # 8. generation_batch_size must be divisible by num_generations, and num_generations must be at least 2.
+        # Inputs: self. Outputs: none.
+        # Exceptions: ValueError for each failed check above (CP/SP parallelism, auto_find_batch_size, indivisible
+        # batch sizes, both batch knobs set, num_generations below 2).
+        # Side effects: mutates pad_to_multiple_of, use_transformers_continuous_batching, generation_batch_size,
+        # steps_per_generation; may emit a FutureWarning.
         super().__post_init__()
         # The CLI passes the value as a string
         if isinstance(self.pad_to_multiple_of, str) and self.pad_to_multiple_of != "auto":

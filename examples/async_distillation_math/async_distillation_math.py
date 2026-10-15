@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Example script: asynchronous on-policy distillation of Qwen2.5-0.5B-Instruct (student) on GSM8K using a
+# Qwen2.5-1.5B-Instruct teacher served by a remote vLLM server (scored only, never loaded locally).
+# Main contents: format_sample (dataset mapping) and main (builds AsyncDistillationConfig/AsyncDistillationTrainer
+# and trains). Expects a teacher vLLM server on localhost:8001 and a student vLLM server with NCCL weight transfer on
+# localhost:8000. Not part of the trl package; run as a script.
+# Import-time side effects: none beyond importing datasets and trl.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,10 +54,24 @@ from trl.experimental.async_distillation import AsyncDistillationConfig, AsyncDi
 
 
 def format_sample(sample):
+    # [FUNCTION DOC]
+    # HELPER: Converts a GSM8K row into a conversational prompt.
+    # Inputs: sample, a dict with a "question" string.
+    # Outputs: dict with key "prompt" holding a single user message whose content is the question.
+    # Exceptions: KeyError if "question" is missing. Side effects: none.
     return {"prompt": [{"role": "user", "content": sample["question"]}]}
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: loads the GSM8K "main" train split, maps it with format_sample (dropping original columns), builds an
+    # AsyncDistillationConfig (output_dir async_distillation_gsm8k, no checkpoint saving, batch 16, grad accumulation 2,
+    # max completion length 256, single teacher "default" at localhost:8001, student vLLM at localhost:8000, 100 steps,
+    # lr 1e-6, trackio reporting with completion logging), creates the trainer for Qwen/Qwen2.5-0.5B-Instruct, trains,
+    # then calls trainer.end() to shut down background workers.
+    # Inputs: none. Outputs: none.
+    # Exceptions: propagates dataset download, connection and training errors.
+    # Side effects: network downloads, HTTP traffic to vLLM servers, trackio logging, files under output_dir.
     dataset = load_dataset("openai/gsm8k", "main", split="train")
     dataset = dataset.map(format_sample, remove_columns=dataset.column_names)
 

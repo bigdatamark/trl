@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Defines ModelConfig, the CLI-parsable dataclass describing how to load a model for TRL scripts:
+# checkpoint/revision, dtype, attention implementation, PEFT/LoRA settings and bitsandbytes
+# quantization settings. Consumed by helpers in trl (e.g. get_peft_config, get_quantization_config)
+# and by the trl CLI scripts via HfArgumentParser.
+# Inputs/Outputs: none at module level. Exceptions: none. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +24,17 @@ from dataclasses import dataclass, field
 
 @dataclass
 class ModelConfig:
+    # [CLASS DOC]
+    # Plain dataclass (no base class) holding model-loading options; each field carries argparse help
+    # metadata so HfArgumentParser can expose it as a command-line flag.
+    # Key fields: model_name_or_path (None), model_revision ("main"), dtype ("float32", choices auto,
+    # bfloat16, float16, float32), attn_implementation (None), use_peft (False), lora_r (16),
+    # lora_alpha (32), lora_dropout (0.05), lora_target_modules / lora_target_parameters /
+    # lora_modules_to_save (None), lora_task_type ("CAUSAL_LM"), use_rslora, use_dora, load_in_8bit,
+    # load_in_4bit (all False), bnb_4bit_quant_type ("nf4", choices fp4/nf4), use_bnb_nested_quant
+    # (False), bnb_4bit_quant_storage (None).
+    # Construction: keyword args per field; validation and normalization happen in __post_init__.
+    # Side effects: none beyond attribute storage.
     """
     Configuration class for the models.
 
@@ -171,6 +189,14 @@ class ModelConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates and normalizes fields after dataclass init.
+        # Behavior: raises if both load_in_8bit and load_in_4bit are set; if lora_target_modules is a
+        # sized object of length exactly one, replaces it with its single element (so a one-item list
+        # such as ["all-linear"] becomes the plain string).
+        # Inputs: self. Outputs: none.
+        # Exceptions: ValueError when 8-bit and 4-bit loading are both requested.
+        # Side effects: may mutate self.lora_target_modules.
         if self.load_in_8bit and self.load_in_4bit:
             raise ValueError("You can't use 8 bit and 4 bit precision at the same time")
 

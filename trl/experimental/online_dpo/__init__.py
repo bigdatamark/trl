@@ -1,3 +1,9 @@
+# [PACKAGE DOC]
+# Experimental package for Online DPO (online Direct Preference Optimization: generate completions on the fly, rank them with a judge or reward model, apply DPO-style loss).
+# Re-exports OnlineDPOConfig (training configuration dataclass) and OnlineDPOTrainer (the trainer) from its submodules; __all__ lists both.
+# Imports are eager (no lazy loading); importing the package imports the trainer module and its heavy dependencies
+# (torch, transformers). No other side effects on import.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

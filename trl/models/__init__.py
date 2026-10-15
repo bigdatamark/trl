@@ -1,3 +1,13 @@
+# [PACKAGE DOC]
+# Package trl.models: model-level utilities shared by trainers.
+# Exports (lazily, via _LazyModule): get_act_offloading_ctx_manager (activation CPU offloading),
+# enable_selective_activation_checkpointing, and from utils: create_reference_model, prepare_deepspeed,
+# prepare_fsdp, unwrap_model_for_generation.
+# Lazy-import behavior: at runtime the module object in sys.modules is replaced by a _LazyModule that imports
+# the submodule only on first attribute access; under TYPE_CHECKING the names are imported directly for
+# static analysis.
+# Side effects on import: replaces this package's entry in sys.modules; no heavy imports happen until use.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

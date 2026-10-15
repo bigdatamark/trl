@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Miscellaneous shaping rewards operating on completion token ids: an n-gram repetition penalty and the DAPO soft
+# overlong punishment. Each public factory returns an instance of a private callable class (not a closure) so
+# the reward function is picklable for the async GRPO rollout worker that sends reward funcs to a child process.
+# No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,6 +22,13 @@ from collections.abc import Callable
 
 
 def get_repetition_penalty_reward(ngram_size: int = 3, max_penalty: float = -1.0) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: validates max_penalty and returns a _RepetitionPenalty callable configured with ngram_size and
+    # max_penalty.
+    # Inputs: ngram_size (default 3); max_penalty (default -1.0, must be <= 0).
+    # Outputs: _RepetitionPenalty instance (called with completion_ids).
+    # Exceptions: ValueError if max_penalty is positive.
+    # Side effects: none.
     # docstyle-ignore
     r"""
     Reward function that penalizes repeated n-grams in a completion, used to discourage degenerate, repetitive text
@@ -60,15 +73,32 @@ def get_repetition_penalty_reward(ngram_size: int = 3, max_penalty: float = -1.0
 
 
 class _RepetitionPenalty:
+    # [CLASS DOC]
+    # HELPER: Picklable callable implementing the repetition penalty reward.
+    # State: ngram_size, max_penalty; class attribute __name__ set to "repetition_penalty_reward" so trainers log
+    # metrics under that name.
+    # Constructed by get_repetition_penalty_reward; no base class.
     # Callable class rather than a closure so the reward stays picklable: the async GRPO rollout
     # worker forwards reward funcs to a spawned child process, and closures can't be pickled.
     __name__ = "repetition_penalty_reward"
 
     def __init__(self, ngram_size: int, max_penalty: float):
+        # [FUNCTION DOC]
+        # HELPER: Stores ngram_size and max_penalty on the instance.
+        # Inputs: ngram_size (int), max_penalty (float). Outputs: none. Exceptions: none. Side effects: sets attributes.
         self.ngram_size = ngram_size
         self.max_penalty = max_penalty
 
     def __call__(self, completion_ids: list[list[int]], **kwargs) -> list[float]:
+        # [FUNCTION DOC]
+        # HELPER: Computes one penalty per completion.
+        # Behavior: completions shorter than ngram_size get 0.0. Otherwise builds all contiguous token n-grams (sliding
+        # window of length ngram_size), computes scaling = 1 minus (unique n-grams / total n-grams) and appends
+        # scaling times max_penalty (0.0 when scaling is zero).
+        # Inputs: completion_ids - list of token-id lists; kwargs ignored.
+        # Outputs: list of floats in the range from max_penalty to 0.0.
+        # Exceptions: none expected.
+        # Side effects: none.
         rewards = []
         for ids in completion_ids:
             if len(ids) < self.ngram_size:
@@ -81,6 +111,15 @@ class _RepetitionPenalty:
 
 
 def get_soft_overlong_punishment(max_completion_len: int, soft_punish_cache: int) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: returns a _SoftOverlongPunishment callable implementing DAPO Eq. 13 with L_max = max_completion_len
+    # and L_cache = soft_punish_cache.
+    # Inputs: max_completion_len (int), soft_punish_cache (int).
+    # Outputs: _SoftOverlongPunishment instance.
+    # Exceptions: none at construction (see __call__ for the zero-cache case).
+    # Side effects: none.
+    # KNOWN ISSUE: the docstring example shows the expected output with a leading ">>>" prompt ("[-0.5]" is
+    # written as a statement), so it is not a valid doctest output line.
     # docstyle-ignore
     r"""
     Reward function that penalizes overlong completions. It is used to penalize overlong completions, but not to reward
@@ -114,16 +153,32 @@ def get_soft_overlong_punishment(max_completion_len: int, soft_punish_cache: int
 
 
 class _SoftOverlongPunishment:
+    # [CLASS DOC]
+    # HELPER: Picklable callable implementing the soft overlong punishment.
+    # State: max_completion_len, soft_punish_cache; class attribute __name__ "soft_overlong_punishment_reward"
+    # (kept equal to the former inner-function name so logged metric keys are unchanged).
+    # Constructed by get_soft_overlong_punishment; no base class.
     # Callable class rather than a closure so the reward stays picklable: the async GRPO rollout
     # worker forwards reward funcs to a spawned child process, and closures can't be pickled.
     # `__name__` mirrors the old inner-function name so metric logging keys are unchanged.
     __name__ = "soft_overlong_punishment_reward"
 
     def __init__(self, max_completion_len: int, soft_punish_cache: int):
+        # [FUNCTION DOC]
+        # HELPER: Stores max_completion_len and soft_punish_cache on the instance.
+        # Inputs: the two ints. Outputs: none. Exceptions: none. Side effects: sets attributes.
         self.max_completion_len = max_completion_len
         self.soft_punish_cache = soft_punish_cache
 
     def __call__(self, completion_ids: list[list[int]], **kwargs) -> list[float]:
+        # [FUNCTION DOC]
+        # HELPER: Computes one punishment per completion from its length.
+        # Behavior: length <= max - cache gives 0.0; max - cache < length <= max gives a linear ramp
+        # (max - cache - length) / cache, going from 0 toward -1; length > max gives -1.0.
+        # Inputs: completion_ids - list of token-id lists; kwargs ignored.
+        # Outputs: list of floats in [-1.0, 0.0].
+        # Exceptions: none (with cache 0 the middle branch is never reached, so no division by zero).
+        # Side effects: none.
         rewards = []
         for ids in completion_ids:
             completion_length = len(ids)

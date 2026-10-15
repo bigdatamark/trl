@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# HELPER: Shared constants for tests that talk to the Hugging Face Hub CI endpoint.
+# Contents: CI_HUB_USER (dummy CI username), CI_HUB_USER_FULL_NAME (its display name), CI_HUB_ENDPOINT (URL of the
+# hub-ci staging server). Only plain string constants; no functions or classes.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

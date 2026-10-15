@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Experimental package integrating OpenReward environments with TRL trainers.
+# Re-exports only OpenRewardSpec from the private _spec module (the environment module is imported on demand by the spec).
+# Eager import of _spec; no other side effects on import.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
