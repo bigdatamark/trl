@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Tests for trl SFTTrainer, SFTConfig and DataCollatorForLanguageModeling (trl.trainer.sft_trainer).
+# Main contents: collator unit tests (padding, padding-free, packing, position ids) and a large TestSFTTrainer
+# class covering model loading, dataset formats, losses (nll, dft), MoE auxiliary loss, PEFT variants,
+# packing, completion/assistant-only loss, chat templates, tool calls, kernels, and VLM tests.
+# Uses tiny models from trl-internal-testing and zen datasets. PEFT symbols are imported only if peft is
+# installed; optional-dependency tests are gated by require_* decorators.
+# Import-time side effects: conditional peft import.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,7 +69,16 @@ if is_peft_available():
 
 
 class TestDataCollatorForLanguageModeling(TrlTestCase):
+    # [CLASS DOC]
+    # Tests DataCollatorForLanguageModeling. In padded mode it right-pads input_ids with pad_token_id, returns
+    # attention_mask and labels (given labels or input_ids, with -100 on padding) and optionally position_ids. In
+    # padding-free mode it concatenates all examples into one row and returns position_ids restarting at each
+    # document, labels with -100 on each document's first token, cumulative sequence lengths (cu_seq_lens_q/k),
+    # max lengths and seq_idx. Also tests the static helper get_position_ids_from_packed_seq_lengths.
     def test_basic_padding(self):
+        # [FUNCTION DOC]
+        # Asserts padded input_ids, attention_mask and labels with -100 on padding, and exactly these three keys.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test basic padding."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0)
         examples = [{"input_ids": [1, 2, 3], "labels": [1, 2, 3]}, {"input_ids": [4, 5], "labels": [4, 5]}]
@@ -73,6 +91,9 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["labels"], torch.tensor([[1, 2, 3], [4, 5, -100]]))
 
     def test_without_labels(self):
+        # [FUNCTION DOC]
+        # Asserts that without a labels key, labels default to input_ids with -100 on padding.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """When no labels are provided, they default to the input IDs (padding excluded)."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0)
         examples = [{"input_ids": [1, 2, 3]}, {"input_ids": [4, 5]}]
@@ -85,6 +106,10 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["labels"], torch.tensor([[1, 2, 3], [4, 5, -100]]))
 
     def test_provided_labels_not_reconstructed_from_masks(self):
+        # [FUNCTION DOC]
+        # Asserts that provided labels are used as is: completion_mask and assistant_masks columns are ignored and do not
+        # add -100 entries; output keys are only input_ids, attention_mask, labels.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Provided labels are used as is, never rebuilt from the mask columns. Here the labels match the input IDs
         (every token trainable); the masks would introduce -100 if they were consumed, so the labels staying equal to
         the input IDs proves the masks are ignored."""
@@ -101,6 +126,9 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["labels"], torch.tensor([[1, 2, 3], [4, 5, -100]]))
 
     def test_return_position_ids(self):
+        # [FUNCTION DOC]
+        # Asserts that with return_position_ids, padded output also has position_ids counting 0..n-1 per row with 0 on
+        # padding. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Padded mode with return_position_ids: position IDs are returned alongside the attention mask."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0, return_position_ids=True)
         examples = [{"input_ids": [1, 2, 3], "labels": [1, 2, 3]}, {"input_ids": [4, 5], "labels": [4, 5]}]
@@ -114,6 +142,9 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["labels"], torch.tensor([[1, 2, 3], [4, 5, -100]]))
 
     def test_return_position_ids_packed(self):
+        # [FUNCTION DOC]
+        # Asserts that with seq_lengths in padded mode, position_ids restart at each packed document boundary.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Padded mode with return_position_ids on packed examples: position IDs reset at document boundaries."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0, return_position_ids=True)
         examples = [{"input_ids": [1, 2, 3, 4, 5], "seq_lengths": [3, 2]}, {"input_ids": [6, 7], "seq_lengths": [2]}]
@@ -125,6 +156,10 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["position_ids"], torch.tensor([[0, 1, 2, 0, 1], [0, 1, 0, 0, 0]]))
 
     def test_padding_free_mode(self):
+        # [FUNCTION DOC]
+        # Asserts padding-free output: one concatenated row, restarting position_ids, labels with -100 at document starts,
+        # cu_seq_lens_q of 0, 3, 5 (int32), max_length_q 3, and the full padding-free key set.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test padding-free mode where sequences are concatenated."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0, padding_free=True)
         examples = [{"input_ids": [1, 2, 3], "labels": [1, 2, 3]}, {"input_ids": [4, 5], "labels": [4, 5]}]
@@ -148,6 +183,9 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         assert result["max_length_q"] == 3
 
     def test_padding_free_without_labels(self):
+        # [FUNCTION DOC]
+        # Same expectations as the padding-free test when examples have no labels.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Padding-free mode without labels: labels default to the input IDs (document starts masked)."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0, padding_free=True)
         examples = [{"input_ids": [1, 2, 3]}, {"input_ids": [4, 5]}]
@@ -171,6 +209,11 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         assert result["max_length_q"] == 3
 
     def test_packing(self):
+        # [FUNCTION DOC]
+        # Asserts padding-free collation of packed examples with seq_lengths splits documents correctly: position_ids
+        # restart per document, labels mask each document start, cu_seq_lens_q 0, 3, 6, 10, 11, max_length_q 4, and
+        # seq_idx enumerates the four documents. No attention_mask is returned.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test that when using packing with position_ids, attention_mask is dropped with fa2."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0, padding_free=True)
 
@@ -202,6 +245,9 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         )
 
     def test_pad_to_multiple_of(self):
+        # [FUNCTION DOC]
+        # Asserts padded mode with pad_to_multiple_of 4 pads rows to length 4 with matching mask and -100 labels.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test padding to multiple of specified value."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0, pad_to_multiple_of=4)
         examples = [{"input_ids": [1, 2, 3], "labels": [1, 2, 3]}, {"input_ids": [4, 5], "labels": [4, 5]}]
@@ -214,6 +260,10 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["labels"], torch.tensor([[1, 2, 3, -100], [4, 5, -100, -100]]))
 
     def test_pad_to_multiple_of_and_padding_free(self):
+        # [FUNCTION DOC]
+        # Asserts padding-free mode with pad_to_multiple_of 4 pads the single row to length 8; the padding positions get
+        # position 0 and label -100 and each padding token appears as its own one-token sequence in cu_seq_lens_q
+        # (0, 3, 5, 6, 7, 8); max_length_q 3. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test padding to multiple of specified value."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0, padding_free=True, pad_to_multiple_of=4)
         examples = [{"input_ids": [1, 2, 3], "labels": [1, 2, 3]}, {"input_ids": [4, 5], "labels": [4, 5]}]
@@ -237,6 +287,9 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         assert result["max_length_q"] == 3
 
     def test_custom_position_ids_but_no_padding_free(self):
+        # [FUNCTION DOC]
+        # Asserts seq_lengths are ignored in padded mode without return_position_ids: only input_ids, attention_mask and
+        # labels are returned. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test that custom position_ids are ignored if padding_free is False."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0)
         examples = [
@@ -252,6 +305,9 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["labels"], torch.tensor([[1, 2, 3], [4, 5, -100]]))
 
     def test_single_example(self):
+        # [FUNCTION DOC]
+        # Asserts a single example is returned unpadded with all-ones mask and labels equal to input_ids.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test collator with a single example."""
         collator = DataCollatorForLanguageModeling(pad_token_id=0)
         examples = [{"input_ids": [1, 2, 3, 4], "labels": [1, 2, 3, 4]}]
@@ -264,6 +320,9 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["labels"], torch.tensor([[1, 2, 3, 4]]))
 
     def test_different_pad_token_id(self):
+        # [FUNCTION DOC]
+        # Asserts padding uses pad_token_id 999 while labels still use -100.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test with different pad token ID."""
         collator = DataCollatorForLanguageModeling(pad_token_id=999)
         examples = [{"input_ids": [1, 2, 3], "labels": [1, 2, 3]}, {"input_ids": [4, 5], "labels": [4, 5]}]
@@ -276,12 +335,18 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         torch.testing.assert_close(result["labels"], torch.tensor([[1, 2, 3], [4, 5, -100]]))
 
     def test_single_example_single_doc(self):
+        # [FUNCTION DOC]
+        # Asserts get_position_ids_from_packed_seq_lengths on one example with one document of length 5 returns a list
+        # with one tensor 0..4. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         batch_seq_lengths = [[5]]
         result = DataCollatorForLanguageModeling.get_position_ids_from_packed_seq_lengths(batch_seq_lengths)
         assert len(result) == 1
         assert torch.equal(result[0], torch.arange(5))
 
     def test_single_example_multiple_docs(self):
+        # [FUNCTION DOC]
+        # Asserts lengths 3 and 2 in one example give positions 0, 1, 2, 0, 1. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         batch_seq_lengths = [[3, 2]]
         result = DataCollatorForLanguageModeling.get_position_ids_from_packed_seq_lengths(batch_seq_lengths)
         assert len(result) == 1
@@ -289,6 +354,9 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
         assert torch.equal(result[0], torch.tensor([0, 1, 2, 0, 1]))
 
     def test_multiple_examples(self):
+        # [FUNCTION DOC]
+        # Asserts two examples (lengths 2+2 and 3) give two tensors 0, 1, 0, 1 and 0, 1, 2.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         batch_seq_lengths = [[2, 2], [3]]
         result = DataCollatorForLanguageModeling.get_position_ids_from_packed_seq_lengths(batch_seq_lengths)
         assert len(result) == 2
@@ -297,12 +365,24 @@ class TestDataCollatorForLanguageModeling(TrlTestCase):
 
 
 class TestSFTTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # End-to-end SFTTrainer tests. Most use self.tmp_dir as output_dir and report_to none with the tiny Qwen2 model
+    # and zen datasets. Common "standard train check": snapshot named parameters, train, assert the last log entry
+    # has train_loss and every parameter changed. Common "PEFT train check": base-model parameters (prefixed
+    # base_model.model.) unchanged and other non-base_layer parameters changed. Inherits TrlTestCase.
     def test_init_with_training_arguments(self):
+        # [FUNCTION DOC]
+        # Asserts the trainer accepts a plain transformers TrainingArguments instead of SFTConfig.
+        # Inputs/Outputs: none. Exceptions: construction errors. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
         args = TrainingArguments(output_dir=self.tmp_dir, report_to="none")
         SFTTrainer(model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=args, train_dataset=dataset)
 
     def test_init_auto_processing_class_uses_model_revision(self):
+        # [FUNCTION DOC]
+        # With model_init_kwargs revision pinned, asserts the auto-loaded tokenizer comes from that revision (its chat
+        # template is 2558 characters long, unlike main). Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: downloads a specific revision.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
         trainer = SFTTrainer(
             model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
@@ -358,6 +438,11 @@ class TestSFTTrainer(TrlTestCase):
         ],
     )
     def test_train(self, model_id):
+        # [FUNCTION DOC]
+        # Runs the standard train check across many causal LMs (Cohere2, FalconMamba, GLM4 MoE, GPT-OSS, Qwen2,
+        # R1-Distill, Qwen3 MoE, Nemotron-H, Olmo3, LFM2/2.5; some skipped on old transformers); if aux_loss_enabled also
+        # asserts aux_loss is logged. Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, report_to="none")
@@ -388,6 +473,9 @@ class TestSFTTrainer(TrlTestCase):
         ],
     )
     def test_train_dataset_format(self, config_name):
+        # [FUNCTION DOC]
+        # Runs the standard train check on standard/conversational language-modeling and prompt-completion datasets.
+        # Inputs: config_name (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", config_name, split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, report_to="none")
@@ -407,6 +495,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_trust_remote_code(self):
+        # [FUNCTION DOC]
+        # Asserts a remote-code model id raises ValueError mentioning custom code without trust_remote_code and loads as
+        # RemoteForCausalLM with it. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: may download code.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
         model_id = "trl-internal-testing/tiny-RemoteForCausalLM"
 
@@ -426,6 +517,9 @@ class TestSFTTrainer(TrlTestCase):
 
     # Special case for harmony
     def test_train_gpt_oss(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on tiny GPT-OSS with the harmony language-modeling dataset.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/harmony", "language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, report_to="none")
@@ -445,6 +539,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_model(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with a float32 model instance. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         model = AutoModelForCausalLM.from_pretrained(
             "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
             dtype="float32",
@@ -467,6 +564,11 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_dft_loss_matches_reference(self):
+        # [FUNCTION DOC]
+        # With loss_type dft, calls compute_loss on random 2x8 ids whose first 3 label positions are -100 and compares it
+        # (tolerance 1e-4) with a reference: shift logits and labels by one, take per-token log-probabilities of the
+        # labels, weight each negative log-probability by the detached token probability, average over unmasked tokens.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
         training_args = SFTConfig(output_dir=self.tmp_dir, loss_type="dft", report_to="none")
         trainer = SFTTrainer(
@@ -489,6 +591,10 @@ class TestSFTTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("num_items_in_batch", [None, 0])
     def test_dft_loss_without_trainable_tokens(self, num_items_in_batch):
+        # [FUNCTION DOC]
+        # With dft loss and all labels -100, asserts compute_loss returns exactly 0.0 and backward yields only finite
+        # gradients, for num_items_in_batch None and 0. Inputs: num_items_in_batch (parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: populates parameter gradients.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
         training_args = SFTConfig(output_dir=self.tmp_dir, loss_type="dft", report_to="none")
         trainer = SFTTrainer(
@@ -508,6 +614,9 @@ class TestSFTTrainer(TrlTestCase):
         assert all(torch.isfinite(p.grad).all() for p in trainer.model.parameters() if p.grad is not None)
 
     def test_train_dft_loss(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with dft loss, lr 0.1 and eval every 3 steps.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
         training_args = SFTConfig(
@@ -537,8 +646,14 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_formatting_func(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on a preference dataset converted to text by a formatting_func.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Dummy formatting function
         def formatting_prompts_func(example):
+            # [FUNCTION DOC]
+            # HELPER: Returns a two-line string with headers Chosen and Rejected followed by the example's chosen and
+            # rejected texts. Inputs: example (dict). Outputs: str. Exceptions: KeyError if fields missing. Side effects: none.
             chosen, rejected = example["chosen"], example["rejected"]
             return f"### Chosen: {chosen}\n### Rejected: {rejected}"
 
@@ -564,6 +679,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_model_dtype(self):
+        # [FUNCTION DOC]
+        # Trains with model_init_kwargs dtype float16 (lr 0.1); asserts every non-layernorm parameter is float16 and
+        # changed. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(
@@ -595,6 +713,9 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_init_is_seeded(self):
+        # [FUNCTION DOC]
+        # Builds two LoRA trainers after different global torch seeds and asserts identical non-empty lora_A weights.
+        # Requires peft. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: changes the global seed.
         # Two trainers with the same seed start from the same adapter weights
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
         adapters = []
@@ -614,6 +735,9 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_peft
     def test_train_dense_with_peft_config_lora(self):
+        # [FUNCTION DOC]
+        # Runs the PEFT train check with a model id and default LoraConfig. Requires peft. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
@@ -653,6 +777,11 @@ class TestSFTTrainer(TrlTestCase):
     )
     @require_peft
     def test_train_with_peft_config_prompt_tuning(self, peft_type):
+        # [FUNCTION DOC]
+        # For prompt tuning, prefix tuning (xfail on peft 0.17.1 or older) and prompt encoder (p-tuning), each with 4
+        # virtual tokens, bf16 and gradient checkpointing off: trains and asserts base parameters (prefixed
+        # base_model.) are unchanged and all other parameters changed. Requires peft.
+        # Inputs: peft_type (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.{n}" for n, _ in model.named_parameters()]
@@ -706,6 +835,10 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_peft_target_parameters
     def test_train_moe_with_peft_config(self):
+        # [FUNCTION DOC]
+        # Runs the PEFT train check on tiny GPT-OSS with LoRA target_parameters on expert down_proj and gate_up_proj.
+        # Requires peft target_parameters support. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         model_id = "trl-internal-testing/tiny-GptOssForCausalLM"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
@@ -747,6 +880,11 @@ class TestSFTTrainer(TrlTestCase):
         ],
     )
     def test_router_aux_loss_coef_defaults_to_the_architecture(self, model_id, expect_coef, expect_aux_loss):
+        # [FUNCTION DOC]
+        # Asserts router_aux_loss_coef and aux_loss_enabled default from the architecture: Qwen3 MoE gives 0.001 and
+        # enabled; DeepseekV3 (router-bias balancing) and dense Qwen2 give 0.0 and disabled.
+        # Inputs: model_id, expect_coef, expect_aux_loss (parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train[:2]")
         training_args = SFTConfig(output_dir=self.tmp_dir, report_to="none")
         trainer = SFTTrainer(model=model_id, args=training_args, train_dataset=dataset)
@@ -755,6 +893,9 @@ class TestSFTTrainer(TrlTestCase):
         assert trainer.aux_loss_enabled == expect_aux_loss
 
     def test_router_aux_loss_coef_fails_without_router_logits(self):
+        # [FUNCTION DOC]
+        # Asserts setting router_aux_loss_coef 0.5 on a dense model raises ValueError (not a Mixture-of-Experts model).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train[:2]")
         training_args = SFTConfig(output_dir=self.tmp_dir, router_aux_loss_coef=0.5, report_to="none")
 
@@ -765,6 +906,9 @@ class TestSFTTrainer(TrlTestCase):
             )
 
     def test_router_aux_loss_coef_explicit_value_overrides_the_architecture(self):
+        # [FUNCTION DOC]
+        # Asserts an explicit router_aux_loss_coef 0.5 on Qwen3 MoE is used and aux loss is enabled.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train[:2]")
         training_args = SFTConfig(output_dir=self.tmp_dir, router_aux_loss_coef=0.5, report_to="none")
 
@@ -776,10 +920,21 @@ class TestSFTTrainer(TrlTestCase):
         assert trainer.aux_loss_enabled
 
     def test_aux_loss_does_not_scale_with_gradient_accumulation(self):
+        # [FUNCTION DOC]
+        # Uses four copies of one example. Measures the router weight update of the first Qwen3 MoE layer after one SGD
+        # step (lr 1.0, no clipping) with and without the auxiliary loss (coef 1.0 vs 0.0); the difference isolates the
+        # aux-loss contribution. Asserts that contribution with batch 4 and no accumulation matches batch 2 with 2
+        # accumulation steps (rtol 1e-3, atol 1e-6). Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: builds and trains four trainers in tmp_dir.
         # Four copies of one example: every micro-batch has the same aux loss as the full batch
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train").select([0] * 4)
 
         def router_update(batch_size, gradient_accumulation_steps, router_aux_loss_coef):
+            # [FUNCTION DOC]
+            # HELPER: Builds a trainer with the given per-device batch size, gradient accumulation steps and
+            # router_aux_loss_coef (max_steps 1, plain SGD, lr 1.0, max_grad_norm 0), trains one step and returns the change
+            # in the first layer's router gate weight. Inputs: batch_size, gradient_accumulation_steps (int),
+            # router_aux_loss_coef (float). Outputs: tensor. Exceptions: none expected. Side effects: writes tmp_dir.
             training_args = SFTConfig(
                 output_dir=self.tmp_dir,
                 per_device_train_batch_size=batch_size,
@@ -806,6 +961,9 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_peft
     def test_train_peft_model(self):
+        # [FUNCTION DOC]
+        # Runs the PEFT train check with a model already wrapped by get_peft_model (default LoRA). Requires peft.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
 
@@ -838,6 +996,9 @@ class TestSFTTrainer(TrlTestCase):
     # explicitly test PEFT + gradient checkpointing, which has caused issues in the past.
     @require_peft
     def test_train_with_peft_config_and_gradient_checkpointing(self):
+        # [FUNCTION DOC]
+        # Runs the PEFT train check with LoRA and gradient_checkpointing explicitly True (regression guard).
+        # Requires peft. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
@@ -870,6 +1031,10 @@ class TestSFTTrainer(TrlTestCase):
     @pytest.mark.parametrize("use_reentrant", [True, False])
     @require_peft
     def test_train_with_peft_config_and_gradient_checkpointing_reentrant(self, use_reentrant):
+        # [FUNCTION DOC]
+        # Runs the PEFT train check with LoRA, gradient checkpointing and the given use_reentrant kwarg. Requires peft.
+        # Inputs: use_reentrant (bool, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
@@ -906,6 +1071,10 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_liger_kernel
     def test_train_with_liger(self):
+        # [FUNCTION DOC]
+        # Requires liger-kernel. Asserts use_liger_kernel True emits a deprecation FutureWarning and disables
+        # fused_linear_cross_entropy in liger_kernel_config, then runs the standard train check.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, use_liger_kernel=True, report_to="none")
@@ -928,10 +1097,16 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_non_chatml_conversational_data(self):
+        # [FUNCTION DOC]
+        # Renames conversational messages to a conversations column with from/value keys and runs the standard train
+        # check. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
 
         # Rename role/content to from/value to ensure SFT works with non-chatML conversational data
         def rename_fields(example: list[dict]):
+            # [FUNCTION DOC]
+            # HELPER: Converts an example's messages (role/content) into a conversations list with from/value keys.
+            # Inputs: example (dict). Outputs: dict. Exceptions: KeyError if fields missing. Side effects: none.
             return {"conversations": [{"from": m["role"], "value": m["content"]} for m in example["messages"]]}
 
         dataset = dataset.map(rename_fields, remove_columns="messages")
@@ -953,11 +1128,17 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_pretokenized_data(self):
+        # [FUNCTION DOC]
+        # Tokenizes the text column (dropping it) and runs the standard train check on the pre-tokenized dataset.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         def tokenize_example(example):
+            # [FUNCTION DOC]
+            # HELPER: Returns the tokenizer output (input_ids, attention_mask) for the example text.
+            # Inputs: example (dict). Outputs: tokenizer encoding. Exceptions: none. Side effects: none.
             return tokenizer(example["text"])
 
         # Apply tokenization
@@ -978,9 +1159,15 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_dataset_with_transform_requires_skip_prepare_dataset(self):
+        # [FUNCTION DOC]
+        # Asserts a dataset with an on-the-fly with_transform raises ValueError advising skip_prepare_dataset and a
+        # trainer-ready dataset. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = Dataset.from_dict({"text": ["hello world"]})
 
         def add_suffix(batch):
+            # [FUNCTION DOC]
+            # HELPER: Batch transform appending an AUG marker to each text. Inputs: batch (dict). Outputs: the mutated batch.
+            # Exceptions: none. Side effects: mutates the batch.
             batch["text"] = [text + " <AUG>" for text in batch["text"]]
             return batch
 
@@ -996,6 +1183,9 @@ class TestSFTTrainer(TrlTestCase):
             )
 
     def test_padding_free_without_packing_and_max_length_raises(self):
+        # [FUNCTION DOC]
+        # Asserts padding_free True with max_length 16 and no packing raises ValueError (max_length is not enforced).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train[:2]")
         training_args = SFTConfig(
             output_dir=self.tmp_dir,
@@ -1010,6 +1200,9 @@ class TestSFTTrainer(TrlTestCase):
             )
 
     def test_train_with_iterable_dataset(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on a streaming dataset with max_steps 3.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train", streaming=True)
 
         training_args = SFTConfig(output_dir=self.tmp_dir, max_steps=3, report_to="none")
@@ -1034,6 +1227,10 @@ class TestSFTTrainer(TrlTestCase):
         reason="Flash Attention 2 requires Ampere or newer GPU, or XPU",
     )
     def test_train_padding_free(self):
+        # [FUNCTION DOC]
+        # Requires kernels and an Ampere-or-newer GPU or XPU. Runs the standard train check with padding_free, no
+        # max_length, bf16 and the kernels-community flash-attn2 attention implementation.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(
@@ -1063,6 +1260,10 @@ class TestSFTTrainer(TrlTestCase):
     @ignore_warnings(message="You are using packing, but the attention implementation is not.*", category=UserWarning)
     @ignore_warnings(message="Padding-free training is enabled, but the attention.*", category=UserWarning)
     def test_train_packing(self, packing_strategy):
+        # [FUNCTION DOC]
+        # Runs the standard train check with packing, max_length 10, for the bfd and wrapped packing strategies
+        # (attention-implementation warnings ignored). Inputs: packing_strategy (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(
@@ -1086,6 +1287,10 @@ class TestSFTTrainer(TrlTestCase):
     @ignore_warnings(message="You are using packing, but the attention implementation is not.*", category=UserWarning)
     @ignore_warnings(message="Padding-free training is enabled, but the attention.*", category=UserWarning)
     def test_eval_packing(self):
+        # [FUNCTION DOC]
+        # With packing and max_length 64 for both splits, asserts the packed train set holds 17 sequences in 3 rows and
+        # eval holds 2 sequences in 1 row, with every row's total length at most 64.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
         training_args = SFTConfig(
@@ -1118,6 +1323,10 @@ class TestSFTTrainer(TrlTestCase):
     @ignore_warnings(message="You are using packing, but the attention implementation is not.*", category=UserWarning)
     @ignore_warnings(message="Padding-free training is enabled, but the attention.*", category=UserWarning)
     def test_only_train_packing(self):
+        # [FUNCTION DOC]
+        # With packing but eval_packing False, asserts train is packed (17 sequences in 3 rows, each at most 64 tokens)
+        # while eval has no seq_lengths column and keeps 2 rows. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
         training_args = SFTConfig(
@@ -1152,6 +1361,10 @@ class TestSFTTrainer(TrlTestCase):
         Version(transformers.__version__) < Version("4.57.0"), reason="Olmo 3 requires transformers>=4.57.0"
     )
     def test_tokenize_prompt_not_prefix_of_conversation(self):
+        # [FUNCTION DOC]
+        # With tiny Olmo-3 (transformers 4.57.0 or newer) whose generation prompt is not a prefix of the conversation,
+        # asserts the trainable labels of each example decode to the assistant content plus eos.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # The Olmo-3 Think template ends the generation prompt with `<think>`, which the full conversation doesn't
         # have, so the tokenized prompt is not a prefix of the tokenized prompt+completion
         dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_completion", split="train")
@@ -1170,6 +1383,11 @@ class TestSFTTrainer(TrlTestCase):
             assert tokenizer.decode(completion_ids) == example["completion"][0]["content"] + tokenizer.eos_token
 
     def test_train_with_chat_template_kwargs(self):
+        # [FUNCTION DOC]
+        # Sets a Qwen-like template capitalizing roles when role_capital is true and adds an alternating
+        # chat_template_kwargs column; asserts the template is kept and the first two tokenized examples start with the
+        # lowercase then uppercase system prompt ids, then runs the standard train check.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, report_to="none")
@@ -1213,6 +1431,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_assistant_only(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on tiny Qwen3 with assistant_only_loss. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, assistant_only_loss=True, report_to="none")
@@ -1232,6 +1453,10 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_dataset_preparation_builds_labels_for_assistant_only_loss(self):
+        # [FUNCTION DOC]
+        # With assistant_only_loss, asserts the prepared dataset has a labels column equal in length to input_ids, equal to
+        # input_ids or -100 at each position, and containing both trainable and masked positions in every example.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Dataset preparation must bake the assistant masks into a labels column."""
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
 
@@ -1255,6 +1480,10 @@ class TestSFTTrainer(TrlTestCase):
     )
     @require_vision
     def test_train_vlm_assistant_only(self):
+        # [FUNCTION DOC]
+        # Requires vision and transformers 5.18.0.dev0 or newer. Runs the standard train check on tiny Qwen2-VL with
+        # assistant_only_loss, batch 1 and no max_length. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_language_modeling", split="train")
 
         training_args = SFTConfig(
@@ -1287,6 +1516,10 @@ class TestSFTTrainer(TrlTestCase):
     )
     @require_vision
     def test_data_collator_builds_labels_for_vlm_assistant_only_loss(self):
+        # [FUNCTION DOC]
+        # Requires vision and transformers 5.18.0.dev0 or newer. Collates two image examples and asserts that, on
+        # attended positions, labels equal input_ids or -100 with both trainable and masked tokens present.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """The vision data collator must mask the non-assistant tokens in the labels."""
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_language_modeling", split="train")
 
@@ -1313,6 +1546,10 @@ class TestSFTTrainer(TrlTestCase):
     )
     @require_vision
     def test_vlm_assistant_only_loss_requires_transformers_5_18(self):
+        # [FUNCTION DOC]
+        # Only on transformers older than 5.18.0.dev0: asserts assistant_only_loss with an image dataset raises
+        # ValueError requiring transformers 5.18.0 or newer. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, assistant_only_loss=True, report_to="none")
@@ -1324,6 +1561,9 @@ class TestSFTTrainer(TrlTestCase):
             )
 
     def test_fully_masked_examples_dropped_after_truncation(self):
+        # [FUNCTION DOC]
+        # With max_length 3, asserts an example whose assistant tokens are all truncated away is dropped and the other
+        # keeps labels 6, 7, 8. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # Example 0's assistant tokens all lie beyond `max_length=3`, so keep_start truncation leaves it fully masked;
         # example 1 keeps a trainable token and survives.
         dataset = Dataset.from_list(
@@ -1341,6 +1581,9 @@ class TestSFTTrainer(TrlTestCase):
         assert trainer.train_dataset[:]["labels"] == [[6, 7, 8]]
 
     def test_dataset_truncated_to_max_length(self):
+        # [FUNCTION DOC]
+        # Asserts with max_length 4 every prepared example has at most 4 input_ids and labels.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Dataset preparation truncates every example to `max_length`."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
@@ -1355,6 +1598,10 @@ class TestSFTTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("dataset_text_field", ["text", "my_column"])
     def test_dataset_preparation_adds_eos_to_dataset_text_field(self, dataset_text_field):
+        # [FUNCTION DOC]
+        # Asserts the eos token is appended (and trained on) when the text column is named text or a custom
+        # dataset_text_field. Inputs: dataset_text_field (str, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: none.
         """Dataset preparation must append EOS to the text column named by `dataset_text_field`, not only `"text"`."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
         if dataset_text_field != "text":
@@ -1371,6 +1618,10 @@ class TestSFTTrainer(TrlTestCase):
             assert example["labels"][-1] == eos_token_id  # EOS is trained on
 
     def test_dataset_preparation_builds_labels_for_completion_only(self):
+        # [FUNCTION DOC]
+        # Asserts a prompt-completion dataset (completion_only_loss defaulting to true) gets labels equal to input_ids or
+        # -100, with both prompt (masked) and completion (trainable) tokens present.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Dataset preparation must bake the completion mask into a labels column when completion_only_loss
         resolves to True (the default for prompt-completion datasets)."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_completion", split="train")
@@ -1390,6 +1641,9 @@ class TestSFTTrainer(TrlTestCase):
             assert any(label == -100 for label in labels)  # prompt tokens are masked
 
     def test_dataset_preparation_respects_existing_labels(self):
+        # [FUNCTION DOC]
+        # Asserts a user-provided labels column is kept unchanged even when assistant_masks is also present.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """A user-provided labels column must be taken as is, even when mask columns are also present."""
         dataset = Dataset.from_list(
             [
@@ -1406,6 +1660,9 @@ class TestSFTTrainer(TrlTestCase):
         assert trainer.train_dataset[:]["labels"] == [[1, -100, 3, -100], [-100, 6]]
 
     def test_dataset_preparation_builds_labels_for_pretokenized_with_masks(self):
+        # [FUNCTION DOC]
+        # Asserts pre-tokenized examples with assistant_masks but no labels get labels with -100 where the mask is 0.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Pre-tokenized datasets that carry mask columns but no labels must get labels built at preparation."""
         dataset = Dataset.from_list(
             [
@@ -1422,6 +1679,10 @@ class TestSFTTrainer(TrlTestCase):
         assert trainer.train_dataset[:]["labels"] == [[-100, -100, 3, 4], [-100, 6, -100]]
 
     def test_packing_carries_labels(self):
+        # [FUNCTION DOC]
+        # With packing (max_length 64) on a prompt-completion dataset, asserts labels are packed (same length as
+        # input_ids), completion_mask is removed, and some labels remain trainable.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """With packing enabled, the labels column must be packed alongside input_ids (replacing the masks)."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_completion", split="train")
 
@@ -1439,6 +1700,9 @@ class TestSFTTrainer(TrlTestCase):
         assert any(label != -100 for example in trainer.train_dataset for label in example["labels"])
 
     def test_skip_prepare_dataset_with_masks_but_no_labels_raises(self):
+        # [FUNCTION DOC]
+        # Asserts skip_prepare_dataset with assistant_masks but no labels raises ValueError asking to add a labels
+        # column. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """With `skip_prepare_dataset=True`, labels are not built at preparation time and the collator doesn't
         consume the mask columns; such datasets must be rejected instead of silently training on the full sequence."""
         dataset = Dataset.from_list([{"input_ids": [1, 2, 3, 4], "assistant_masks": [0, 0, 1, 1]} for _ in range(2)])
@@ -1452,6 +1716,9 @@ class TestSFTTrainer(TrlTestCase):
             )
 
     def test_train_completion_only(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on tiny Qwen3 with completion_only_loss and conversational prompt-completion
+        # data. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_completion", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, completion_only_loss=True, report_to="none")
@@ -1471,6 +1738,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_completion_only_harmony(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on tiny GPT-OSS with completion_only_loss and harmony prompt-completion data.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/harmony", "prompt_completion", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, completion_only_loss=True, report_to="none")
@@ -1490,10 +1760,17 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_assistant_only_and_completion_only(self):
+        # [FUNCTION DOC]
+        # Appends a user turn and another assistant turn to each completion, then runs the standard train check on tiny
+        # Qwen3 with both assistant_only_loss and completion_only_loss. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_completion", split="train")
 
         # To test this case, we need to add user messages in the completion (they'll be masked in the loss)
         def add_to_completion(example):
+            # [FUNCTION DOC]
+            # HELPER: Appends the first prompt message and then the first completion message to the completion list.
+            # Inputs: example (dict). Outputs: the mutated example. Exceptions: none. Side effects: mutates the example.
             example["completion"].append(example["prompt"][0])
             example["completion"].append(example["completion"][0])
             return example
@@ -1519,6 +1796,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_assistant_only_iterable_dataset(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with assistant_only_loss on a streaming dataset (max_steps 3).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset(
             "trl-internal-testing/zen", "conversational_language_modeling", split="train", streaming=True
         )
@@ -1540,6 +1820,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_set_chat_template_from_model(self):
+        # [FUNCTION DOC]
+        # Uses chat_template_path naming Qwen3-4B to give tiny GPT-NeoX a chat template and runs the standard train
+        # check. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, chat_template_path="Qwen/Qwen3-4B", report_to="none")
@@ -1560,6 +1843,10 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_set_chat_template_from_path(self, lazy_shared_datadir):
+        # [FUNCTION DOC]
+        # Uses a local template.jinja via chat_template_path, runs the standard train check, then asserts checkpoint-9
+        # contains chat_template.jinja identical to the source. Inputs: lazy_shared_datadir (fixture path).
+        # Outputs: none. Exceptions: AssertionError. Side effects: writes checkpoints to tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
 
         training_args = SFTConfig(
@@ -1594,6 +1881,9 @@ class TestSFTTrainer(TrlTestCase):
         assert template_content == original_template_content, "Chat template content does not match the original"
 
     def test_train_toolcall_data(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on the toolcall language-modeling dataset (batch 2, max_length 512).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/toolcall", "language_modeling", split="train")
 
         training_args = SFTConfig(
@@ -1618,6 +1908,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_toolcall_data_as_json(self):
+        # [FUNCTION DOC]
+        # Same as the toolcall test after decoding the tools column from JSON strings into lists of dicts.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Tabular backends (Arrow/Parquet) can insert `None` for missing keys in nested structures.
         # If `tools` is stored as a list of dicts and examples use different dict schemas, nulls may
         # be introduced and break tool processing. This test ensures we also support `tools` provided
@@ -1625,6 +1918,9 @@ class TestSFTTrainer(TrlTestCase):
         dataset = load_dataset("trl-internal-testing/toolcall", "language_modeling", split="train")
 
         def convert_to_json(example):
+            # [FUNCTION DOC]
+            # HELPER: Returns a dict replacing tools with its JSON-decoded value. Inputs: example (dict). Outputs: dict.
+            # Exceptions: json decode errors. Side effects: none.
             return {"tools": json.loads(example["tools"])}
 
         dataset = dataset.map(convert_to_json)
@@ -1651,6 +1947,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_eval(self):
+        # [FUNCTION DOC]
+        # Trains with eval every 3 steps and asserts the first log entry has eval_loss.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, eval_strategy="steps", eval_steps=3, report_to="none")
@@ -1677,6 +1976,10 @@ class TestSFTTrainer(TrlTestCase):
         ],
     )
     def test_evaluate_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Asserts evaluate accepts a raw eval dataset in six container forms (regression for issue 6115), yielding
+        # eval_loss or eval_data1_loss and eval_data2_loss. Inputs: eval_dataset_type (str, parametrized).
+        # Outputs: none. Exceptions: AssertionError. Side effects: none.
         # `evaluate` accepts a raw (unprepared) dataset passed directly, not only a preprocessed `eval_dataset` set
         # at init. See https://github.com/huggingface/trl/issues/6115.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
@@ -1705,6 +2008,10 @@ class TestSFTTrainer(TrlTestCase):
             assert metrics["eval_data2_loss"] is not None
 
     def test_train_with_metric_for_best_model(self):
+        # [FUNCTION DOC]
+        # Smoke test: trains with eval every 3 steps and metric_for_best_model set to eval_mean_token_accuracy (a metric
+        # SFTTrainer adds itself); passes if training does not fail looking the metric up in evaluate results.
+        # Inputs/Outputs: none. Exceptions: any training error (e.g. KeyError). Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
         training_args = SFTConfig(
@@ -1726,6 +2033,10 @@ class TestSFTTrainer(TrlTestCase):
         trainer.train()
 
     def test_train_with_multiple_eval_dataset(self):
+        # [FUNCTION DOC]
+        # Trains with two named eval datasets and asserts the third-last and second-last log entries contain
+        # eval_data1_loss and eval_data2_loss. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, eval_strategy="steps", eval_steps=3, report_to="none")
@@ -1742,6 +2053,11 @@ class TestSFTTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("train_dataset_type", ["dataset", "iterable_dataset", "none", "unsupported_dataset_dict"])
     def test_init_with_train_dataset(self, train_dataset_type):
+        # [FUNCTION DOC]
+        # Checks train_dataset validation: None raises ValueError (train_dataset is required), a DatasetDict raises
+        # TypeError (must be Dataset or IterableDataset); Dataset and streaming dataset (max_steps 3) are tokenized so the
+        # first example has input_ids. Inputs: train_dataset_type (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         streaming = "iterable" in train_dataset_type
         if train_dataset_type == "none":
             train_dataset = None
@@ -1789,6 +2105,10 @@ class TestSFTTrainer(TrlTestCase):
         ],
     )
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Checks eval_dataset preparation: None stays None; dict-like inputs keep keys data1 and data2 each tokenized
+        # with input_ids; single datasets are tokenized. Inputs: eval_dataset_type (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         if eval_dataset_type == "none":
@@ -1825,9 +2145,17 @@ class TestSFTTrainer(TrlTestCase):
             assert "input_ids" in next(iter(trainer.eval_dataset))
 
     def test_train_with_compute_metrics(self):
+        # [FUNCTION DOC]
+        # Trains with eval every 3 steps and a compute_metrics that asserts predictions carry full-vocabulary logits and
+        # returns my_metric 0.123; asserts training emits a FutureWarning about return_outputs True and the second-last
+        # log entry has eval_my_metric 0.123. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
         def dummy_compute_metrics(eval_pred):
+            # [FUNCTION DOC]
+            # HELPER: Asserts the last dimension of eval_pred.predictions equals the model vocab size (closure over trainer)
+            # and returns a dict with my_metric 0.123. Exceptions: AssertionError. Side effects: none.
             # The logits are the full-vocabulary logits, as before the fused LM head
             assert eval_pred.predictions.shape[-1] == trainer.model.config.vocab_size
             return {"my_metric": 0.123}
@@ -1852,10 +2180,19 @@ class TestSFTTrainer(TrlTestCase):
         assert trainer.state.log_history[-2]["eval_my_metric"] == 0.123
 
     def test_train_with_compute_loss_func(self):
+        # [FUNCTION DOC]
+        # Trains 2 steps with a custom compute_loss_func (expects a FutureWarning that it is deprecated); asserts the
+        # function received full-vocabulary logits every time and that mean_token_accuracy was logged.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
         vocab_sizes = []
 
         def compute_loss_func(outputs, labels, num_items_in_batch=None):
+            # [FUNCTION DOC]
+            # HELPER: Records the logits vocabulary size, then returns token-level cross entropy between logits without the
+            # last position and labels without the first position, ignoring -100. Inputs: outputs (model output), labels
+            # (tensor), num_items_in_batch (unused). Outputs: scalar loss tensor. Exceptions: none.
+            # Side effects: appends to vocab_sizes.
             # The outputs are the model's own, with the full logits, as before the fused LM head
             vocab_sizes.append(outputs.logits.shape[-1])
             logits = outputs.logits[:, :-1].flatten(0, 1)
@@ -1881,6 +2218,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_predict_returns_logits(self):
+        # [FUNCTION DOC]
+        # Asserts predict (with a FutureWarning about return_outputs True) returns predictions whose last dimension is
+        # the vocab size. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="test")
         training_args = SFTConfig(output_dir=self.tmp_dir, report_to="none")
         trainer = SFTTrainer(
@@ -1893,11 +2233,18 @@ class TestSFTTrainer(TrlTestCase):
         assert predictions.predictions.shape[-1] == trainer.model.config.vocab_size
 
     def test_chunked_nll_is_deprecated_alias_of_nll(self):
+        # [FUNCTION DOC]
+        # Asserts loss_type chunked_nll emits a deprecation FutureWarning and is normalized to nll.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         with pytest.warns(FutureWarning, match="`loss_type='chunked_nll'` is deprecated"):
             training_args = SFTConfig(output_dir=self.tmp_dir, loss_type="chunked_nll", report_to="none")
         assert training_args.loss_type == "nll"
 
     def test_label_smoothing(self):
+        # [FUNCTION DOC]
+        # With label_smoothing_factor 0.1 (deprecated, FutureWarning expected) and the model in eval mode, asserts
+        # compute_loss on a collated batch of 4 equals transformers LabelSmoother with epsilon 0.1 on the full logits
+        # with shifted labels. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: sets model to eval mode.
         # Label smoothing goes through `Trainer`'s label smoother, on the full logits
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
         training_args = SFTConfig(output_dir=self.tmp_dir, label_smoothing_factor=0.1, report_to="none")
@@ -1918,6 +2265,9 @@ class TestSFTTrainer(TrlTestCase):
     # `SFTTrainer`. We keep it as a regression guard: if the default ever changes, we still explicitly test gradient
     # checkpointing, which has caused issues in the past.
     def test_train_with_gradient_checkpointing(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with gradient_checkpointing explicitly True (regression guard).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, gradient_checkpointing=True, report_to="none")
@@ -1946,6 +2296,10 @@ class TestSFTTrainer(TrlTestCase):
         ],
     )
     def test_train_with_gradient_checkpointing_kwargs(self, gradient_checkpointing_kwargs):
+        # [FUNCTION DOC]
+        # Runs the standard train check with gradient checkpointing and kwargs use_reentrant True/False or selective
+        # True/False. Inputs: gradient_checkpointing_kwargs (dict, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(
@@ -1971,6 +2325,9 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_torch_accelerator
     def test_train_with_fp16(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with fp16; requires an accelerator. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, fp16=True, report_to="none")
@@ -1991,6 +2348,9 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_torch_accelerator
     def test_train_with_activation_offloading(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with activation_offloading; requires an accelerator. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, activation_offloading=True, report_to="none")
@@ -2010,6 +2370,9 @@ class TestSFTTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_tag_added(self):
+        # [FUNCTION DOC]
+        # Asserts a trainer with default args adds sft and trl to model.model_tags. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         trainer = SFTTrainer(
@@ -2022,6 +2385,9 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_peft
     def test_tag_added_peft(self):
+        # [FUNCTION DOC]
+        # Same tag assertion with a LoRA peft_config (requires peft). Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         trainer = SFTTrainer(
@@ -2099,6 +2465,12 @@ class TestSFTTrainer(TrlTestCase):
     )
     @require_vision
     def test_train_vlm(self, model_id):
+        # [FUNCTION DOC]
+        # Requires vision. Trains each listed VLM (Gemma3/4, LFM2.5-VL, LLaVA, LLaVA-Next, Muse Glimmer, Qwen2/2.5/3-VL,
+        # Qwen3.5 dense and MoE, Muse Spark; newer ones skipped on old transformers) with batch 1 and no max_length,
+        # asserting train_loss is logged and every parameter changed except: LLaVA vision encoder layers.1 and
+        # post_layernorm stay unchanged, and Muse Spark audio_tower stays unchanged.
+        # Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_language_modeling", split="train")
 
         training_args = SFTConfig(
@@ -2145,6 +2517,10 @@ class TestSFTTrainer(TrlTestCase):
     )
     @require_vision
     def test_train_vlm_multi_image(self, model_id):
+        # [FUNCTION DOC]
+        # Requires vision; xfail (non-strict) before transformers 4.57.0. On the multi-image prompt-completion dataset
+        # with Qwen2.5-VL, asserts ddp_find_unused_parameters is enabled, then runs the standard train check.
+        # Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset(
             "trl-internal-testing/zen-multi-image", "conversational_prompt_completion", split="train"
         )
@@ -2192,6 +2568,10 @@ class TestSFTTrainer(TrlTestCase):
     )
     @require_vision
     def test_train_vlm_prompt_completion(self, model_id):
+        # [FUNCTION DOC]
+        # Requires vision. Runs the standard train check on image prompt-completion data for Qwen2.5-VL, Gemma3 and Gemma4
+        # (the Gemma models exercise token_type_ids collation). Inputs: model_id (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_completion", split="train")
 
         training_args = SFTConfig(
@@ -2235,6 +2615,11 @@ class TestSFTTrainer(TrlTestCase):
     )
     @require_vision
     def test_train_vlm_text_only_data(self, model_id, dataset_config):
+        # [FUNCTION DOC]
+        # Requires vision. Trains Qwen2.5-VL on text-only zen data in four formats; asserts ddp_find_unused_parameters,
+        # train_loss logged, parameters under model.visual unchanged (tolerance 1e-12) and all others changed.
+        # Inputs: model_id, dataset_config (str, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", dataset_config, split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, report_to="none")
@@ -2264,6 +2649,10 @@ class TestSFTTrainer(TrlTestCase):
     @ignore_warnings(message="You are using packing, but the attention implementation is not.*", category=UserWarning)
     @require_vision
     def test_train_vlm_text_only_data_packing(self):
+        # [FUNCTION DOC]
+        # Requires vision. Regression for issue 6545: packing on a VLM checkpoint with text-only data must work; trains
+        # Qwen2.5-VL with packing and asserts visual parameters unchanged and others changed.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Packing is incompatible with on-the-fly image processing, not with VLMs. A text-only dataset goes through
         # the regular text pipeline, so packing must be available on a VLM checkpoint too. Regression test for #6545.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
@@ -2296,6 +2685,9 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_vision
     def test_vision_dataset_with_text_model_raises(self):
+        # [FUNCTION DOC]
+        # Requires vision. Asserts an image dataset with a text-only model raises ValueError mentioning vision-related
+        # data and a vision-language model. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_language_modeling", split="train")
         training_args = SFTConfig(output_dir=self.tmp_dir, report_to="none")
         with pytest.raises(ValueError, match="vision-related.*vision-language model"):
@@ -2307,6 +2699,11 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_peft
     def test_prompt_tuning(self):
+        # [FUNCTION DOC]
+        # Trains with a prompt encoder (p-tuning, 8 virtual tokens) peft_config; asserts train_loss and
+        # mean_token_accuracy are logged, base_model parameters unchanged, prompt_encoder parameters changed, and raises
+        # ValueError on any other parameter name. Requires peft. Inputs/Outputs: none.
+        # Exceptions: AssertionError, ValueError. Side effects: writes tmp_dir.
         """Test that SFT works with Prompt Tuning."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
@@ -2338,6 +2735,10 @@ class TestSFTTrainer(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_peft_and_quantization(self):
+        # [FUNCTION DOC]
+        # With peft and bitsandbytes, loads the model id in 4-bit NF4 double-quant (bf16 compute) with LoRA and lr 0.1;
+        # asserts 4-bit loading, train_loss and mean_token_accuracy logged, and LoRA parameters bfloat16 and changed.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, learning_rate=0.1, report_to="none")
@@ -2377,6 +2778,9 @@ class TestSFTTrainer(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_peft_dora_and_quantization(self):
+        # [FUNCTION DOC]
+        # Same as the 4-bit LoRA test with DoRA: magnitude vectors stay float32 and change, other LoRA parameters are
+        # bfloat16 and change. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
 
         training_args = SFTConfig(output_dir=self.tmp_dir, learning_rate=0.1, report_to="none")
@@ -2420,6 +2824,9 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_peft
     def test_prompt_tuning_peft_model(self):
+        # [FUNCTION DOC]
+        # Same assertions as test_prompt_tuning but passing a model already wrapped with a prompt-encoder PEFT config.
+        # Requires peft. Inputs/Outputs: none. Exceptions: AssertionError, ValueError. Side effects: writes tmp_dir.
         """Test that SFT works with Prompt Tuning and a pre-converted PeftModel"""
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype="float32")
         model = get_peft_model(model, PromptEncoderConfig(task_type=TaskType.CAUSAL_LM, num_virtual_tokens=8))
@@ -2447,6 +2854,9 @@ class TestSFTTrainer(TrlTestCase):
                 raise ValueError(f"Unexpected parameter {n} in model: {trainer.model}")
 
     def test_pad_token_id_synced_with_model_config(self):
+        # [FUNCTION DOC]
+        # With tiny Mistral (no pad token, eos used), asserts the tokenizer pad id is set and equals model.config and
+        # model.generation_config pad_token_id. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # This model's tokenizer has no pad token, so the trainer falls back to the eos token. The model configs must
         # follow: otherwise `Trainer` realigns them at train time and reports it as a change the user did not make.
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling", split="train")
@@ -2463,6 +2873,10 @@ class TestSFTTrainer(TrlTestCase):
 
     @require_vision
     def test_pad_token_id_synced_with_model_config_vision(self):
+        # [FUNCTION DOC]
+        # Requires vision. With Qwen2.5-VL and an image dataset, asserts the processor tokenizer pad id is set and equals
+        # the text config pad_token_id and generation_config pad_token_id. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         # A vision dataset takes the other collator branch, which used to skip the pad token handling entirely.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_language_modeling", split="train")
 
@@ -2488,6 +2902,12 @@ class TestSFTTrainer(TrlTestCase):
         ],
     )
     def test_eos_token_id_synced_with_model_config(self, generation_eos_token_id, expected_eos_token_ids):
+        # [FUNCTION DOC]
+        # With eos_token set to the im_start token (id 151644) and the model's generation eos given as a list, a single
+        # id, None, or a list already containing 151644, asserts the tokenizer eos id is 151644, model.config eos equals
+        # it, and generation_config eos becomes the expected list (requested id first, then existing ids, without
+        # duplicates). Inputs: generation_eos_token_id, expected_eos_token_ids (parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         # The trainer sets the requested eos token on the tokenizer. The model configs must follow: otherwise
         # `Trainer` realigns them at train time and reports it as a change the user did not make. The generation
         # config holds the eos token as a list, as a single id, or not at all, so cover the three shapes.

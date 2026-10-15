@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Experimental SDPO trainer (paper 2601.20802, "Reinforcement Learning via Self-Distillation").
+# Online RL in which the policy samples groups of completions, rewards are computed with reward functions, and the
+# model conditioned on feedback (a successful sibling rollout and/or environment feedback from privileged_context) acts
+# as a self-teacher whose token distributions are distilled back into the unconditioned policy. The loss blends a
+# GRPO-style clipped policy-gradient loss and the distillation loss by distillation_weight.
+# Contents: TrainingBatch alias, build_teacher_request_inputs, DistillationLogits, _extract_last_user_text,
+# SuccessfulRolloutTeacherContextBuilder and SDPOTrainer. Import-time side effects: imports peft when available;
+# creates an accelerate logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -86,6 +96,13 @@ def build_teacher_request_inputs(
     attention_mask: torch.Tensor,
     prompt_attention_mask: torch.Tensor,
 ) -> tuple[list[list[int]], list[int], list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: Converts padded teacher tensors into per-sample token lists for teacher-server scoring requests.
+    # Behavior: checks ids and mask shapes match; on CPU, keeps tokens where the mask is set; prompt length per row is the
+    # sum of prompt_attention_mask; validates 0 <= prompt length <= trimmed length; completion length is the remainder.
+    # Inputs: input_ids, attention_mask (B, L), prompt_attention_mask (B, P).
+    # Outputs: (list of token lists, list of prompt lengths, list of completion lengths).
+    # Exceptions: ValueError on shape mismatch or invalid prompt length. Side effects: device-to-host copies.
     """Trim padded batch tensors into per-sample (prompt+completion) sequences for teacher-server requests."""
     if input_ids.shape != attention_mask.shape:
         raise ValueError(
@@ -114,6 +131,10 @@ def build_teacher_request_inputs(
 
 @dataclass
 class DistillationLogits:
+    # [CLASS DOC]
+    # Dataclass bundling aligned tensors for the distillation objective: completion_ids and completion_mask (B, T),
+    # loss_mask (B, T; completion mask restricted to reprompted samples), student_logits and teacher_logits (B, T, V).
+    # No methods.
     """Aligned logits and masks used to compute a self-distillation objective."""
 
     completion_ids: torch.Tensor
@@ -124,6 +145,11 @@ class DistillationLogits:
 
 
 def _extract_last_user_text(messages: list[dict[str, Any]]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the text of the final message of a conversation, which must be a user turn.
+    # Behavior: list contents join the text parts with spaces; string contents are returned as is (missing content gives "").
+    # Inputs: messages (list of role/content dicts). Outputs: str.
+    # Exceptions: ValueError if the last role is not "user"; IndexError for an empty list. Side effects: none.
     """Extract the text content from the last user message in a conversational prompt."""
     last_message = messages[-1]
     if last_message.get("role") != "user":
@@ -139,13 +165,25 @@ def _extract_last_user_text(messages: list[dict[str, Any]]) -> str:
 
 
 class SuccessfulRolloutTeacherContextBuilder:
+    # [CLASS DOC]
+    # Builds SDPO teacher prompts by reprompting the original question with a successful sibling rollout as a demonstration
+    # and/or environment feedback, and returns teacher inputs plus a per-sample self_distillation_mask.
+    # State: trainer (back-reference for args, tokenizer, accelerator), last_metrics (fractions from the latest build,
+    # copied into trainer metrics). No base class.
     """Builds teacher contexts from successful rollouts"""
 
     def __init__(self, trainer):
+        # [FUNCTION DOC]
+        # Stores the trainer and initializes last_metrics to an empty dict.
+        # Inputs: trainer. Outputs: none. Side effects: none.
         self.trainer = trainer
         self.last_metrics: dict[str, float] = {}
 
     def _build_reprompt_text(self, prompt_text: str, solution_text: str, feedback_text: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Fills args.reprompt_template with prompt, solution and feedback text.
+        # Inputs: prompt_text, solution_text, feedback_text. Outputs: str. Exceptions: KeyError for bad templates.
+        # Side effects: none.
         return self.trainer.args.reprompt_template.format(
             prompt=prompt_text,
             solution=solution_text,
@@ -155,6 +193,11 @@ class SuccessfulRolloutTeacherContextBuilder:
     def _tokenize_teacher_messages(
         self, teacher_messages_list: list[str | list[dict[str, Any]]]
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Tokenizes teacher prompts without max_prompt_length truncation, keeps the last max_reprompt_len tokens of
+        # each, and left-pads ids (pad id) and masks (0) on the accelerator device.
+        # Inputs: teacher_messages_list (strings or conversations). Outputs: dict with prompt_ids and prompt_mask.
+        # Side effects: none.
         device = self.trainer.accelerator.device
         teacher_prompt_ids_list = self.trainer._tokenize_prompts_untruncated(teacher_messages_list)
         teacher_prompt_ids = [
@@ -176,6 +219,28 @@ class SuccessfulRolloutTeacherContextBuilder:
         rewards: torch.Tensor,
         feedbacks: list[Any] | None = None,
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Builds teacher inputs for the local batch using information gathered across processes.
+        # Behavior:
+        # 1. Uses num_generations (train) or num_generations_eval (eval); this process's samples are the slice starting at
+        # process_index times the local count.
+        # 2. Gathers rewards, completion ids (padded across processes), prompts and feedbacks (or Nones).
+        # 3. For every global sample, when use_successful_as_teacher, collects group members (consecutive blocks of
+        # num_generations) with reward at least success_reward_threshold, excluding itself if dont_reprompt_on_self_success;
+        # the first one becomes its demonstration. Counts groups with any success. Feedback is usable when it is a non-blank
+        # string and include_environment_feedback is set and (not feedback-only-without-solution, or no solution exists).
+        # Samples with a solution or used feedback get self_distillation_mask 1.
+        # 4. Warns once if feedback was present but include_environment_feedback is False.
+        # 5. For local samples: inactive ones keep the original prompt; active ones decode the demonstration (pad tokens
+        # removed, special tokens skipped, optional removal of think blocks), format solution_template and feedback_template,
+        # and build the reprompt (for conversations, replacing the last user turn and keeping earlier messages).
+        # 6. Tokenizes teacher prompts and appends the local (unpadded) completion ids and mask.
+        # 7. Sets last_metrics: success_group_fraction, success_sample_fraction, feedback_available_fraction,
+        # feedback_used_fraction, reprompt_sample_fraction.
+        # Inputs: output (batch with completion_ids and completion_mask), prompts (local), rewards (local), feedbacks (optional).
+        # Outputs: dict with teacher_input_ids, teacher_attention_mask, self_distillation_mask (local, shape (B,)).
+        # Exceptions: RuntimeError if an active sample has no demonstration index; ValueError from prompt extraction.
+        # Side effects: cross-process gathers; warnings; mutates last_metrics.
         device = self.trainer.accelerator.device
         mode = "train" if self.trainer.model.training else "eval"
         num_generations = self.trainer.num_generations if mode == "train" else self.trainer.num_generations_eval
@@ -320,6 +385,16 @@ class SuccessfulRolloutTeacherContextBuilder:
 
 
 class SDPOTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer subclass (via _BaseTrainer) for SDPO.
+    # Key state: same generation/teacher/vLLM/buffering state as the SDFT trainer (teacher_model, vllm_generation,
+    # teacher_client, _step, _buffered_inputs, _metrics, eos_token_ids, model_kwarg_keys), plus reward_funcs,
+    # reward_func_names, reward_weights, reward_processing_classes, loss_type, mask_truncated_completions,
+    # importance_sampling_level, scale_rewards, epsilon_low/epsilon_high, beta, _diagnostic_counters (consecutive
+    # degenerate-step counts per mode), and teacher_context_builder (SuccessfulRolloutTeacherContextBuilder).
+    # Flow: _prepare_inputs buffers generation batches; _prepare_training_batch samples rollouts, computes rewards and
+    # group-normalized advantages, builds teacher contexts and diagnostics; compute_loss returns pure distillation, pure
+    # policy loss, or their convex blend; log averages metrics ignoring NaN.
     """
     Trainer for Self-Distillation Policy Optimization (SDPO).
 
@@ -360,6 +435,26 @@ class SDPOTrainer(_BaseTrainer):
         optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         peft_config=None,
     ):
+        # [FUNCTION DOC]
+        # Builds the trainer.
+        # Steps: requires non-empty reward_funcs and train_dataset; seeds; loads/validates the model, PEFT and processor exactly
+        # like the SDFT trainer (model_init_kwargs with device_map None under multi-GPU/DeepSpeed, PEFT validation and
+        # prepare_peft_model, AutoProcessor with left padding/truncation, pad defaults to eos, eos_token_ids); stores
+        # generation and loss settings (loss_type, mask_truncated_completions) and diagnostic counters; builds a
+        # GenerationConfig; validates use_teacher_server (vLLM server mode, live teacher, distillation_weight 1.0,
+        # sampled_token/topk_logits); calls the parent constructor with an identity collator; creates VLLMGeneration and the
+        # teacher VLLMClient when enabled; disables dropout; adds tags; sets up the teacher. Then stores importance sampling
+        # level, scale_rewards, epsilons and beta, warning when sequence-level importance sampling is combined with a
+        # token-summing loss type. Loads string reward functions as single-label sequence classifiers (sharing
+        # model_init_kwargs), records names, builds reward_weights (length must match, else ones), normalizes
+        # reward_processing_classes (loading tokenizers for model rewards, pad defaults to eos, pad id mirrored to the reward
+        # config), prepares reward models with DeepSpeed/FSDP/accelerate, and creates the teacher context builder.
+        # Inputs: model, reward_funcs, args, train_dataset, eval_dataset, processing_class, reward_processing_classes,
+        # callbacks, optimizers, peft_config.
+        # Outputs: none. Exceptions: ValueError, ImportError, TypeError.
+        # Side effects: model downloads, vLLM connections, callbacks, mutation of args.model_init_kwargs.
+        # KNOWN ISSUE: args defaults to None but is dereferenced without a default config. beta is stored but never used (no
+        # reference model or KL term exists). model_init_kwargs from args is mutated in place and reused for reward models.
         if reward_funcs is None or (isinstance(reward_funcs, list) and len(reward_funcs) == 0):
             raise ValueError("`reward_funcs` is required for SDPOTrainer because SDPO must score rollouts.")
         if train_dataset is None:
@@ -654,10 +749,18 @@ class SDPOTrainer(_BaseTrainer):
         self.teacher_context_builder = SuccessfulRolloutTeacherContextBuilder(self)
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # HELPER: Restricts kept dataset columns to "prompt" and "privileged_context" when not already set.
+        # Inputs: none. Outputs: none. Side effects: sets _signature_columns.
         if self._signature_columns is None:
             self._signature_columns = ["prompt", "privileged_context"]
 
     def _dispatch_self_distillation_callback(self, event_name: str, **payload) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls the method named event_name on every registered callback that defines it, passing args, state,
+        # control, model, processing_class and the payload as keyword arguments.
+        # Inputs: event_name, payload kwargs. Outputs: none. Exceptions: those raised by callbacks.
+        # Side effects: whatever callbacks do.
         for callback in self.callback_handler.callbacks:
             callback_fn = getattr(callback, event_name, None)
             if callback_fn is not None:
@@ -671,6 +774,17 @@ class SDPOTrainer(_BaseTrainer):
                 )
 
     def _setup_teacher_model(self) -> None:
+        # [FUNCTION DOC]
+        # Resolves the effective teacher (see docstring table).
+        # Behavior: live, or base with a PEFT model: teacher is the student model. EMA with pure-LoRA training: adds a
+        # PEFTAdapterEMACallback ("teacher" adapter, configured rate and sync steps) and teacher is the student. EMA with other
+        # PEFT models: error. Otherwise builds a fresh model from the student's model id (copy of model_init_kwargs; device_map
+        # None for multi-GPU/DeepSpeed; trust_remote_code, dtype and attention implementation defaulted from the student),
+        # freezes it, sets eval, prepares it with DeepSpeed, FSDP or accelerate, and for EMA adds a SyncTeacherModelCallback.
+        # Inputs: none. Outputs: none. Exceptions: ValueError for EMA with non-LoRA PEFT.
+        # Side effects: sets teacher_model, may download a model and add callbacks.
+        # Note: the base teacher for non-PEFT models is reloaded from the model id, so it differs from the initial student if
+        # the student instance was modified before being passed.
         """Prepare teacher state according to the semantic teacher choice.
 
         Resolve `teacher_model_kind` × PEFT state into the effective teacher:
@@ -745,9 +859,18 @@ class SDPOTrainer(_BaseTrainer):
             self.add_callback(SyncTeacherModelCallback(teacher_model=self.teacher_model, accelerator=self.accelerator))
 
     def _use_peft_ema_teacher_adapter(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True when teacher_model_kind is "ema" and the student is pure-LoRA training.
+        # Inputs: none. Outputs: bool. Side effects: none.
         return self.args.teacher_model_kind == "ema" and is_pure_lora_training(self.model, self.accelerator)
 
     def get_train_dataloader(self):
+        # [FUNCTION DOC]
+        # Builds the training DataLoader (override of Trainer).
+        # Behavior: removes unused columns (datasets.Dataset) or wraps the collator; batch size is the per-device train batch
+        # times steps_per_generation so one load fills a whole generation batch; uses the RepeatSampler, drop_last, seeded
+        # worker init and prefetch factor for map-style datasets; prepared with the accelerator.
+        # Inputs: none. Outputs: DataLoader. Exceptions: ValueError without train_dataset. Side effects: none.
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
@@ -775,6 +898,11 @@ class SDPOTrainer(_BaseTrainer):
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
     def _get_train_sampler(self, dataset=None) -> Sampler:
+        # [FUNCTION DOC]
+        # HELPER: RepeatSampler repeating each prompt num_generations times consecutively, with batches of
+        # generation_batch_size / num_generations distinct prompts, each batch repeated num_iterations * steps_per_generation
+        # times, shuffled per shuffle_dataset with args.seed.
+        # Inputs: dataset (defaults to train_dataset). Outputs: Sampler. Side effects: none.
         if dataset is None:
             dataset = self.train_dataset
         return RepeatSampler(
@@ -787,6 +915,9 @@ class SDPOTrainer(_BaseTrainer):
         )
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
+        # [FUNCTION DOC]
+        # HELPER: RepeatSampler repeating each eval prompt num_generations_eval times, seeded.
+        # Inputs: eval_dataset. Outputs: Sampler. Side effects: none.
         return RepeatSampler(
             data_source=eval_dataset,
             mini_repeat_count=self.num_generations_eval,
@@ -794,11 +925,18 @@ class SDPOTrainer(_BaseTrainer):
         )
 
     def training_step(self, model, inputs, num_items_in_batch):
+        # [FUNCTION DOC]
+        # Runs the parent training step then increments the micro-step counter _step (drives buffer reuse).
+        # Inputs: model, inputs, num_items_in_batch. Outputs: parent's loss. Side effects: increments _step.
         output = super().training_step(model, inputs, num_items_in_batch)
         self._step += 1
         return output
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # [FUNCTION DOC]
+        # Evaluation step: prepares inputs if they are a raw list, computes the loss without grad inside the loss context
+        # manager, and returns (detached loss, None, None).
+        # Inputs: model, inputs, prediction_loss_only, ignore_keys (unused). Side effects: generation and metric recording.
         if not isinstance(inputs, dict):
             inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
@@ -807,6 +945,13 @@ class SDPOTrainer(_BaseTrainer):
         return loss.detach(), None, None
 
     def _prepare_inputs(self, generation_batch):
+        # [FUNCTION DOC]
+        # Returns the batch for the current step.
+        # Behavior: in train mode, regenerates when _step is a multiple of steps_per_generation * num_iterations (or nothing is
+        # buffered): builds a full batch, splits it into steps_per_generation slices, dispatches on_generation_batch_built;
+        # returns the slice indexed by _step modulo steps_per_generation. In eval mode, always builds a fresh batch.
+        # Inputs: generation_batch (list of example dicts). Outputs: TrainingBatch dict.
+        # Side effects: generation, buffer mutation, callbacks.
         """Return the per-step training batch, regenerating rollouts and buffering them for reuse in train mode.
 
         In train mode, rollouts are generated once every `steps_per_generation * num_iterations` steps and split into
@@ -827,6 +972,17 @@ class SDPOTrainer(_BaseTrainer):
         return self._prepare_training_batch(generation_batch)
 
     def _prepare_training_batch(self, inputs: list[dict[str, Any]]) -> TrainingBatch:
+        # [FUNCTION DOC]
+        # HELPER: Builds a full SDPO training batch.
+        # Behavior: samples rollouts; decodes completions (as assistant messages when conversational); computes per-function
+        # rewards over the gathered batch and their weighted NaN-ignoring sum (zeros when there are no reward columns);
+        # computes advantages as (reward minus group mean) divided by (std plus 1e-4), with std per group ("group"), over the
+        # whole batch ("batch"), or 1 ("none"); keeps this process's slice of rewards and advantages; records reward
+        # diagnostics and completion metrics; builds teacher contexts (rewards and privileged contexts as feedback), appends
+        # builder metrics, warns on inactive self-distillation; dispatches on_teacher_context_built and
+        # on_self_distillation_batch_prepared; adds teacher_input_ids, teacher_attention_mask and self_distillation_mask.
+        # Inputs: inputs (list of example dicts). Outputs: TrainingBatch.
+        # Side effects: generation, reward computation, cross-process gathers, metrics, callbacks.
         """Sample student rollouts, calculate advantage and construct teacher prompts"""
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
@@ -912,6 +1068,14 @@ class SDPOTrainer(_BaseTrainer):
         return batch
 
     def sample_rollouts(self, inputs: list[dict[str, Any]]) -> TrainingBatch:
+        # [FUNCTION DOC]
+        # Generates completions from the student prompts and assembles the batch.
+        # Behavior: tokenizes prompts (left-truncated), dispatches on_generation_prompts_selected, generates, left-pads prompt
+        # ids/masks and right-pads completions on the device; with mask_truncated_completions zeroes the mask of completions
+        # whose last token is neither eos nor pad; computes rollout log-probs when needed.
+        # Inputs: inputs. Outputs: dict with prompt_ids, prompt_mask, completion_ids, completion_mask, raw_completion_lengths
+        # and optionally old_per_token_logps.
+        # Side effects: generation, callbacks.
         """Generate completions for a batch of prompts and assemble the training batch."""
         prompts = [example["prompt"] for example in inputs]
         prompt_ids = self._tokenize_prompts(prompts)
@@ -960,6 +1124,9 @@ class SDPOTrainer(_BaseTrainer):
         return batch
 
     def _get_completion_ids_list(self, batch: TrainingBatch) -> list[list[int]]:
+        # [FUNCTION DOC]
+        # HELPER: Unpadded completion token lists, cut to raw_completion_lengths, from the batch.
+        # Inputs: batch. Outputs: list of lists of ints. Side effects: none.
         raw_completion_lengths = batch["raw_completion_lengths"].detach().cpu().tolist()
         return [
             ids[:length].tolist()
@@ -967,6 +1134,10 @@ class SDPOTrainer(_BaseTrainer):
         ]
 
     def _tokenize_prompts_untruncated(self, prompts: list[Any]) -> list[list[int]]:
+        # [FUNCTION DOC]
+        # HELPER: Tokenizes prompts (chat template with generation prompt and chat_template_kwargs for conversations, the
+        # processing class otherwise) without length truncation.
+        # Inputs: prompts. Outputs: list of token id lists. Side effects: none.
         if is_conversational({"prompt": prompts[0]}):
             tokenized = self.processing_class.apply_chat_template(
                 conversation=prompts,
@@ -981,17 +1152,28 @@ class SDPOTrainer(_BaseTrainer):
         return prompt_ids
 
     def _tokenize_prompts(self, prompts: list[Any]) -> list[list[int]]:
+        # [FUNCTION DOC]
+        # HELPER: Untruncated tokenization followed by keeping the last max_prompt_length tokens when set.
+        # Inputs: prompts. Outputs: list of token id lists. Side effects: none.
         prompt_ids = self._tokenize_prompts_untruncated(prompts)
         if self.max_prompt_length is not None:
             prompt_ids = [ids[-self.max_prompt_length :] for ids in prompt_ids]
         return prompt_ids
 
     def _generate(self, prompt_ids: list[list[int]]) -> tuple[list[list[int]], list[list[int]]]:
+        # [FUNCTION DOC]
+        # HELPER: Dispatches generation to vLLM or transformers.
+        # Inputs: prompt_ids. Outputs: (prompt ids, completion id lists). Side effects: those of the backend.
         if self.use_vllm:
             return self._generate_vllm(prompt_ids)
         return self._generate_transformers(prompt_ids)
 
     def _generate_vllm(self, prompt_ids: list[list[int]]) -> tuple[list[list[int]], list[list[int]]]:
+        # [FUNCTION DOC]
+        # HELPER: Generates with VLLMGeneration: syncs weights when global_step changed since the last load, then generates
+        # with num_generations (train) or num_generations_eval (eval), without images.
+        # Inputs: prompt_ids. Outputs: (prompt ids as returned, completion id lists).
+        # Side effects: weight sync, network/GPU generation.
         if self.state.global_step != self._last_loaded_step:
             self.vllm_generation.sync_weights()
             self._last_loaded_step = self.state.global_step
@@ -1006,6 +1188,12 @@ class SDPOTrainer(_BaseTrainer):
         return prompt_ids_out, completion_ids_list
 
     def _generate_transformers(self, prompt_ids: list[list[int]]) -> tuple[list[list[int]], list[list[int]]]:
+        # [FUNCTION DOC]
+        # HELPER: Generates with transformers.
+        # Behavior: left-pads prompts, generates under unwrap_model_for_generation (ZeRO-3 gather setting, generation_kwargs),
+        # no_grad and FSDP full params when FSDP; strips the prompt; masks everything after the first eos token (keeping the
+        # eos; full length if none); returns the masked completions as lists.
+        # Inputs: prompt_ids. Outputs: (prompt_ids unchanged, completion id lists). Side effects: none.
         device = self.accelerator.device
         prompt_tensors = [torch.tensor(ids) for ids in prompt_ids]
         padded_ids = pad(prompt_tensors, padding_value=self._tokenizer.pad_token_id, padding_side="left").to(
@@ -1049,6 +1237,13 @@ class SDPOTrainer(_BaseTrainer):
         completion_ids: torch.Tensor,
         completion_mask: torch.Tensor,
     ) -> torch.Tensor | None:
+        # [FUNCTION DOC]
+        # HELPER: Student log-probs of the sampled completions at rollout time (for importance-sampling correction).
+        # Behavior: only when gradient_accumulation_steps is not a multiple of steps_per_generation * num_iterations (i.e. the
+        # batch is reused after the policy changed); concatenates prompt and completion, forwards without grad via
+        # _forward_logits (temperature-scaled) and gathers completion token log-probs. Otherwise returns None.
+        # Inputs: prompt_ids, prompt_mask, completion_ids, completion_mask. Outputs: tensor (B, T) or None.
+        # Side effects: none.
         generate_every = self.args.steps_per_generation * self.num_iterations
         old_per_token_logps = None
 
@@ -1068,6 +1263,16 @@ class SDPOTrainer(_BaseTrainer):
         return old_per_token_logps
 
     def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+        # [FUNCTION DOC]
+        # HELPER: Computes per-function rewards and gathers them across processes.
+        # Behavior: returns an empty (N, 0) tensor without reward functions. Extra example columns (excluding prompt,
+        # completion, completion_ids) plus trainer_state are passed as kwargs. Model rewards: conversational inputs are prompt
+        # plus completion messages rendered with the reward tokenizer's chat template, otherwise string concatenation;
+        # tokenized right-padded, moved via the base _prepare_inputs, first logit is the reward (inference mode). Callables:
+        # None becomes NaN.
+        # Inputs: inputs (examples), prompts, completions, completion_ids_list.
+        # Outputs: tensor (global N, number of reward functions).
+        # Exceptions: errors from reward functions. Side effects: cross-process gather.
         device = self.accelerator.device
         if len(self.reward_funcs) == 0:
             return torch.zeros((len(prompts), 0), device=device)
@@ -1112,6 +1317,13 @@ class SDPOTrainer(_BaseTrainer):
         return self.accelerator.gather(rewards_per_func)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Computes the SDPO loss.
+        # Behavior: distillation_weight 1: server or local distillation loss only; 0: forwards the student and returns the
+        # policy loss only; otherwise forwards student and teacher once and returns (1 - w) * policy loss + w * distillation
+        # loss. Divided by the current gradient accumulation steps in training.
+        # Inputs: model, inputs, return_outputs (must be False), num_items_in_batch (unused).
+        # Outputs: scalar loss. Exceptions: ValueError when return_outputs is True. Side effects: metrics.
         if return_outputs:
             raise ValueError("The SDPOTrainer does not support returning outputs")
 
@@ -1147,6 +1359,18 @@ class SDPOTrainer(_BaseTrainer):
         inputs,
         student_logits,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: GRPO-style clipped policy-gradient loss.
+        # Behavior: per-token log-probs of completions from the student logits; old log-probs default to the detached current
+        # ones (ratio 1); log-ratio is per token, or a masked mean per sequence for "sequence" importance sampling; ratio
+        # clipped to [1 - epsilon_low, 1 + epsilon_high]; per-token loss is the negative minimum of unclipped and clipped ratio
+        # times advantage. Aggregation: grpo = mean over sequences of per-sequence masked means; bnpo and dapo = masked sum over
+        # local masked token count; dr_grpo = masked sum over (batch size times max_completion_length). Logs
+        # self_distillation/policy_loss (gathered mean).
+        # Inputs: inputs (completion_ids, completion_mask, advantages, optional old_per_token_logps), student_logits.
+        # Outputs: scalar loss. Exceptions: ValueError for unknown loss_type. Side effects: metrics.
+        # KNOWN ISSUE: "dapo" is documented as normalizing by active tokens in the global accumulated batch but is computed
+        # identically to "bnpo" (local token count).
         completion_ids = inputs["completion_ids"]
         completion_mask = inputs["completion_mask"]
         per_token_logps = selective_log_softmax(student_logits, completion_ids)
@@ -1189,6 +1413,14 @@ class SDPOTrainer(_BaseTrainer):
         inputs: TrainingBatch,
         distillation_logits: DistillationLogits,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Computes the per-token distillation loss from local student/teacher logits.
+        # Behavior: if the loss mask is empty, logs 0 and returns a zero attached to the student graph. Otherwise dispatches on
+        # distillation_mode (topk_logits needs distillation_topk; full_logits; sampled_token). With distillation_is_clip and
+        # old_per_token_logps, multiplies by the clipped importance ratio. Loss = mean over sequences of masked per-token loss
+        # divided by masked token count (min 1). Logs the global token-mean loss (gathered) as the distillation metric.
+        # Inputs: model, inputs, distillation_logits.
+        # Outputs: scalar loss. Exceptions: ValueError for missing topk or invalid mode. Side effects: metrics.
         """Compute the per-token distillation loss and aggregate by normalizing over sequence length.
 
         Dispatches between three objectives based on `distillation_mode`:
@@ -1265,6 +1497,20 @@ class SDPOTrainer(_BaseTrainer):
         return loss
 
     def _compute_server_distillation_loss(self, model, inputs: TrainingBatch) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Computes the distillation loss with teacher log-probs from the vLLM server (live teacher).
+        # Behavior: re-syncs server weights when global_step changed (waiting for all ranks). Builds the loss mask (see below), forwards the student for temperature-scaled logits, fetches teacher
+        # log-probs; raises if a required position lacks a finite teacher log-prob; zeroes masked positions. Logs
+        # self_distillation/server_logprob_abs_diff (mean absolute difference between student and teacher realized-token
+        # log-probs). sampled_token: detached log-ratio times student log-prob. topk_logits: gathers student log-probs on the
+        # teacher's top-k ids, zeroes masked positions, then adds tail buckets or renormalizes both, and applies
+        # compute_divergence. Optional clipped importance weighting; same per-sequence normalization and logging as the local
+        # path.
+        # Inputs: model, inputs. Outputs: scalar loss.
+        # Exceptions: ValueError for missing teacher log-probs. Side effects: network calls, weight sync, metrics.
+        #
+        # Loss mask: completion mask multiplied per sample by self_distillation_mask (when present), so only reprompted samples
+        # (those with a successful demonstration or used feedback) contribute to distillation.
         """Distillation loss with teacher logprobs served by the vLLM generation server (`teacher_model_kind='live'`).
 
         The student is forwarded locally (grad) for its logits; the teacher logprobs are fetched from the server (no
@@ -1359,6 +1605,14 @@ class SDPOTrainer(_BaseTrainer):
     def _get_teacher_token_logprobs_from_server(
         self, inputs: TrainingBatch, logits_to_keep: int
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Fetches teacher per-token log-probs from the vLLM server.
+        # Behavior: derives the prompt mask as the teacher mask without the last logits_to_keep columns; requests top
+        # distillation_topk (top-k mode) or 1 log-probs for the trimmed sequences with the prompt lengths and temperature;
+        # fills arrays initialized to negative infinity (log-probs) and 0 (ids) for the first n positions of each row.
+        # Inputs: inputs (needs teacher_input_ids and teacher_attention_mask), logits_to_keep.
+        # Outputs: dict with actual_logprobs (B, T), topk_logprobs and topk_token_ids (B, T, K) on the input device.
+        # Exceptions: ValueError when top-k mode lacks distillation_topk; client errors. Side effects: HTTP request.
         """Per-token teacher logprobs from the vLLM server.
 
         Returns a dict with `actual_logprobs` (`(B, T)`, the realized-token logprob for reverse KL) and `topk_logprobs`
@@ -1409,6 +1663,14 @@ class SDPOTrainer(_BaseTrainer):
         teacher_model,
         inputs: TrainingBatch,
     ) -> DistillationLogits:
+        # [FUNCTION DOC]
+        # HELPER: Forwards the student on prompt plus completion (with grad) and the teacher on teacher prompt plus completion
+        # (no grad, inside the teacher adapter context), both cut to completion positions.
+        #
+        # Loss mask: completion mask multiplied per sample by self_distillation_mask (when present), so only reprompted samples
+        # (those with a successful demonstration or used feedback) contribute to distillation.
+        #
+        # Inputs: model, teacher_model, inputs. Outputs: DistillationLogits (including completion_mask). Side effects: none.
         """Compute the per-token logits of the student and teacher over the completion tokens.
 
         The student is forwarded on its own input (original prompt plus the sampled completion) while the teacher is
@@ -1461,6 +1723,11 @@ class SDPOTrainer(_BaseTrainer):
         attention_mask: torch.Tensor,
         logits_to_keep: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Forwards a model without cache (passing logits_to_keep + 1 when supported), drops the last position, keeps the
+        # last logits_to_keep positions, and divides by the sampling temperature.
+        # Inputs: model, input_ids, attention_mask, logits_to_keep. Outputs: tensor (B, logits_to_keep, V).
+        # Side effects: none.
         """Forward the model and return temperature-scaled logits aligned to the completion tokens."""
         model_inputs = {
             "input_ids": input_ids,
@@ -1476,6 +1743,10 @@ class SDPOTrainer(_BaseTrainer):
         return logits / self.temperature
 
     def _get_teacher_context_for_self_distillation(self):
+        # [FUNCTION DOC]
+        # HELPER: Context manager routing the teacher forward: no-op for non-PEFT students; for PEFT, disables adapters for the
+        # base teacher, activates the "teacher" adapter for the pure-LoRA EMA teacher, otherwise no-op.
+        # Inputs: none. Outputs: context manager. Side effects: none until entered.
         """Return the context manager that routes the teacher forward to the correct weights.
 
         For non-PEFT models this is a no-op. For PEFT models:
@@ -1497,6 +1768,14 @@ class SDPOTrainer(_BaseTrainer):
         return nullcontext()
 
     def _record_completion_metrics(self, mode: str, batch: TrainingBatch) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Logs completion length statistics.
+        # Behavior: gathers raw completion lengths (RuntimeError if none); records mean/min/max length; a completion is
+        # clipped when its last token is neither an eos nor pad; records clipped_ratio and mean/min/max length over terminated
+        # completions (zeros if none).
+        # Inputs: mode, batch. Outputs: none. Exceptions: RuntimeError when nothing was generated.
+        # Side effects: appends to _metrics.
+        # KNOWN ISSUE: an empty completion makes the last-token lookup fail with IndexError.
         device = self.accelerator.device
         completion_ids_list = self._get_completion_ids_list(batch)
         agg_completion_lengths = self.accelerator.gather(batch["raw_completion_lengths"])
@@ -1522,11 +1801,18 @@ class SDPOTrainer(_BaseTrainer):
         self._metrics[mode]["completions/max_terminated_length"].append(term_completion_lengths.float().max().item())
 
     def _log_self_distillation_metric(self, mode: str, value: float) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Appends the value under self_distillation/distillation_loss and under "<trainer name>/distillation_loss".
+        # Inputs: mode, value. Outputs: none. Side effects: mutates _metrics.
         metric_prefix = self._name.lower().replace(" ", "_")
         self._metrics[mode]["self_distillation/distillation_loss"].append(value)
         self._metrics[mode][f"{metric_prefix}/distillation_loss"].append(value)
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Averages each metric list for the current mode ignoring NaN values (None when no valid values remain), prefixes keys
+        # with "eval_" in eval, merges them into logs (mutating it), calls the parent log, and clears that mode's metrics.
+        # Inputs: logs, start_time (optional). Outputs: none. Side effects: logging; clears metrics.
         mode = "train" if self.model.training else "eval"
         # Average the metrics
         metrics = {}
@@ -1554,6 +1840,15 @@ class SDPOTrainer(_BaseTrainer):
         rewards_per_func: torch.Tensor,
         group_std_rewards: torch.Tensor,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Records reward statistics and warns on flat rewards.
+        # Behavior: computes mean, std, min, max of the (already gathered) rewards and the fraction of groups whose std is
+        # within diagnostics_flat_tolerance (1 if no groups); appends reward_mean/std/min/max, group_reward_std_mean,
+        # flat_group_fraction and per-function NaN-ignoring means (self_distillation/rewards/<name>) to metrics. If rewards are
+        # flat overall and all groups are flat, increments the flat_rewards degenerate counter (with periodic warning);
+        # otherwise resets it.
+        # Inputs: mode, rewards, rewards_per_func, group_std_rewards. Outputs: none.
+        # Side effects: cross-process gathers, metrics, warnings, counter mutation.
         tolerance = self.args.diagnostics_flat_tolerance
 
         reward_mean = rewards.mean() if rewards.numel() > 0 else torch.tensor(0.0, device=self.accelerator.device)
@@ -1601,6 +1896,11 @@ class SDPOTrainer(_BaseTrainer):
             self._diagnostic_counters[mode]["flat_rewards"] = 0
 
     def _warn_on_inactive_self_distillation(self, mode: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Uses the builder's last_metrics to track degenerate steps: when the reprompt fraction is within tolerance,
+        # counts/warns "inactive_self_distillation"; when no group had a success, counts/warns "no_successful_rollouts";
+        # otherwise resets the respective counter.
+        # Inputs: mode. Outputs: none. Side effects: counter mutation, warnings.
         metrics = self.teacher_context_builder.last_metrics
         tolerance = self.args.diagnostics_flat_tolerance
 
@@ -1634,6 +1934,10 @@ class SDPOTrainer(_BaseTrainer):
             self._diagnostic_counters[mode]["no_successful_rollouts"] = 0
 
     def _warn_on_degenerate_diagnostics(self, mode: str, counter_key: str, message: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Increments the named consecutive-degenerate counter and logs the message on the first occurrence and every
+        # diagnostics_warning_interval occurrences; does nothing when the interval is 0.
+        # Inputs: mode, counter_key, message. Outputs: none. Side effects: counter mutation, warning logs.
         interval = self.args.diagnostics_warning_interval
         if interval == 0:
             return

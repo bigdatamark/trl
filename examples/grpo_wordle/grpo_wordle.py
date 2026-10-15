@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Example script: GRPO with vLLM on OpenEnv's TextArena Wordle environment (default Qwen3-1.7B, environment on the
+# openenv-wordle HF Space or a local server). The model plays through a "guess" tool and is rewarded with the
+# environment's reward, zeroed for invalid moves. Main contents: parse_args, prompt (Wordle rules), reward_func, main
+# (defines WordleEnv inline). Import-time side effects: none beyond imports (requires textarena_env).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -104,6 +110,10 @@ from trl import GRPOConfig, GRPOTrainer, RichProgressCallback
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Behavior: argparse for model, env URL, dataset size (1000), generations (4), epochs, learning rate (1e-6), grad
+    # accumulation (64), logging steps, output dir, trackio space id (wordle-grpo), vLLM mode and server URL.
+    # Inputs: command line. Outputs: Namespace. Exceptions: SystemExit on bad args. Side effects: may print usage.
     parser = argparse.ArgumentParser(
         description="Run GRPO training for Wordle using the TextArena OpenEnv environment."
     )
@@ -199,19 +209,41 @@ Follow these rules to play Wordle:
 
 
 def reward_func(environments, **kwargs) -> list[float]:
+    # [FUNCTION DOC]
+    # Behavior: returns each environment's reward from its last guess (0 after reset).
+    # Inputs: environments, kwargs ignored. Outputs: list of floats. Exceptions: none. Side effects: none.
     return [env.reward for env in environments]
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: parses args; defines WordleEnv for the closed-over env_url; output_dir defaults to
+    # "<model name>-wordle-GRPO"; builds dataset_size identical prompt rows; trains GRPOTrainer with reward_func,
+    # environment_factory WordleEnv and RichProgressCallback (vLLM, server URL only in server mode, trackio, completion
+    # logging, thinking disabled, completion length 1024); calls trainer.end().
+    # Inputs: command line. Outputs: none. Exceptions: propagates network/training errors.
+    # Side effects: remote env traffic, GPU training, trackio logging, output files.
     args = parse_args()
 
     env_url = args.env_url
 
     class WordleEnv:
+        # [CLASS DOC]
+        # Per-rollout Wordle environment wrapping a TextArenaEnv client. State (set at reset): _last_full_feedback (the
+        # cumulative transcript seen so far, used to diff out new feedback), reward and done. guess is the only tool.
+        # No base class.
         def __init__(self):
+            # [FUNCTION DOC]
+            # Behavior: creates the TextArenaEnv client for env_url. Inputs: none. Outputs: none. Exceptions: client errors.
+            # Side effects: creates a client.
             self.client = TextArenaEnv(base_url=env_url)
 
         def reset(self, **kwargs) -> str | None:
+            # [FUNCTION DOC]
+            # Behavior: resets the remote game, stores the first message content as the cumulative transcript, sets reward 0 and
+            # done False and returns that content as the initial observation.
+            # Inputs: kwargs ignored. Outputs: string. Exceptions: network errors; IndexError if no messages.
+            # Side effects: remote reset, mutates state.
             result = self.client.reset()
             # The game returns cumulative feedback each turn (new text appended at the end), so
             # we store the previous full response and slice out only the newly appended part.
@@ -221,6 +253,11 @@ def main() -> None:
             return self._last_full_feedback
 
         def guess(self, guess: str) -> str:
+            # [FUNCTION DOC]
+            # Tool: raises if done; sends the guess, slices the new suffix from the cumulative transcript and updates it; reward is
+            # 0 if the suffix reports an invalid move, else the step reward; updates done and returns the new feedback.
+            # Inputs: guess (expected bracketed, e.g. "[crane]"). Outputs: string.
+            # Exceptions: ValueError("Game over.") when done; network errors. Side effects: remote step, mutates state.
             """
             Make a guess in the Wordle environment.
 

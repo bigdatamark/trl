@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Example script: GRPO for vision-language models (e.g. Qwen2.5-VL-3B, SmolVLM2) on lmms-lab/multimodal-open-r1-8k-
+# verified math problems with images. Under the main guard: parses ScriptArguments/GRPOConfig/ModelConfig, sets
+# model_init_kwargs (dtype resolved to a torch dtype unless "auto"/None), splits off 100 test rows (seed 42), maps rows
+# to a system (think-tag reasoning format) plus user prompt, drops images 512 px or larger, converts images to RGB,
+# trains GRPOTrainer with think_format_reward and accuracy_reward (eval split only when eval_strategy is not "no",
+# optional quantization and PEFT), saves, optionally pushes and calls trainer.end().
+# Main contents: nested helpers make_conversation, filter_big_images, convert_to_rgb defined in the main guard.
+# Import-time side effects: none unless run as a script.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -104,6 +114,9 @@ if __name__ == "__main__":
     )
 
     def make_conversation(example):
+        # [FUNCTION DOC]
+        # HELPER: Builds a "prompt" of the system prompt and the example's "problem" as user message.
+        # Inputs: example with "problem". Outputs: dict with "prompt". Exceptions: KeyError if missing. Side effects: none.
         prompt = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": example["problem"]},
@@ -114,12 +127,18 @@ if __name__ == "__main__":
 
     # Filter have big images
     def filter_big_images(example):
+        # [FUNCTION DOC]
+        # HELPER: Filter predicate keeping rows whose image width and height are both less than 512.
+        # Inputs: example with PIL "image". Outputs: bool. Exceptions: none expected. Side effects: none.
         image = example["image"]
         return image.size[0] < 512 and image.size[1] < 512
 
     dataset = dataset.filter(filter_big_images)
 
     def convert_to_rgb(example):
+        # [FUNCTION DOC]
+        # HELPER: Converts the example's image to RGB when needed and stores it back.
+        # Inputs: example. Outputs: same example dict. Exceptions: none expected. Side effects: mutates the input dict.
         image = example["image"]
         if image.mode != "RGB":
             image = image.convert("RGB")

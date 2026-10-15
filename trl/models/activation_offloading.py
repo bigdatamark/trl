@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Module trl.models.activation_offloading: activation offloading to CPU during the forward pass and reload
+# during backward, adapted from torchtune (with dedup ideas from verl). Exposed through trl.models as
+# get_act_offloading_ctx_manager and used by trainers when activation_offloading is enabled.
+# Main contents: _get_unique_tensor_key (storage-based dedup key), OffloadActivations (saved_tensors_hooks
+# context manager doing the offload/reload with an optional side stream), NoOpManager (hook that disables
+# offloading in a region) and get_act_offloading_ctx_manager (builds the manager and opts the output head and
+# Liger modules out of offloading).
+# Import-time side effects: imports torch_npu on NPU systems; resolves DTensor from the version-appropriate
+# location (None if unavailable); creates an accelerate logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +62,11 @@ logger = get_logger(__name__)
 
 
 def _get_unique_tensor_key(tensor: torch.Tensor) -> tuple:
+    # [FUNCTION DOC]
+    # HELPER: Key identifying a tensor's storage for deduplication.
+    # Behavior: for DTensor use its local tensor; key is (storage data pointer plus storage offset, dtype); if the
+    # storage pointer cannot be read, fall back to the Python id of the tensor (no dedup then).
+    # Inputs: tensor. Outputs: tuple (int, dtype). Exceptions: none (errors caught). Side effects: none.
     """
     Get a unique key for a tensor based on its storage pointer and dtype. This allows deduplication of tensors that
     share the same underlying storage. From:
@@ -81,6 +97,17 @@ def _get_unique_tensor_key(tensor: torch.Tensor) -> tuple:
 
 
 class OffloadActivations(saved_tensors_hooks):
+    # [CLASS DOC]
+    # saved_tensors_hooks subclass: tensors saved for backward are replaced by integer ids in the forward pack
+    # hook, qualifying ones copied to (optionally pinned) CPU memory, and restored in the unpack hook.
+    # State: use_streams, min_tensor_size_bytes, tracker (id to (tensor, offloaded flag, stride, storage offset,
+    # shape)), tensor_id counter, phase flags (is_first_forward_call, is_first_backward_call,
+    # is_first_forward_pass), storage_to_tensor_id and _storage_key_by_tensor_id (dedup maps), param_storages
+    # (parameter storage pointers to skip), use_pin_memory, virtual_memory_safe_pct (60), accelerator_type,
+    # device_module; with streams: s1 (communication stream), fwd_stash, max_fwd_stash_size, bwd_tensor_stash,
+    # bwd_ev_stash, curr_graph_id, curr_autograd_node. s0 is the live compute stream property.
+    # Flow: update_model_params registers parameter storages; __enter__ resets state and installs hooks; pack and
+    # unpack closures (defined in __init__) do the work; __exit__ synchronizes streams and uninstalls hooks.
     """
     Context manager under which activation tensors created in the forward pass will be offloaded.
 
@@ -128,6 +155,14 @@ class OffloadActivations(saved_tensors_hooks):
         min_offload_size: int = 1024,
         max_fwd_stash_size: int = 5,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: initialize the state described on the class; determine the accelerator type via torch.accelerator
+        # (default "cuda") and the device module (torch.cuda before torch 2.4); with streams create s1 and validate
+        # max_fwd_stash_size. Define the pack/unpack closures and helper closures, choose the streaming or
+        # single-stream unpack function, and register them with saved_tensors_hooks.
+        # Inputs: use_pin_memory (True), use_streams (True), min_offload_size (1024 bytes), max_fwd_stash_size (5).
+        # Outputs: none. Exceptions: ValueError when max_fwd_stash_size is below 1 (streams only).
+        # Side effects: creates a device stream.
         self.use_streams = use_streams
 
         self.min_tensor_size_bytes = min_offload_size  # we don't want to bother with small tensors
@@ -170,34 +205,66 @@ class OffloadActivations(saved_tensors_hooks):
 
         # -------- platform util functions -------- #
         def verify_sufficient_virtual_memory():
+            # [FUNCTION DOC]
+            # HELPER: Log a warning when system RAM usage exceeds virtual_memory_safe_pct percent.
+            # Inputs: none. Outputs: none. Exceptions: none. Side effects: logging.
             curr_pct = get_cpu_ram_pct()
             if curr_pct > self.virtual_memory_safe_pct:
                 logger.warning(f"{curr_pct=}% > {self.virtual_memory_safe_pct=}% of virtual memory used")
 
         def get_cpu_ram_pct() -> float:
+            # [FUNCTION DOC]
+            # HELPER: Return system memory usage percentage from psutil. Inputs: none. Outputs: float.
+            # Exceptions: none. Side effects: none.
             # get the percentage of memory used by the system
             return psutil.virtual_memory().percent
 
         def get_tensor_id() -> int:
+            # [FUNCTION DOC]
+            # HELPER: Increment and return the tensor id counter. Inputs: none. Outputs: int. Exceptions: none.
+            # Side effects: mutates self.tensor_id.
             # create a unique id for each tensor we are managing
             self.tensor_id += 1
             return self.tensor_id
 
         def get_num_bytes_tensor(x: torch.Tensor) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Byte size of a tensor as element size times element count. Inputs: x. Outputs: int.
+            # Exceptions: none. Side effects: none.
             # get the number of bytes in a tensor, for memory management purposes
             return x.element_size() * x.nelement()  # x.element_size() * x._base_storage().nbytes()
 
         def track_storage_key(storage_key: tuple, tensor_id: int):
+            # [FUNCTION DOC]
+            # HELPER: Record the storage key to tensor id mapping in both directions.
+            # Inputs: storage_key, tensor_id. Outputs: none. Exceptions: none. Side effects: mutates dedup maps.
             self.storage_to_tensor_id[storage_key] = tensor_id
             self._storage_key_by_tensor_id[tensor_id] = storage_key
 
         def release_storage_key(tensor_id: int):
+            # [FUNCTION DOC]
+            # HELPER: Forget a tensor id's storage key, removing the forward mapping only if it still points to this id.
+            # Inputs: tensor_id. Outputs: none. Exceptions: none. Side effects: mutates dedup maps.
             storage_key = self._storage_key_by_tensor_id.pop(tensor_id, None)
             if storage_key is not None and self.storage_to_tensor_id.get(storage_key) == tensor_id:
                 del self.storage_to_tensor_id[storage_key]
 
         # -------- core pack / unpack work -------- #
         def pack_tensor(activation: torch.Tensor) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Forward pack hook returning an integer id for a saved tensor.
+            # Behavior: on the first call of a forward pass require an empty tracker (else ValueError), flip phase flags
+            # and reset dedup maps. Assign a new id. Keep the tensor on device (offloaded flag False) when: its storage is
+            # already tracked (streams only), it is not on the accelerator, it is smaller than min_tensor_size_bytes, it is a
+            # Parameter/Buffer, it is a TorchAO FP8 helper type, or its storage belongs to a model parameter. Otherwise:
+            # unless it has broadcast (zero) strides, make it contiguous (clone when storage offset is non-zero). With
+            # streams, release forward-stash entries older than max_fwd_stash_size ids after waiting on their events, and
+            # make s1 wait on s0. On s1 (or s0) copy to a CPU tensor (pinned if configured): whole underlying storage for
+            # broadcast tensors, else an empty_like copy, non-blocking; record (cpu tensor, True, stride, storage offset,
+            # shape) in tracker. With streams, record an event, stash the device tensor with it and track its storage key.
+            # Inputs: activation (tensor). Outputs: int id.
+            # Exceptions: ValueError if the tracker was not emptied by the previous backward.
+            # Side effects: device-to-host copies, stream syncs, mutates tracker and stashes.
             # activations are passed in during forward pass - from here we take over and return a unique id
             if self.is_first_forward_call:
                 if len(self.tracker) != 0:
@@ -340,6 +407,14 @@ class OffloadActivations(saved_tensors_hooks):
             return tensor_id
 
         def unpack_tensor_single_stream(unpack_tensor_id: int) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Backward unpack hook without side streams.
+            # Behavior: on the first backward call (and only for the first forward pass) check RAM usage when pinning;
+            # raise for unknown ids; if offloaded, copy back to the accelerator non-blocking and restore the original
+            # stride/shape/offset with as_strided; delete the tracker entry and storage key; when the tracker is empty mark
+            # the next pack as the start of a new forward.
+            # Inputs: unpack_tensor_id (int). Outputs: tensor. Exceptions: ValueError for untracked ids.
+            # Side effects: host-to-device copy; mutates tracker.
             # backward pass - we are called with the tensor_id, which
             # we will use to retrieve the saved/offloaded tensor
             if self.is_first_backward_call:
@@ -383,12 +458,26 @@ class OffloadActivations(saved_tensors_hooks):
             return maybe_accelerator_tensor
 
         def unpack_tensor_with_streams(unpack_tensor_id: int) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Backward unpack hook using the side stream.
+            # Behavior: on the first backward call record the graph task id and queue an end-of-backward callback that waits
+            # on remaining events and clears bwd_tensor_stash; check RAM on the first pass. Raise for unknown ids. If the
+            # tensor was offloaded: detect moving to a new autograd node (then previous node's ids are scheduled for
+            # release); if it is still in fwd_stash reuse the device tensor, else copy back on s1, restore strides, make s0
+            # wait on s1, stash it and record the storage use count. Register a hook on the current node that, after it
+            # runs, either calls record_stream (if extra references appeared) or records an event, drains the forward stash,
+            # and waits on and frees the previous node's tensors. Finally remove tracking as in the single-stream variant.
+            # Inputs: unpack_tensor_id. Outputs: tensor. Exceptions: ValueError for untracked ids.
+            # Side effects: stream operations, autograd hooks/callbacks, mutates stashes and tracker.
             # backward pass - we are called with the tensor_id, which
             # we will use to retrieve the saved/offloaded tensor
             if self.is_first_backward_call:
                 self.curr_graph_id = torch._C._current_graph_task_id()
 
                 def wait_and_del_remaining_references() -> None:
+                    # [FUNCTION DOC]
+                    # HELPER: End-of-backward callback: for every stashed backward tensor wait on its event on s1 if any, then drop
+                    # it from bwd_tensor_stash. Inputs: none. Outputs: none. Exceptions: none. Side effects: stream waits.
                     for id in list(self.bwd_tensor_stash.keys()):
                         if id in self.bwd_ev_stash:
                             event = self.bwd_ev_stash[id]
@@ -475,6 +564,11 @@ class OffloadActivations(saved_tensors_hooks):
                         )
 
                 def hook(outputs, inputs):
+                    # [FUNCTION DOC]
+                    # HELPER: Post-hook on the autograd node consuming the unpacked tensor (see unpack_tensor_with_streams):
+                    # handles record_stream versus event recording for tensors brought back from CPU, drains fwd_stash, and
+                    # releases the previous node's tensors and events. Returns outputs unchanged.
+                    # Inputs: outputs, inputs. Outputs: outputs. Exceptions: none. Side effects: stream ops, mutates stashes.
                     # create events for the current node inputs/outputs if they were streamed in
                     if brought_back_from_cpu:
                         # See Note: [Track views of the unpacked]
@@ -538,11 +632,19 @@ class OffloadActivations(saved_tensors_hooks):
 
     @property
     def s0(self) -> torch.Stream:
+        # [FUNCTION DOC]
+        # Property: the device module's current stream, queried on every access (the compute stream may change under
+        # FSDP2, checkpoint recompute or custom autograd functions).
+        # Inputs: none. Outputs: stream. Exceptions: none. Side effects: none.
         # Compute stream. Queried live, not cached: under FSDP2, checkpoint recompute, or a custom autograd
         # Function, the current stream when packing/unpacking may differ from the one at construction time.
         return self.device_module.current_stream()
 
     def update_model_params(self, model: nn.Module):
+        # [FUNCTION DOC]
+        # Collect the storage data pointers of all model parameters (local tensor for DTensor; zero pointers and
+        # inaccessible storages skipped) into param_storages so pack_tensor skips them.
+        # Inputs: model. Outputs: none. Exceptions: none. Side effects: replaces self.param_storages.
         """
         Update the set of parameter storage pointers from the model. This allows filtering out model parameters during
         offloading, which is especially important for FSDP models where parameters may not be detected by isinstance
@@ -575,6 +677,12 @@ class OffloadActivations(saved_tensors_hooks):
         self.param_storages = param_storages
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Behavior: clear tracker, dedup maps and counters, reset phase flags, clear stashes when streaming, empty the
+        # device cache if bitsandbytes has been imported (avoids BNB buffer leaks), then install the hooks via the
+        # parent __enter__.
+        # Inputs: none. Outputs: parent's return value. Exceptions: none.
+        # Side effects: drops leaked state, may free cached device memory, installs autograd hooks.
         """Clear stale state and release BNB buffers before entering.
 
         By the time __enter__ is called, the previous forward/backward has already completed, so anything still in
@@ -604,6 +712,10 @@ class OffloadActivations(saved_tensors_hooks):
         return super().__enter__()
 
     def __exit__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: when streaming, synchronize s0 and s1 and clear stashes; in a finally block always call the parent
+        # __exit__ so hooks are removed. Inputs: exception info. Outputs: parent's result.
+        # Exceptions: propagates stream sync errors after cleanup. Side effects: uninstalls hooks.
         """Sync streams and clear stashes before parent cleanup.
 
         try/finally ensures the saved_tensors_hooks parent cleanup runs even if stream sync raises — otherwise hooks
@@ -622,6 +734,9 @@ class OffloadActivations(saved_tensors_hooks):
 
 
 class NoOpManager(saved_tensors_hooks):
+    # [CLASS DOC]
+    # saved_tensors_hooks whose pack and unpack are the identity; entering it overrides any outer offloading hook
+    # for the enclosed region (only the innermost hook runs). No state.
     """
     A `saved_tensors_hook` manager used to disable any other `saved_tensors_hook` manager applied before. This relies
     on the behavior that only the most recently registered `saved_tensors_hook` will run.
@@ -631,7 +746,13 @@ class NoOpManager(saved_tensors_hooks):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: register the identity function as both pack and unpack hook.
+        # Inputs: none. Outputs: none. Exceptions: none. Side effects: none until entered.
         def noop(tensor):
+            # [FUNCTION DOC]
+            # HELPER: Identity function returning the given tensor. Inputs: tensor. Outputs: tensor. Exceptions: none.
+            # Side effects: none.
             return tensor
 
         super().__init__(noop, noop)
@@ -645,6 +766,17 @@ def get_act_offloading_ctx_manager(
     max_fwd_stash_size: int = 5,
     warn_if_no_head: bool = True,
 ) -> OffloadActivations:
+    # [FUNCTION DOC]
+    # Build an OffloadActivations manager for a model, excluding the output head and Liger modules.
+    # Behavior: create the manager with the given options and register model parameter storages. Unwrap .module
+    # (DDP-style) and PEFT base_model. Find the head in priority order: output (module, or output.linear), lm_head,
+    # decoder.output or decoder.lm_head, final_layer_norm or ln_f, head; register a forward pre-hook entering a
+    # shared NoOpManager and a forward hook (always_call) exiting it. Warn if no head was found and
+    # warn_if_no_head. Do the same for every submodule whose name contains "liger".
+    # Inputs: model, use_pin_memory (True), use_streams (True), min_offload_size (1024), max_fwd_stash_size (5),
+    # warn_if_no_head (True). Outputs: OffloadActivations.
+    # Exceptions: ValueError from the manager constructor.
+    # Side effects: registers forward hooks on model submodules; logging.
     """
     Returns the activation offloading context manager for the model. All but the last output Linear in every step will
     be offloaded.
