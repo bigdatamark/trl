@@ -1,3 +1,18 @@
+# [MODULE DOC]
+# Tests for the experimental GOLD trainer (trl.experimental.gold): General On-policy Logit
+# Distillation with Universal Logit Distillation (ULD) loss for cross-tokenizer teacher/student pairs
+# and vision-language support. Covers: ChatML and VLM collators (completion preservation,
+# truncation, byte offsets), dataset preparation (messages, extended/positional ULD, sentencepiece,
+# tokenizers without a fast backend), teacher input building, byte-offset alignment and probability
+# merging, ULDLoss variants (hybrid, Bayesian shifts, positional), vocabulary mapping, on-policy
+# generation (vLLM and non-vLLM prompt budgeting, prompt/pad/eos masking), VLM trainer init validation
+# and collation paths, teacher-tokenizer revision handling, and loss normalization/eval datasets.
+# Contains many hub fixtures (tokenizers, processors, datasets; dataset fixtures skip when
+# unavailable) and fake vLLM generation helpers.
+# Import-time side effects: none.
+# KNOWN ISSUE: many tests drive private trainer methods directly and use SimpleNamespace / fake
+# models / monkeypatched internals, contrary to the repository test guideline.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,6 +64,11 @@ from ..testing_utils import TrlTestCase
 
 @pytest.fixture(scope="module")
 def openr1_examples():
+    # [FUNCTION DOC]
+    # HELPER: Module-scoped fixture loading the first 3 rows of the OpenR1-Math verified dataset and
+    # returning dicts with only messages. Skips the test if loading fails.
+    # Inputs: none. Outputs: list[dict]. Exceptions: pytest skip on any load error.
+    # Side effects: network/cache access.
     try:
         dataset = load_dataset(
             "HuggingFaceTB/OpenR1-Math-220k-default-verified",
@@ -62,6 +82,10 @@ def openr1_examples():
 
 @pytest.fixture(scope="module")
 def countdown_examples():
+    # [FUNCTION DOC]
+    # HELPER: Module-scoped fixture loading the first 3 rows of Countdown-Tasks-3to4 (gkd verified
+    # Qwen2.5-7B config) as messages-only dicts; skips if unavailable.
+    # Inputs: none. Outputs: list[dict]. Exceptions: pytest skip. Side effects: network/cache access.
     try:
         dataset = load_dataset(
             "HuggingFaceTB/Countdown-Tasks-3to4",
@@ -74,6 +98,14 @@ def countdown_examples():
 
 
 def _teacher_inputs_from_collator(student_tok, teacher_tok, batch):
+    # [FUNCTION DOC]
+    # HELPER: Reconstructs prompt and completion texts from a collated student batch and re-tokenizes
+    # them for the teacher. For each row: drops pad tokens from the prompt ids (if a pad id exists) and
+    # decodes them; decodes the input tokens whose labels are not -100 as the completion (special tokens
+    # kept). Then calls build_teacher_inputs_from_texts.
+    # Inputs: student_tok, teacher_tok (tokenizers), batch (dict with prompts, input_ids, labels).
+    # Outputs: tuple of teacher_input_ids, teacher_labels, completion_texts (list[str]),
+    # teacher_byte_offsets. Exceptions: none expected. Side effects: none.
     prompt_texts = []
     completion_texts = []
 
@@ -98,6 +130,13 @@ def _teacher_inputs_from_collator(student_tok, teacher_tok, batch):
 
 
 def _assert_alignment_covers_completion(loss_fn, batch, teacher_input_ids, teacher_labels, teacher_byte_offsets):
+    # [FUNCTION DOC]
+    # HELPER: For each row, takes the student and teacher byte offsets from the first to last supervised
+    # label position, aligns them with the loss's _align_by_byte_offsets, and asserts both group lists are
+    # non-empty and that their flattened indices are exactly every answer position once.
+    # Inputs: loss_fn (ULDLoss), batch (with labels, byte_offsets), teacher_input_ids (unused),
+    # teacher_labels, teacher_byte_offsets. Outputs: None. Exceptions: AssertionError.
+    # Side effects: none.
     """Assert byte-offset alignment groups cover every answer-region position."""
     for idx in range(batch["input_ids"].shape[0]):
         s_positions = (batch["labels"][idx] != -100).nonzero(as_tuple=True)[0]
@@ -111,6 +150,13 @@ def _assert_alignment_covers_completion(loss_fn, batch, teacher_input_ids, teach
 
 
 def test_chatml_collator_preserves_completion_llama(llama_tokenizer, qwen_tokenizer, openr1_examples):
+    # [FUNCTION DOC]
+    # Tests the ChatML collator plus teacher re-tokenization for a tiny Llama student and a Qwen2.5 teacher on
+    # OpenR1 examples: every decoded collated sequence contains the assistant reply; reconstructed
+    # completion texts contain the reply and are non-empty; a hybrid ULDLoss (matched weight 0.6 / unmatched 0.4) built
+    # via build_config has byte-offset alignment groups covering every answer position; and the loss on
+    # random student/teacher logits (seed 0) over each vocab is finite.
+    # Inputs: llama_tokenizer, qwen_tokenizer, openr1_examples fixtures. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     collator = DataCollatorForChatML(tokenizer=llama_tokenizer, max_length=512)
     batch = collator(openr1_examples)
 
@@ -157,6 +203,13 @@ def test_chatml_collator_preserves_completion_llama(llama_tokenizer, qwen_tokeni
 
 
 def test_chatml_collator_preserves_completion_llama_countdown(llama_tokenizer, qwen_tokenizer, countdown_examples):
+    # [FUNCTION DOC]
+    # Tests the ChatML collator plus teacher re-tokenization for a tiny Llama student and a Qwen2.5 teacher on
+    # Countdown examples: every decoded collated sequence contains the assistant reply; reconstructed
+    # completion texts contain the reply and are non-empty; a hybrid ULDLoss (matched weight 0.6 / unmatched 0.4) built
+    # via build_config has byte-offset alignment groups covering every answer position; and the loss on
+    # random student/teacher logits (seed 2) over each vocab is finite.
+    # Inputs: llama_tokenizer, qwen_tokenizer, countdown_examples fixtures. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     collator = DataCollatorForChatML(tokenizer=llama_tokenizer, max_length=512)
     batch = collator(countdown_examples)
 
@@ -203,6 +256,13 @@ def test_chatml_collator_preserves_completion_llama_countdown(llama_tokenizer, q
 
 
 def test_chatml_collator_preserves_completion_smollm(smollm_tokenizer, qwen_tokenizer, openr1_examples):
+    # [FUNCTION DOC]
+    # Tests the ChatML collator plus teacher re-tokenization for a SmolLM3 student and a Qwen2.5 teacher on
+    # OpenR1 examples: every decoded collated sequence contains the assistant reply; reconstructed
+    # completion texts contain the reply and are non-empty; a hybrid ULDLoss (matched weight 0.5 / unmatched 0.5) built
+    # via build_config has byte-offset alignment groups covering every answer position; and the loss on
+    # random student/teacher logits (seed 1) over each vocab is finite.
+    # Inputs: smollm_tokenizer, qwen_tokenizer, openr1_examples fixtures. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     collator = DataCollatorForChatML(tokenizer=smollm_tokenizer, max_length=512)
     batch = collator(openr1_examples)
 
@@ -249,11 +309,19 @@ def test_chatml_collator_preserves_completion_smollm(smollm_tokenizer, qwen_toke
 
 
 def build_config(**overrides):
+    # [FUNCTION DOC]
+    # HELPER: Returns a GOLDConfig with uld_skip_student_eos and uld_skip_teacher_eos False plus the
+    # given overrides (default output_dir). Inputs: overrides (kwargs). Outputs: GOLDConfig.
+    # Exceptions: config validation errors. Side effects: none.
     return GOLDConfig(uld_skip_student_eos=False, uld_skip_teacher_eos=False, **overrides)
 
 
 @pytest.fixture(scope="session")
 def llama_tokenizer():
+    # [FUNCTION DOC]
+    # HELPER: Session-scoped pytest fixture loading the tiny Llama 3.2 tokenizer from the hub and setting pad_token
+    # to eos_token if missing. Inputs: none. Outputs: tokenizer. Exceptions: load errors propagate.
+    # Side effects: network/cache access.
     tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-LlamaForCausalLM-3.2")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -262,6 +330,10 @@ def llama_tokenizer():
 
 @pytest.fixture(scope="session")
 def qwen_tokenizer():
+    # [FUNCTION DOC]
+    # HELPER: Session-scoped pytest fixture loading the Qwen2.5-0.5B-Instruct tokenizer from the hub and setting pad_token
+    # to eos_token if missing. Inputs: none. Outputs: tokenizer. Exceptions: load errors propagate.
+    # Side effects: network/cache access.
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -270,6 +342,10 @@ def qwen_tokenizer():
 
 @pytest.fixture(scope="session")
 def smollm_tokenizer():
+    # [FUNCTION DOC]
+    # HELPER: Session-scoped pytest fixture loading the SmolLM3-3B tokenizer from the hub and setting pad_token
+    # to eos_token if missing. Inputs: none. Outputs: tokenizer. Exceptions: load errors propagate.
+    # Side effects: network/cache access.
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM3-3B")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -278,6 +354,10 @@ def smollm_tokenizer():
 
 @pytest.fixture(scope="session")
 def gemma4_tokenizer():
+    # [FUNCTION DOC]
+    # HELPER: Session-scoped pytest fixture loading the tiny Gemma4 tokenizer from the hub and setting pad_token
+    # to eos_token if missing. Inputs: none. Outputs: tokenizer. Exceptions: load errors propagate.
+    # Side effects: network/cache access.
     tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Gemma4ForConditionalGeneration")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -286,6 +366,10 @@ def gemma4_tokenizer():
 
 @pytest.fixture(scope="session")
 def smolvlm_processor():
+    # [FUNCTION DOC]
+    # HELPER: Session-scoped pytest fixture loading the SmolVLM-256M-Instruct processor and setting its tokenizer's
+    # pad_token to eos_token if missing. Inputs: none. Outputs: processor. Exceptions: load errors.
+    # Side effects: network/cache access.
     processor = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct")
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -294,6 +378,10 @@ def smolvlm_processor():
 
 @pytest.fixture(scope="session")
 def qwen3_vl_processor():
+    # [FUNCTION DOC]
+    # HELPER: Session-scoped pytest fixture loading the Qwen3-VL-2B-Instruct processor and setting its tokenizer's
+    # pad_token to eos_token if missing. Inputs: none. Outputs: processor. Exceptions: load errors.
+    # Side effects: network/cache access.
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -302,6 +390,10 @@ def qwen3_vl_processor():
 
 @pytest.fixture(scope="module")
 def vlm_dataset():
+    # [FUNCTION DOC]
+    # HELPER: Module-scoped fixture loading the first 3 rows of zen-image conversational
+    # prompt-completion; skips if unavailable. Inputs: none. Outputs: Dataset.
+    # Exceptions: pytest skip. Side effects: network/cache access.
     try:
         return load_dataset(
             "trl-internal-testing/zen-image",
@@ -314,10 +406,21 @@ def vlm_dataset():
 
 @pytest.fixture
 def vlm_examples(vlm_dataset):
+    # [FUNCTION DOC]
+    # HELPER: Function-scoped fixture converting each vlm_dataset row to a plain dict (fresh copy per
+    # test). Inputs: vlm_dataset. Outputs: list[dict]. Exceptions: none. Side effects: none.
     return [dict(row) for row in vlm_dataset]
 
 
 def encode_prompt_completion(tokenizer, prompt, completion):
+    # [FUNCTION DOC]
+    # HELPER: Tokenizes the prompt without special tokens; tokenizes the completion with
+    # encode_with_byte_offsets on the backend tokenizer; appends eos (with offset pair content_len,
+    # content_len where content_len is the completion's UTF-8 byte length) if the tokenizer has one.
+    # Builds input_ids as prompt plus completion, labels with -100 over the prompt, and byte offsets with
+    # (0, 0) over the prompt. Inputs: tokenizer (fast), prompt, completion (str).
+    # Outputs: tuple (input_ids, labels, byte_offsets) as lists. Exceptions: AttributeError without a
+    # backend tokenizer. Side effects: none.
     """Build input_ids, labels, and per-token byte offsets for a (prompt, completion) pair.
 
     Byte offsets are computed via `encode_with_byte_offsets` on the completion text only, then padded with (0, 0) for
@@ -342,14 +445,25 @@ def encode_prompt_completion(tokenizer, prompt, completion):
 
 
 def pad_tokens(ids, pad_id, target_length):
+    # [FUNCTION DOC]
+    # HELPER: Right-pads ids with pad_id up to target_length (no truncation). Inputs: ids (list),
+    # pad_id (int), target_length (int). Outputs: list. Exceptions: none. Side effects: none.
     return ids + [pad_id] * (target_length - len(ids))
 
 
 def pad_labels(labels, target_length):
+    # [FUNCTION DOC]
+    # HELPER: Right-pads labels with -100 up to target_length. Inputs: labels (list), target_length.
+    # Outputs: list. Exceptions: none. Side effects: none.
     return labels + [-100] * (target_length - len(labels))
 
 
 def _gold_trainer(tmp_path, **config_kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Builds a GOLDTrainer with the module constant _TINY_QWEN2 as both student and teacher, a
+    # GOLDConfig (output_dir tmp_path, no reporting, plus config_kwargs), and the zen conversational
+    # prompt-completion train split. Inputs: tmp_path, config_kwargs. Outputs: GOLDTrainer.
+    # Exceptions: propagates. Side effects: downloads.
     return GOLDTrainer(
         model=_TINY_QWEN2,
         teacher_model=_TINY_QWEN2,
@@ -359,28 +473,53 @@ def _gold_trainer(tmp_path, **config_kwargs):
 
 
 class RecordingVLLMGeneration:
+    # [CLASS DOC]
+    # HELPER: Fake VLLMGeneration (vLLM cannot run in tests): records received prompts, counts
+    # sync_weights calls, and completes every prompt with the token ids of "C".
     """Stands in for vLLM, which cannot run here: records the prompts it gets and completes each one with "C"."""
 
     def __init__(self, processing_class, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Encodes "C" without special tokens as completion_ids; sets prompts None and sync_calls 0.
+        # Inputs: processing_class, kwargs (ignored). Outputs: none. Exceptions: none.
+        # Side effects: sets attributes.
         self.completion_ids = processing_class.encode("C", add_special_tokens=False)
         self.prompts = None
         self.sync_calls = 0
 
     def sync_weights(self):
+        # [FUNCTION DOC]
+        # HELPER: Increments sync_calls. Inputs: none. Outputs: None. Exceptions: none.
+        # Side effects: mutates self.
         self.sync_calls += 1
 
     def generate(self, prompts, images, num_generations):
+        # [FUNCTION DOC]
+        # HELPER: Stores prompts and returns a 4-tuple of None, a list of completion_ids per prompt, None,
+        # None (matching VLLMGeneration's output layout). Inputs: prompts, images, num_generations.
+        # Outputs: tuple. Exceptions: none. Side effects: sets self.prompts.
         self.prompts = prompts
         return None, [self.completion_ids] * len(prompts), None, None
 
 
 def _gold_vllm_trainer(monkeypatch, tmp_path, **config_kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Patches gold_trainer_module so is_vllm_available returns True and VLLMGeneration is
+    # RecordingVLLMGeneration, then builds a trainer with use_vllm True and config_kwargs.
+    # Inputs: monkeypatch, tmp_path, config_kwargs. Outputs: GOLDTrainer. Exceptions: propagates.
+    # Side effects: monkeypatch; downloads.
     monkeypatch.setattr(gold_trainer_module, "is_vllm_available", lambda: True)
     monkeypatch.setattr(gold_trainer_module, "VLLMGeneration", RecordingVLLMGeneration)
     return _gold_trainer(tmp_path, use_vllm=True, **config_kwargs)
 
 
 def test_process_completions_to_buffer_left_pads_prompt_ids(tmp_path):
+    # [FUNCTION DOC]
+    # Tests _process_completions_to_buffer with prompts of length 1 and 2 and one-token completions:
+    # the buffered input_ids are left-padded (pad, 11, 31 and 21, 22, 41), attention masks mark the pad,
+    # and labels are -100 across the prompt width with completion tokens supervised.
+    # Inputs: tmp_path. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     trainer = _gold_trainer(tmp_path)
     trainer._buffered_inputs = [None]
     trainer._buffered_text_logs = [None]
@@ -403,6 +542,12 @@ def test_process_completions_to_buffer_left_pads_prompt_ids(tmp_path):
 
 
 def test_generate_on_policy_for_slices_uses_prompt_attention_mask_for_vllm_prompts(monkeypatch, tmp_path):
+    # [FUNCTION DOC]
+    # Tests a prompt containing the pad token as a real token: vLLM receives prompt A, pad, B selected
+    # by the attention mask (not by pad id), weights are synced once, buffered input_ids are that prompt
+    # plus the completion, and original_prompt_text decodes to A then the endoftext token then B.
+    # Inputs: monkeypatch, tmp_path. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: temporary monkeypatch of the gold_trainer module; downloads; tmp_path.
     # The prompt contains the pad token as a real token: the attention mask, not the token id, says what to keep
     trainer = _gold_vllm_trainer(monkeypatch, tmp_path, max_length=None, max_completion_length=1)
     trainer._buffered_inputs = [None]
@@ -429,6 +574,12 @@ def test_generate_on_policy_for_slices_uses_prompt_attention_mask_for_vllm_promp
 
 
 def test_generate_on_policy_for_slices_reconstructs_prompt_with_special_tokens(monkeypatch, tmp_path):
+    # [FUNCTION DOC]
+    # Tests a prompt with an im_start special token: vLLM gets A, im_start, B; one sync; buffered
+    # input_ids, all-ones attention, labels (-100 over prompt), original prompt and completion texts
+    # (special token kept, completion "C"), and the buffered text logs are as expected.
+    # Inputs: monkeypatch, tmp_path. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: temporary monkeypatch of the gold_trainer module; downloads; tmp_path.
     trainer = _gold_vllm_trainer(monkeypatch, tmp_path, max_length=None, max_completion_length=1)
     trainer._buffered_inputs = [None]
     trainer._buffered_text_logs = [None]
@@ -459,6 +610,12 @@ def test_generate_on_policy_for_slices_reconstructs_prompt_with_special_tokens(m
 
 
 def test_on_policy_prompt_text_reflects_truncated_prompt(monkeypatch, tmp_path):
+    # [FUNCTION DOC]
+    # Tests with max_length 3 and max_completion_length 1 that the prompt is budgeted to 2 tokens
+    # keeping the end before generation: vLLM receives im_start, B; buffered input_ids, prompts, prompt
+    # attention mask, and original_prompt_text all reflect the truncated prompt.
+    # Inputs: monkeypatch, tmp_path. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: temporary monkeypatch of the gold_trainer module; downloads; tmp_path.
     """When the prompt overflows max_length - max_completion_length it is truncated before the student sees it.
     `original_prompt_text` — which the teacher re-encodes — must reflect that truncated prompt, not the full one, so
     teacher and student score the completion under the same context."""
@@ -492,6 +649,12 @@ def test_on_policy_prompt_text_reflects_truncated_prompt(monkeypatch, tmp_path):
 
 
 def test_non_vllm_on_policy_budgets_prompt_before_generation(tmp_path):
+    # [FUNCTION DOC]
+    # Tests the non-vLLM path (_generate_non_vllm_for_slices) also keeps the last 2 real prompt tokens
+    # (im_start, B) before generating one token: buffered prompts match, input_ids have shape (1, 3)
+    # starting with them.
+    # Inputs: tmp_path. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """Non-vLLM path budgets the prompt to max_length - max_new_tokens (keep-end) before model.generate,
     matching the vLLM path, so the student generates from and trains on the same in-budget context."""
     trainer = _gold_trainer(tmp_path, max_length=3, max_completion_length=1)
@@ -519,6 +682,11 @@ def test_non_vllm_on_policy_budgets_prompt_before_generation(tmp_path):
 
 
 def test_non_vllm_on_policy_does_not_trim_padded_width_when_real_prompt_fits(tmp_path):
+    # [FUNCTION DOC]
+    # Tests that a left-padded prompt whose single real token fits the budget is kept unchanged (pad,
+    # pad, Q) and input_ids have shape (1, 4) beginning with it (budget counts real tokens, not width).
+    # Inputs: tmp_path. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """Fallback budgets on the REAL token count, not the padded width (vLLM parity). A left-padded prompt
     whose real tokens already fit max_length - max_new_tokens is passed through unchanged, not trimmed to the last
     `budget` columns (which would carry a pad column into generation)."""
@@ -546,11 +714,22 @@ def test_non_vllm_on_policy_does_not_trim_padded_width_when_real_prompt_fits(tmp
 
 
 def test_gold_trainer_init_defaults_vllm_max_model_length_to_max_length(monkeypatch, tmp_path):
+    # [FUNCTION DOC]
+    # Patches vLLM availability and replaces VLLMGeneration with a local capturing class; constructs a
+    # GOLDTrainer with use_vllm, max_length 128, max_completion_length 16, and asserts the vLLM
+    # generation was created with max_model_length 128.
+    # Inputs: monkeypatch, tmp_path. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     captured = {}
 
     # Stand in for vLLM, which cannot run here
     class CapturingVLLMGeneration:
+        # [CLASS DOC]
+        # HELPER: Fake VLLMGeneration recording its constructor kwargs into the test's captured dict.
         def __init__(self, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Updates the enclosing captured dict with kwargs. Inputs: kwargs. Outputs: none.
+            # Exceptions: none. Side effects: mutates captured.
             captured.update(kwargs)
 
     monkeypatch.setattr(gold_trainer_module, "is_vllm_available", lambda: True)
@@ -569,6 +748,11 @@ def test_gold_trainer_init_defaults_vllm_max_model_length_to_max_length(monkeypa
 
 
 def test_chatml_collator_truncates_keeping_completion_end(llama_tokenizer):
+    # [FUNCTION DOC]
+    # Tests DataCollatorForChatML with a very long prompt and completion and max_length 512: the batch is
+    # exactly 512 tokens, its last token equals the last token of the full untruncated templated
+    # encoding (end kept), and the final byte offset end is positive.
+    # Inputs: llama_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     """When the rendered chat-template message exceeds max_length, the collator must
     keep the LAST max_length tokens (the model's recent context), not the first. Also verifies byte_offsets are sliced
     consistently with input_ids."""
@@ -602,6 +786,10 @@ def test_chatml_collator_truncates_keeping_completion_end(llama_tokenizer):
 
 
 def test_chatml_collator_raises_when_completion_fills_window(llama_tokenizer):
+    # [FUNCTION DOC]
+    # Tests that with max_length 256 (smaller than the completion) the collator raises ValueError
+    # "no prompt tokens left after truncation".
+    # Inputs: llama_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     """When the completion alone fills the whole window, the prompt is entirely dropped, leaving nothing to
     generate from. The collator must reject this rather than emit an all-padding prompt row."""
     long_user = "Please summarize:\n" + ("very long context. " * 200)
@@ -622,6 +810,11 @@ def test_chatml_collator_raises_when_completion_fills_window(llama_tokenizer):
 
 
 def _prepared_row(tmp_path, model_id, tokenizer, dataset, **config_kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Constructs a GOLDTrainer (model_id as student and teacher, GOLDConfig with config_kwargs)
+    # so that its __init__ prepares the dataset, and returns the first prepared train row.
+    # Inputs: tmp_path, model_id (str), tokenizer, dataset, config_kwargs. Outputs: dict row.
+    # Exceptions: propagates. Side effects: downloads; tmp_path.
     # `GOLDTrainer.__init__` prepares the train dataset, so its first row is what training sees
     trainer = GOLDTrainer(
         model=model_id,
@@ -634,6 +827,13 @@ def _prepared_row(tmp_path, model_id, tokenizer, dataset, **config_kwargs):
 
 
 def test_prepared_tokenized_rows_keep_completion_after_truncation(tmp_path, llama_tokenizer):
+    # [FUNCTION DOC]
+    # Tests dataset prep with an overflowing prompt (max_length 64, extended ULD): the row has exactly 64
+    # ids, completion_mask contains ones, original prompt and completion texts equal decoding the kept
+    # ids split at the first completion position, and the collator supervises exactly the tracked
+    # completion ids, whose decoding contains the assistant answer.
+    # Inputs: tmp_path, llama_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """When a GOLD row's prompt overflows max_length, dataset prep must keep the LAST max_length tokens (the
     completion end), tracking the prompt/completion boundary via completion_mask so the collator labels the completion
     instead of masking the whole sequence."""
@@ -686,6 +886,11 @@ def test_prepared_tokenized_rows_keep_completion_after_truncation(tmp_path, llam
 
 
 def test_prepared_tokenized_rows_rebase_byte_offsets_when_truncation_eats_into_completion(tmp_path, llama_tokenizer):
+    # [FUNCTION DOC]
+    # Tests a short prompt with a completion overflowing max_length 32: all 32 kept positions are
+    # completion, and the first kept byte offset is rebased to start at 0 spanning "word ".
+    # Inputs: tmp_path, llama_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """When truncation drops the front of the completion (``drop > completion_start``), the kept byte_offsets
     reference bytes in the original completion text — but ``original_completion_text`` is decoded fresh from the kept
     ids and starts at byte 0. The kept offsets must be rebased so they match the teacher's re-encoding.
@@ -714,6 +919,12 @@ def test_prepared_tokenized_rows_rebase_byte_offsets_when_truncation_eats_into_c
 
 
 def test_prepare_dataset_messages_uses_last_assistant_turn(tmp_path, qwen_tokenizer):
+    # [FUNCTION DOC]
+    # Tests that for a multi-turn conversation the prompt text is the chat template of all but the last
+    # message with generation prompt, the completion text is the rest of the full template (contains the
+    # last answer, not the earlier one), and decoding the completion-mask ids reproduces it exactly.
+    # Inputs: tmp_path, qwen_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     messages = [
         {"role": "system", "content": "Be terse."},
         {"role": "user", "content": "First?"},
@@ -739,6 +950,13 @@ def test_prepare_dataset_messages_uses_last_assistant_turn(tmp_path, qwen_tokeni
 
 
 def test_prepare_dataset_extended_uld_keeps_seam_token(tmp_path, qwen_tokenizer):
+    # [FUNCTION DOC]
+    # Tests prompt/completion prep with extended ULD on Qwen: completion text is "Answer."; completion
+    # ids minus the final eos decode to it; exactly one eos; first completion offset spans "Answer" and
+    # the eos offset is the zero-width pair at the end. Teacher inputs built from the texts also contain
+    # exactly one eos in their completion.
+    # Inputs: tmp_path, qwen_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     dataset = Dataset.from_dict({"prompt": ["Question: "], "completion": ["Answer."]})
     row = _prepared_row(
         tmp_path, _TINY_QWEN2, qwen_tokenizer, dataset, max_length=64, max_completion_length=16, use_extended_uld=True
@@ -767,6 +985,12 @@ def test_prepare_dataset_extended_uld_keeps_seam_token(tmp_path, qwen_tokenizer)
 
 
 def test_prepare_dataset_positional_uld_supports_sentencepiece(tmp_path, gemma4_tokenizer, qwen_tokenizer):
+    # [FUNCTION DOC]
+    # Tests positional ULD prep with the sentencepiece Gemma4 tokenizer: completion ends with eos and
+    # decodes to "Answer.", all byte offsets are zero pairs (unused), and Qwen teacher inputs decode to
+    # "Answer." followed by its eos token.
+    # Inputs: tmp_path, gemma4_tokenizer, qwen_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     dataset = Dataset.from_dict({"text": ["Question: Answer."], "prompt": ["Question: "], "completion": ["Answer."]})
     row = _prepared_row(
         tmp_path,
@@ -797,6 +1021,10 @@ def test_prepare_dataset_positional_uld_supports_sentencepiece(tmp_path, gemma4_
 
 
 def test_build_teacher_inputs_positional_uld_supports_sentencepiece(gemma4_tokenizer):
+    # [FUNCTION DOC]
+    # Tests build_teacher_inputs_from_texts positional mode with Gemma4: one eos in the completion, it
+    # decodes to "Answer." plus eos, and byte offsets are all zero pairs.
+    # Inputs: gemma4_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     input_ids, labels, _, byte_offsets = build_teacher_inputs_from_texts(
         gemma4_tokenizer,
         ["Question: "],
@@ -811,21 +1039,38 @@ def test_build_teacher_inputs_positional_uld_supports_sentencepiece(gemma4_token
 
 
 class _NoBackendTokenizer:
+    # [CLASS DOC]
+    # HELPER: Wrapper delegating everything to a real tokenizer except backend_tokenizer, which raises
+    # AttributeError, simulating a slow tokenizer without a fast backend.
     """Wraps a tokenizer but hides `backend_tokenizer`, standing in for a slow tokenizer with no fast backend."""
 
     def __init__(self, tokenizer):
+        # [FUNCTION DOC]
+        # HELPER: Stores the wrapped tokenizer. Inputs: tokenizer. Outputs: none. Exceptions: none.
+        # Side effects: sets attribute.
         self._tokenizer = tokenizer
 
     def __getattr__(self, name):
+        # [FUNCTION DOC]
+        # HELPER: Raises AttributeError for backend_tokenizer; otherwise returns the wrapped tokenizer's
+        # attribute. Inputs: name (str). Outputs: attribute value. Exceptions: AttributeError.
+        # Side effects: none.
         if name == "backend_tokenizer":
             raise AttributeError(name)
         return getattr(self._tokenizer, name)
 
     def __call__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Forwards the call to the wrapped tokenizer. Inputs: args, kwargs. Outputs: encoding.
+        # Exceptions: propagates. Side effects: none.
         return self._tokenizer(*args, **kwargs)
 
 
 def test_build_teacher_inputs_positional_uld_works_without_backend_tokenizer(gemma4_tokenizer):
+    # [FUNCTION DOC]
+    # Tests positional build_teacher_inputs_from_texts works with a backend-less tokenizer: the completion
+    # decodes to "Answer." plus eos.
+    # Inputs: gemma4_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     slow_tokenizer = _NoBackendTokenizer(gemma4_tokenizer)
 
     input_ids, labels, _, _ = build_teacher_inputs_from_texts(
@@ -840,6 +1085,12 @@ def test_build_teacher_inputs_positional_uld_works_without_backend_tokenizer(gem
 
 
 def test_prepare_dataset_positional_uld_works_without_backend_tokenizer(tmp_path, gemma4_tokenizer):
+    # [FUNCTION DOC]
+    # Builds a Gemma4 GOLDTrainer (positional ULD), then calls _prepare_dataset_with_original_text
+    # directly with the backend-less wrapper; asserts completion ids minus eos decode to the stored
+    # original completion text.
+    # Inputs: tmp_path, gemma4_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     dataset = Dataset.from_dict({"prompt": ["Question: "], "completion": ["Answer."]})
     trainer = GOLDTrainer(
         model="trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
@@ -872,6 +1123,11 @@ def test_prepare_dataset_positional_uld_works_without_backend_tokenizer(tmp_path
 
 
 def test_alignment_groups_cover_all_tokens(llama_tokenizer, qwen_tokenizer):
+    # [FUNCTION DOC]
+    # Tests _align_by_byte_offsets on a text with emoji and CJK encoded by Llama and Qwen: equal group
+    # counts, groups partition all student and all teacher token indices, and each paired group spans the
+    # same byte range.
+    # Inputs: llama_tokenizer, qwen_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     config = build_config()
     loss = ULDLoss(config, student_tokenizer=llama_tokenizer, teacher_tokenizer=qwen_tokenizer)
 
@@ -901,6 +1157,12 @@ def test_alignment_groups_cover_all_tokens(llama_tokenizer, qwen_tokenizer):
 
 
 def test_on_policy_completion_byte_offsets_match_encode_offsets(tmp_path, smollm_tokenizer):
+    # [FUNCTION DOC]
+    # Builds a trainer (tiny Llama student with SmolLM3 tokenizer, Qwen teacher, extended ULD) and calls
+    # _maybe_add_completion_byte_offsets on a slice of pad plus a completion with emoji/CJK; asserts the
+    # derived completion byte offsets equal those of encode_with_byte_offsets on the same text.
+    # Inputs: tmp_path, smollm_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """On-policy offsets are derived from the generated token ids directly (per-token piece byte length, no
     decode-then-re-encode round-trip). For ByteLevel BPE — the family of every cross-tokenizer pair GOLD targets
     (SmolLM, Qwen, Llama 3+, …) — those per-token spans match what `encode_with_byte_offsets` produces on the same
@@ -931,6 +1193,10 @@ def test_on_policy_completion_byte_offsets_match_encode_offsets(tmp_path, smollm
 
 
 def test_merge_probabilities_multiplies_split_tokens_observed():
+    # [FUNCTION DOC]
+    # Tests observed merging of a 2-token group over a 3-token vocab: the merged distribution equals the
+    # first position's distribution times the second position's probability of its actual token (0.5).
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     config = build_config(uld_token_merge_strategy="observed")
     # Use simple 3-token vocabulary to validate merging behaviour
     # probs[0] = marginal P(token | context) at position 0 for all vocab tokens
@@ -953,6 +1219,10 @@ def test_merge_probabilities_multiplies_split_tokens_observed():
 
 
 def test_merge_probabilities_multiplies_split_tokens_bayesian():
+    # [FUNCTION DOC]
+    # Tests bayesian merging: the merged distribution equals the last position's distribution times the
+    # first position's probability of its actual token (0.6).
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     config = build_config(uld_token_merge_strategy="bayesian")
     # Use simple 3-token vocabulary to validate merging behaviour
     # probs[0] = P(token | context) at position 0 for all vocab tokens
@@ -974,6 +1244,12 @@ def test_merge_probabilities_multiplies_split_tokens_bayesian():
 
 
 def test_compute_distillation_loss_bayesian_shifts_answer_logits():
+    # [FUNCTION DOC]
+    # Tests positional bayesian _compute_distillation_loss uses logits shifted one position earlier: for
+    # an answer at positions 1-2 it compares to the expected value computed as: softmax the student and teacher logits at the
+    # shifted positions 0 and 1, sort each distribution descending, and take the summed absolute
+    # difference divided by the number of positions. The observed strategy gives a different value.
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     # The "bayesian" strategy shifts the answer-logit slice one position earlier (probs[k] predicts token_ids[k]).
     # This also applies on the positional path (use_extended_uld=False), so check the loss uses the shifted slice.
     config = build_config(use_extended_uld=False, uld_token_merge_strategy="bayesian")
@@ -1010,6 +1286,12 @@ def test_compute_distillation_loss_bayesian_shifts_answer_logits():
 
 
 def test_compute_distillation_loss_bayesian_skips_zero_start_span_positional():
+    # [FUNCTION DOC]
+    # Tests that an answer span starting at index 0 skips its first token (start 1, size 2) rather than
+    # wrapping; it compares to the expected value computed as: softmax the student and teacher logits at the
+    # shifted positions 0 and 1, sort each distribution descending, and take the summed absolute
+    # difference divided by the number of positions.
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     # Front-truncation can drop the whole prompt, leaving an answer span that starts at index 0. The first token has
     # no preceding predictor logit for the shift, so it must be skipped (start += 1, size -= 1) rather than wrapping
     # around with negative indexing.
@@ -1040,6 +1322,9 @@ def test_compute_distillation_loss_bayesian_skips_zero_start_span_positional():
 
 
 def test_compute_distillation_loss_bayesian_zero_loss_when_only_token_dropped():
+    # [FUNCTION DOC]
+    # Tests a single-token answer at index 0 under bayesian positional mode yields a zero loss without
+    # error. Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     # If the answer span is a single token at index 0, skipping it leaves nothing to score -> zero loss, no crash.
     config = build_config(use_extended_uld=False, uld_token_merge_strategy="bayesian")
     loss_fn = ULDLoss(config, student_tokenizer=None, teacher_tokenizer=None)
@@ -1059,6 +1344,9 @@ def test_compute_distillation_loss_bayesian_zero_loss_when_only_token_dropped():
 
 
 def test_compute_distillation_loss_bayesian_skips_zero_start_span_extended():
+    # [FUNCTION DOC]
+    # Tests the extended (byte-offset) bayesian path with a zero-start span and one-byte-per-token offsets
+    # yields a finite loss. Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     # Same zero-start scenario on the extended (byte-offset) path: the first aligned group pair is dropped instead of
     # wrapping around, so the loss is finite.
     config = build_config(use_extended_uld=True, uld_token_merge_strategy="bayesian")
@@ -1089,6 +1377,9 @@ def test_compute_distillation_loss_bayesian_skips_zero_start_span_extended():
 
 
 def test_uldloss_positional_mode_does_not_require_byte_offsets():
+    # [FUNCTION DOC]
+    # Tests ULDLoss in positional mode with different student/teacher vocab sizes and no byte offsets
+    # returns a finite loss. Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     config = build_config(use_extended_uld=False)
     loss_fn = ULDLoss(config, student_tokenizer=None, teacher_tokenizer=None)
 
@@ -1112,6 +1403,10 @@ def test_uldloss_positional_mode_does_not_require_byte_offsets():
 
 
 def test_initialize_vocabulary_mapping_contains_common_tokens(llama_tokenizer, qwen_tokenizer):
+    # [FUNCTION DOC]
+    # Tests a hybrid ULDLoss (matched 1.0 / unmatched 0.0) maps each of several common tokens' teacher ids
+    # to the student ids and lists them in the matched id sets.
+    # Inputs: llama_tokenizer, qwen_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     config = build_config(
         uld_use_hybrid_loss=True,
         uld_hybrid_matched_weight=1.0,
@@ -1132,6 +1427,9 @@ def test_initialize_vocabulary_mapping_contains_common_tokens(llama_tokenizer, q
 
 
 def test_get_start_and_size_answers_skips_prompt_tokens():
+    # [FUNCTION DOC]
+    # Tests _get_start_and_size_answers returns starts 3, 1, 0 and sizes 3, 3, 0 for rows with a middle
+    # span, an early span, and no span. Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     loss_fn = ULDLoss(build_config(), student_tokenizer=None, teacher_tokenizer=None)
 
     answers = torch.tensor(
@@ -1149,6 +1447,10 @@ def test_get_start_and_size_answers_skips_prompt_tokens():
 
 
 def _llama_trainer(tmp_path, tokenizer):
+    # [FUNCTION DOC]
+    # HELPER: Builds a GOLDTrainer with tiny Llama as student and teacher, default config (tmp_path), zen
+    # prompt-completion data, and the given tokenizer. Inputs: tmp_path, tokenizer.
+    # Outputs: GOLDTrainer. Exceptions: propagates. Side effects: downloads.
     return GOLDTrainer(
         model=_TINY_LLAMA,
         teacher_model=_TINY_LLAMA,
@@ -1159,6 +1461,14 @@ def _llama_trainer(tmp_path, tokenizer):
 
 
 def test_generate_on_policy_outputs_masks_prompt(tmp_path, llama_tokenizer):
+    # [FUNCTION DOC]
+    # Tests GOLDTrainer.generate_on_policy_outputs with a fake model (which also asserts it received the
+    # left-padded prompt and its mask): returned ids equal the generated sequence; attention mask is
+    # non-pad tokens (or all ones without a pad id); labels are -100 over the padded prompt width and
+    # equal the completion ids after it; prompt text decodes the unpadded prompt and completion text
+    # decodes the completion (special tokens kept).
+    # Inputs: tmp_path, llama_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     trainer = _llama_trainer(tmp_path, llama_tokenizer)
 
     prompt_text = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\nHello?<|eot_id|>"
@@ -1178,7 +1488,14 @@ def test_generate_on_policy_outputs_masks_prompt(tmp_path, llama_tokenizer):
     generated_sequence = torch.cat([prompt_tensor, completion_tensor], dim=1)
 
     class DummyModel:
+        # [CLASS DOC]
+        # HELPER: Fake model standing in for a real generate call so the generated sequence is controlled.
         def generate(self, input_ids, attention_mask, generation_config, return_dict_in_generate):
+            # [FUNCTION DOC]
+            # HELPER: Asserts input_ids and attention_mask equal the test's prompt tensor and mask, then returns
+            # a SimpleNamespace with sequences set to generated_sequence. Inputs: input_ids, attention_mask,
+            # generation_config, return_dict_in_generate. Outputs: SimpleNamespace.
+            # Exceptions: AssertionError on mismatch. Side effects: none.
             assert torch.equal(input_ids, prompt_tensor)
             assert torch.equal(attention_mask, prompt_mask)
             return SimpleNamespace(sequences=generated_sequence)
@@ -1216,6 +1533,12 @@ def test_generate_on_policy_outputs_masks_prompt(tmp_path, llama_tokenizer):
 
 
 def test_generate_on_policy_outputs_pad_equals_eos_keeps_eos(tmp_path, llama_tokenizer):
+    # [FUNCTION DOC]
+    # With pad equal to eos and a fake model: prompt attention equals the input prompt mask; row 0's
+    # terminating eos stays attended and labeled while later padding is masked; row 1 (no padding) stays
+    # fully attended and supervised; prompt labels are all -100.
+    # Inputs: tmp_path, llama_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     # pad == eos here (the fixture ties them): identity-based pad masking used to erase the terminating EOS label on
     # every row and zero attention on pad-id tokens inside the prompt.
     trainer = _llama_trainer(tmp_path, llama_tokenizer)
@@ -1230,7 +1553,13 @@ def test_generate_on_policy_outputs_pad_equals_eos_keeps_eos(tmp_path, llama_tok
     generated_sequence = torch.cat([prompts, completions], dim=1)
 
     class DummyModel:
+        # [CLASS DOC]
+        # HELPER: Fake model standing in for a real generate call so the generated sequence is controlled.
         def generate(self, input_ids, attention_mask, generation_config, return_dict_in_generate):
+            # [FUNCTION DOC]
+            # HELPER: Ignores inputs and returns a SimpleNamespace whose sequences is the enclosing test's
+            # generated_sequence. Inputs: input_ids, attention_mask, generation_config, return_dict_in_generate.
+            # Outputs: SimpleNamespace. Exceptions: none. Side effects: none.
             return SimpleNamespace(sequences=generated_sequence)
 
     generation_config = GenerationConfig(eos_token_id=eos_id)
@@ -1256,6 +1585,10 @@ def test_generate_on_policy_outputs_pad_equals_eos_keeps_eos(tmp_path, llama_tok
 
 
 def test_generate_on_policy_outputs_without_eos_id_keeps_full_completion(tmp_path, llama_tokenizer):
+    # [FUNCTION DOC]
+    # Tests that with a default GenerationConfig (eos_token_id None) the whole completion stays attended
+    # and supervised. Inputs: tmp_path, llama_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     # GenerationConfig defaults eos_token_id to None; torch.tensor(None) would raise, so the
     # None guard must keep the whole completion instead of trying to find a stop token.
     trainer = _llama_trainer(tmp_path, llama_tokenizer)
@@ -1266,7 +1599,13 @@ def test_generate_on_policy_outputs_without_eos_id_keeps_full_completion(tmp_pat
     generated_sequence = torch.cat([prompts, completions], dim=1)
 
     class DummyModel:
+        # [CLASS DOC]
+        # HELPER: Fake model standing in for a real generate call so the generated sequence is controlled.
         def generate(self, input_ids, attention_mask, generation_config, return_dict_in_generate):
+            # [FUNCTION DOC]
+            # HELPER: Ignores inputs and returns a SimpleNamespace whose sequences is the enclosing test's
+            # generated_sequence. Inputs: input_ids, attention_mask, generation_config, return_dict_in_generate.
+            # Outputs: SimpleNamespace. Exceptions: none. Side effects: none.
             return SimpleNamespace(sequences=generated_sequence)
 
     generation_config = GenerationConfig()
@@ -1282,6 +1621,10 @@ def test_generate_on_policy_outputs_without_eos_id_keeps_full_completion(tmp_pat
 
 
 def test_build_teacher_inputs_pad_equals_eos_keeps_terminating_eos(llama_tokenizer):
+    # [FUNCTION DOC]
+    # Tests build_teacher_inputs_from_texts with a deep-copied tokenizer whose pad equals eos and
+    # completions of different lengths: in every row the last supervised token is the appended eos, it is
+    # labeled eos, and it is attended. Inputs: llama_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     # A teacher tokenizer with no pad token ties pad to eos; the old pad-id label strip and attention
     # loop then dropped the appended terminating EOS from both supervision and attention.
     tokenizer = copy.deepcopy(llama_tokenizer)
@@ -1303,6 +1646,11 @@ def test_build_teacher_inputs_pad_equals_eos_keeps_terminating_eos(llama_tokeniz
 
 
 def test_decode_completion_texts_from_labels_keeps_eos_when_pad_equals_eos(tmp_path, llama_tokenizer):
+    # [FUNCTION DOC]
+    # Tests _decode_completion_texts_from_labels keeps the terminating eos when pad equals eos: the text
+    # equals decoding 21, 22, eos and ends with the eos token string.
+    # Inputs: tmp_path, llama_tokenizer. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     # pad == eos: the old pad-id filter dropped the terminating EOS from the reconstructed completion.
     trainer = _llama_trainer(tmp_path, llama_tokenizer)
     eos_id = llama_tokenizer.eos_token_id
@@ -1318,6 +1666,14 @@ def test_decode_completion_texts_from_labels_keeps_eos_when_pad_equals_eos(tmp_p
 
 
 def test_generate_on_policy_outputs_masks_prompt_smollm(tmp_path, smollm_tokenizer, openr1_examples):
+    # [FUNCTION DOC]
+    # Uses the ChatML collator with SmolLM3's tokenizer on one OpenR1 example and a fake model (asserting
+    # it receives the collated prompts/mask and returning the collated input_ids). Asserts ids pass
+    # through; attention equals the prompt mask over prompt columns and ones elsewhere; labels are -100
+    # over the real prompt length and match input ids where active; prompt text decodes the unpadded
+    # prompt; completion text contains the assistant reply.
+    # Inputs: tmp_path, smollm_tokenizer, openr1_examples. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     # There is no tiny SmolLM3 model; tiny Llama 3.2 shares SmolLM3's 128k vocabulary, so it pairs with its tokenizer
     trainer = _llama_trainer(tmp_path, smollm_tokenizer)
 
@@ -1326,7 +1682,14 @@ def test_generate_on_policy_outputs_masks_prompt_smollm(tmp_path, smollm_tokeniz
     batch = {k: v.cpu() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     class DummyModel:
+        # [CLASS DOC]
+        # HELPER: Fake model standing in for a real generate call so the generated sequence is controlled.
         def generate(self, input_ids, attention_mask, generation_config, return_dict_in_generate):
+            # [FUNCTION DOC]
+            # HELPER: Asserts it received the collated prompts and prompt_attention_mask, then returns a
+            # SimpleNamespace whose sequences is the collated input_ids. Inputs: input_ids, attention_mask,
+            # generation_config, return_dict_in_generate. Outputs: SimpleNamespace.
+            # Exceptions: AssertionError. Side effects: none.
             assert torch.equal(input_ids, batch["prompts"])
             assert torch.equal(attention_mask, batch["prompt_attention_mask"])
             return SimpleNamespace(sequences=batch["input_ids"])
@@ -1365,6 +1728,10 @@ def test_generate_on_policy_outputs_masks_prompt_smollm(tmp_path, smollm_tokeniz
 
 
 def test_generalized_jsd_loss_accepts_probability_inputs():
+    # [FUNCTION DOC]
+    # Tests generalized_jsd_loss with logits_are_probs True and beta 0.5 equals the hand-computed JSD:
+    # half the sum of each distribution's KL divergence to their average.
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     student_probs = torch.tensor([[[0.6, 0.3, 0.1]]])
     teacher_probs = torch.tensor([[[0.5, 0.4, 0.1]]])
     mixture = 0.5 * (student_probs + teacher_probs)
@@ -1385,6 +1752,12 @@ def test_generalized_jsd_loss_accepts_probability_inputs():
 
 
 def test_uldloss_handles_llama_student_qwen_teacher_sequence(llama_tokenizer, qwen_tokenizer):
+    # [FUNCTION DOC]
+    # Tests a hybrid ULDLoss (matched 0.6, unmatched 0.4) with a tiny Llama student and Qwen2.5 teacher on one
+    # prompt/completion pair encoded by encode_prompt_completion for each tokenizer and right-padded to a
+    # common length (ids, labels with -100, byte offsets via pad_byte_offsets). With random logits over
+    # each vocab, the loss is a finite scalar and both last_matched_loss and last_unmatched_loss are set.
+    # Inputs: llama_tokenizer, qwen_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     config = build_config(
         uld_use_hybrid_loss=True,
         uld_hybrid_matched_weight=0.6,
@@ -1438,6 +1811,12 @@ def test_uldloss_handles_llama_student_qwen_teacher_sequence(llama_tokenizer, qw
 
 
 def test_uldloss_handles_smollm_student_qwen_teacher_sequence(smollm_tokenizer, qwen_tokenizer):
+    # [FUNCTION DOC]
+    # Tests a hybrid ULDLoss (matched 0.5, unmatched 0.5) with a SmolLM3 student and Qwen2.5 teacher on one
+    # prompt/completion pair encoded by encode_prompt_completion for each tokenizer and right-padded to a
+    # common length (ids, labels with -100, byte offsets via pad_byte_offsets). With random logits over
+    # each vocab, the loss is a finite scalar and both last_matched_loss and last_unmatched_loss are set.
+    # Inputs: smollm_tokenizer, qwen_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     config = build_config(
         uld_use_hybrid_loss=True,
         uld_hybrid_matched_weight=0.5,
@@ -1491,6 +1870,12 @@ def test_uldloss_handles_smollm_student_qwen_teacher_sequence(smollm_tokenizer, 
 
 
 def test_uldloss_hybrid_config_beta_zero(llama_tokenizer, qwen_tokenizer):
+    # [FUNCTION DOC]
+    # Same setup as the hybrid ULD sequence tests (Llama student, Qwen teacher, seed 0) but with matched
+    # weight 0, unmatched weight 1, crossentropy weight 0, distillation weight 1, unit temperatures and
+    # beta 0. Asserts a finite scalar loss, both component losses set, and the total equals the unmatched
+    # weight times last_unmatched_loss.
+    # Inputs: llama_tokenizer, qwen_tokenizer. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     config = build_config(
         uld_use_hybrid_loss=True,
         uld_hybrid_matched_weight=0.0,
@@ -1556,6 +1941,10 @@ def test_uldloss_hybrid_config_beta_zero(llama_tokenizer, qwen_tokenizer):
 
 
 def test_vlm_alignment_groups_cover_all_tokens_smolvlm_qwen3vl(smolvlm_processor, qwen3_vl_processor, vlm_examples):
+    # [FUNCTION DOC]
+    # Tests that after VLM ChatML collation (SmolVLM, max_length 2048) and teacher re-tokenization with
+    # the Qwen3-VL tokenizer, byte-offset alignment groups cover every answer position.
+    # Inputs: smolvlm_processor, qwen3_vl_processor, vlm_examples. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     student_tokenizer = smolvlm_processor.tokenizer
     teacher_tokenizer = qwen3_vl_processor.tokenizer
 
@@ -1573,6 +1962,14 @@ def test_vlm_alignment_groups_cover_all_tokens_smolvlm_qwen3vl(smolvlm_processor
 
 
 def test_build_teacher_vlm_inputs_feeds_images_and_completion_byte_offsets(tmp_path, vlm_dataset, vlm_examples):
+    # [FUNCTION DOC]
+    # Builds a cross-architecture VLM trainer (tiny SmolVLM student, tiny Qwen3-VL teacher, extended ULD)
+    # and calls _build_teacher_vlm_inputs. Asserts consistent shapes (offsets batch by seq by 2),
+    # pixel_values in the teacher forward kwargs, and per row: completion supervised but first position
+    # not, completion ids and offsets begin with those of encode_with_byte_offsets on the completion
+    # text, and the final offset is the zero-width end pair.
+    # Inputs: tmp_path, vlm_dataset, vlm_examples. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """Cross-architecture VLM ULD must render the teacher prompt through the teacher processor (so it
     actually sees the image via pixel_values) while keeping completion byte offsets relative to the original completion
     text — the coordinate system shared with the student."""
@@ -1619,6 +2016,10 @@ def test_build_teacher_vlm_inputs_feeds_images_and_completion_byte_offsets(tmp_p
 
 
 def test_gold_trainer_init_rejects_llm_with_vision_dataset(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests a text-only model with an image dataset raises ValueError matching "vision-related".
+    # Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """GOLDTrainer should raise ValueError when a text-only model receives a vision dataset."""
     with pytest.raises(ValueError, match="vision-related"):
         GOLDTrainer(
@@ -1630,6 +2031,10 @@ def test_gold_trainer_init_rejects_llm_with_vision_dataset(tmp_path, vlm_dataset
 
 
 def _get_assistant_texts(examples):
+    # [FUNCTION DOC]
+    # HELPER: For each example returns the last completion message's content; when it is a list of parts,
+    # concatenates the text of parts that have text. Inputs: examples (list of dict).
+    # Outputs: list[str]. Exceptions: KeyError on malformed examples. Side effects: none.
     """Extract assistant text content from examples, handling both plain string and multimodal format."""
     texts = []
     for example in examples:
@@ -1642,6 +2047,10 @@ def _get_assistant_texts(examples):
 
 
 def _get_prompt_turn_texts(example):
+    # [FUNCTION DOC]
+    # HELPER: For each prompt turn extracts text (multi-part content joined by newlines, keeping only
+    # dict parts with text) and returns the non-empty ones. Inputs: example (dict).
+    # Outputs: list[str]. Exceptions: KeyError on malformed input. Side effects: none.
     texts = []
     for turn in example["prompt"]:
         content = turn["content"]
@@ -1655,6 +2064,13 @@ def _get_prompt_turn_texts(example):
 
 
 def test_vlm_chatml_collator_preserves_completion_smolvlm(smolvlm_processor, qwen3_vl_processor, vlm_examples):
+    # [FUNCTION DOC]
+    # Tests the VLM ChatML collator with SmolVLM as student processor (max_length 2048) on vlm_examples:
+    # batch contains input_ids, labels, prompts, prompt_attention_mask, pixel_values, and
+    # original prompt/completion texts; decoded sequences contain each assistant text; teacher inputs built with
+    # the Qwen3-VL tokenizer yield non-empty completion texts containing the reply; a hybrid ULDLoss (0.6 /
+    # 0.4) has alignment groups covering the completion; and the loss on random logits (seed 42) is
+    # finite. Inputs: smolvlm_processor, qwen3_vl_processor, vlm_examples. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     # 2048 to not truncate the completion tokens
     collator = DataCollatorForVisionLanguageChatML(processor=smolvlm_processor, max_length=2048)
     batch = collator(vlm_examples)
@@ -1716,6 +2132,12 @@ def test_vlm_chatml_collator_preserves_completion_smolvlm(smolvlm_processor, qwe
 
 
 def test_vlm_chatml_collator_preserves_completion_qwen3vl(smolvlm_processor, qwen3_vl_processor, vlm_examples):
+    # [FUNCTION DOC]
+    # Tests the VLM ChatML collator with Qwen3-VL as student processor (max_length 2048) on vlm_examples:
+    # batch contains input_ids, labels, prompts, and pixel_values; decoded sequences contain each assistant text; teacher inputs built with
+    # the SmolVLM tokenizer yield non-empty completion texts containing the reply; a hybrid ULDLoss (0.6 /
+    # 0.4) has alignment groups covering the completion; and the loss on random logits (seed 43) is
+    # finite. Inputs: smolvlm_processor, qwen3_vl_processor, vlm_examples. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     collator = DataCollatorForVisionLanguageChatML(processor=qwen3_vl_processor, max_length=2048)
     batch = collator(vlm_examples)
 
@@ -1773,6 +2195,12 @@ def test_vlm_chatml_collator_preserves_completion_qwen3vl(smolvlm_processor, qwe
 
 
 def test_vlm_collator_label_masking_and_prompt_truncation(smolvlm_processor, vlm_examples):
+    # [FUNCTION DOC]
+    # Tests the VLM collator: per row, padding is label-masked, at least one supervised completion token
+    # exists and matches input_ids, and attended-but-masked prompt tokens exist. Then with max_length one
+    # less than the full prompt width, prompts and prompt_attention_mask are truncated to at most that
+    # width, keeping the start (equal to the leading columns of the full batch).
+    # Inputs: smolvlm_processor, vlm_examples. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     """Verify that the VLM collator:
     1. Masks prompt and padding tokens in labels, leaves completion tokens unmasked.
     2. Truncates `prompts`/`prompt_attention_mask` to `max_length` (keeping the start, matching SFT/DPO VLM truncation)
@@ -1822,6 +2250,11 @@ def test_vlm_collator_label_masking_and_prompt_truncation(smolvlm_processor, vlm
 
 
 def test_vlm_collator_original_text_is_untemplated(smolvlm_processor, vlm_examples):
+    # [FUNCTION DOC]
+    # Tests original_prompt_text / original_completion_text have one entry per example and contain no
+    # student special tokens (non-blank all_special_tokens); completion contains the assistant text;
+    # prompt contains each prompt turn text and, for multiple turns, equals them joined by newlines.
+    # Inputs: smolvlm_processor, vlm_examples. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     """`original_*_text` must be free of the student's chat-template markers.
 
     Cross-tokenizer ULD distillation re-renders the prompt through the teacher's chat template and concatenates the
@@ -1864,6 +2297,10 @@ def test_vlm_collator_original_text_is_untemplated(smolvlm_processor, vlm_exampl
 
 
 def test_gold_trainer_init_rejects_non_vlm_teacher(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests a VLM student with an instantiated text-only teacher raises ValueError ("VLM distillation
+    # requires both student and teacher"). Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """GOLDTrainer should raise ValueError when the student is a VLM but the instantiated teacher is not."""
     teacher_model = AutoModelForCausalLM.from_pretrained(_TINY_QWEN2)
 
@@ -1877,6 +2314,10 @@ def test_gold_trainer_init_rejects_non_vlm_teacher(tmp_path, vlm_dataset):
 
 
 def test_gold_trainer_init_rejects_keep_end_truncation_for_vlm(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests truncation_mode keep_end emits a deprecation FutureWarning on config creation and raises
+    # ValueError for a VLM trainer. Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """GOLDTrainer should raise ValueError when truncation_mode='keep_end' is used with a VLM."""
     with pytest.warns(FutureWarning, match="keep_end.*deprecated"):
         training_args = GOLDConfig(output_dir=str(tmp_path), report_to="none", truncation_mode="keep_end")
@@ -1890,6 +2331,12 @@ def test_gold_trainer_init_rejects_keep_end_truncation_for_vlm(tmp_path, vlm_dat
 
 
 def test_gold_trainer_vlm_vllm_init_uses_identity_collator(monkeypatch, tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Patches vLLM with a capturing fake; a SmolVLM trainer with use_vllm and max_length 128 creates vLLM
+    # with max_model_length 128, uses identity as data_collator, and stores a
+    # DataCollatorForVisionLanguageChatML as _vlm_collator.
+    # Inputs: monkeypatch, tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """When a VLM processor is used with lmbda > 0 and use_vllm=True, GOLDTrainer should use the identity collator
     and store a _vlm_collator for on-the-fly collation. vLLM should be initialized with max_model_length from args.
     """
@@ -1897,7 +2344,12 @@ def test_gold_trainer_vlm_vllm_init_uses_identity_collator(monkeypatch, tmp_path
 
     # Stand in for vLLM, which cannot run here
     class CapturingVLLMGeneration:
+        # [CLASS DOC]
+        # HELPER: Fake VLLMGeneration (vLLM cannot run in tests) recording constructor kwargs.
         def __init__(self, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Updates the enclosing captured dict with kwargs. Inputs: kwargs. Outputs: none.
+            # Exceptions: none. Side effects: mutates captured.
             captured.update(kwargs)
 
     monkeypatch.setattr(gold_trainer_module, "is_vllm_available", lambda: True)
@@ -1919,6 +2371,10 @@ def test_gold_trainer_vlm_vllm_init_uses_identity_collator(monkeypatch, tmp_path
 
 
 def test_cross_architecture_vlm_without_uld_raises_error(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests SmolVLM student with Qwen3-VL teacher and no ULD warns (UserWarning) and raises ValueError
+    # asking for use_uld_loss=True. Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """When student and teacher have different model_type and use_uld_loss=False, GOLDTrainer should raise
     a ValueError telling the user to enable ULD loss."""
     with pytest.warns(UserWarning, match="Cross-architecture VLM distillation"):
@@ -1932,6 +2388,12 @@ def test_cross_architecture_vlm_without_uld_raises_error(tmp_path, vlm_dataset):
 
 
 def test_cross_architecture_vlm_with_uld_sets_teacher_processor(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests cross-architecture VLM with ULD: teacher processor loaded from the teacher id, teacher
+    # tokenizer is its tokenizer, _is_cross_architecture_vlm True, exactly one cross-architecture warning
+    # naming smolvlm and qwen3_vl, identity collator and a VLM collator set.
+    # Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """When student and teacher have different model_type and use_uld_loss=True, GOLDTrainer should store
     the teacher's processor and emit a warning about cross-architecture distillation."""
     with warnings.catch_warnings(record=True) as caught:
@@ -1960,6 +2422,11 @@ def test_cross_architecture_vlm_with_uld_sets_teacher_processor(tmp_path, vlm_da
 
 
 def test_same_architecture_vlm_no_teacher_processor(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests same-architecture VLM without ULD: no teacher processor, not cross-architecture, no
+    # cross-architecture warning, identity collator and VLM collator set.
+    # Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """When student and teacher have the same model_type, GOLDTrainer should not load a teacher processor."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -1984,6 +2451,11 @@ def test_same_architecture_vlm_no_teacher_processor(tmp_path, vlm_dataset):
 
 
 def test_same_architecture_vlm_with_uld_sets_teacher_processor(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests same-architecture VLM with ULD still loads a teacher processor (SmolVLM id) used as the teacher
+    # tokenizer, not cross-architecture, identity and VLM collators set.
+    # Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """ULD VLM distillation should use a teacher processor even when the VLM model_type matches."""
     trainer = GOLDTrainer(
         model=_TINY_SMOLVLM,
@@ -2000,6 +2472,10 @@ def test_same_architecture_vlm_with_uld_sets_teacher_processor(tmp_path, vlm_dat
 
 
 def _gold_vlm_trainer(tmp_path, vlm_dataset, **config_kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Builds a GOLDTrainer with tiny SmolVLM as student and teacher on vlm_dataset with
+    # config_kwargs. Inputs: tmp_path, vlm_dataset, config_kwargs. Outputs: GOLDTrainer.
+    # Exceptions: propagates. Side effects: downloads.
     return GOLDTrainer(
         model=_TINY_SMOLVLM,
         teacher_model=_TINY_SMOLVLM,
@@ -2009,6 +2485,12 @@ def _gold_vlm_trainer(tmp_path, vlm_dataset, **config_kwargs):
 
 
 def test_same_architecture_vlm_uld_preserves_raw_images_for_teacher_processor(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests off-policy (lmbda 0) ULD VLM training input prep with grad accumulation 2: _prepare_inputs on
+    # two raw examples returns a first slice whose _raw_images is the first image and _raw_prompts the
+    # multimodal-prepared prompt, and the second buffered slice keeps raw image and prompt keys.
+    # Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     trainer = _gold_vlm_trainer(tmp_path, vlm_dataset, use_uld_loss=True, lmbda=0.0, gradient_accumulation_steps=2)
     trainer.model.train()
     generation_batch = [dict(vlm_dataset[0]), dict(vlm_dataset[1])]
@@ -2025,6 +2507,15 @@ def test_same_architecture_vlm_uld_preserves_raw_images_for_teacher_processor(tm
 
 
 def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatch, tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Patches vLLM with a local recording fake; builds a fully on-policy SmolVLM trainer (3 generations,
+    # batch 3, 2 accumulation slices, 4 completion tokens). Creates slices from a RepeatSampler over two
+    # examples and calls _generate_on_policy_vlm_raw. Asserts vLLM got exactly 6 prompts and images (no
+    # extra duplication) with each group of 3 identical, every slice buffer holds lazy examples and 3
+    # completion texts, and materializing slice 0 yields 3 rows whose prompt text is the first example's
+    # prompt and whose completions end with eos.
+    # Inputs: monkeypatch, tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """The VLM vLLM path must rely on RepeatSampler for `num_generations` duplication.
 
     `VLLMGeneration.generate` expects the incoming prompt batch to already contain the repeated prompt entries,
@@ -2036,13 +2527,25 @@ def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatc
 
     # Stand in for vLLM, which cannot run here
     class RecordingVLLMGeneration:
+        # [CLASS DOC]
+        # HELPER: Fake VLLMGeneration recording prompts and images and returning two-token completions
+        # (100 plus index, then eos) per prompt.
         def __init__(self, processing_class, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Stores the processor tokenizer's eos id. Inputs: processing_class, kwargs.
+            # Outputs: none. Exceptions: none. Side effects: sets attribute.
             self.eos_token_id = processing_class.tokenizer.eos_token_id
 
         def sync_weights(self):
+            # [FUNCTION DOC]
+            # HELPER: No-op. Inputs: none. Outputs: None. Exceptions: none. Side effects: none.
             pass
 
         def generate(self, prompts, images, num_generations):
+            # [FUNCTION DOC]
+            # HELPER: Records prompts and images in the enclosing received dict and returns a 4-tuple of None,
+            # the completion id lists, None, None. Inputs: prompts, images, num_generations.
+            # Outputs: tuple. Exceptions: none. Side effects: mutates received.
             received["prompts"] = prompts
             received["images"] = images
             return None, [[100 + i, self.eos_token_id] for i in range(len(prompts))], None, None
@@ -2099,6 +2602,10 @@ def test_on_policy_vlm_vllm_does_not_duplicate_repeated_sampler_batch(monkeypatc
 
 
 def test_vlm_uld_custom_collator_missing_raw_fields_raises_clear_error(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests compute_loss on a ULD VLM trainer with inputs lacking _raw_images and _raw_prompts raises
+    # ValueError naming those fields. Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     trainer = _gold_vlm_trainer(tmp_path, vlm_dataset, use_uld_loss=True)
     device = trainer.accelerator.device
 
@@ -2114,6 +2621,11 @@ def test_vlm_uld_custom_collator_missing_raw_fields_raises_clear_error(tmp_path,
 
 
 def test_off_policy_vlm_collates_only_consumed_slice(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests off-policy VLM training with grad accumulation 2: the first _prepare_inputs call returns a
+    # 2-row collated slice while the second slice stays raw (lazy examples) in the buffer; the next call
+    # returns a 2-row slice and the buffer entry is no longer lazy. Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     trainer = _gold_vlm_trainer(tmp_path, vlm_dataset, lmbda=0.0, gradient_accumulation_steps=2)
     trainer.model.train()
     generation_batch = [dict(vlm_dataset[i]) for i in [0, 1, 2, 0]]
@@ -2131,6 +2643,10 @@ def test_off_policy_vlm_collates_only_consumed_slice(tmp_path, vlm_dataset):
 
 
 def test_eval_vlm_collates_raw_batch_off_policy(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests in eval mode _prepare_inputs collates the whole 3-example raw batch at once (3 rows,
+    # pixel_values present) without generation or buffers (_buffered_inputs stays None). Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """VLM eval (identity collator yields raw dicts) must collate off-policy in `_prepare_inputs`.
 
     Regression test for the eval crash: the inherited path indexed the raw `list[dict]`. Eval must run the VLM collator
@@ -2150,6 +2666,10 @@ def test_eval_vlm_collates_raw_batch_off_policy(tmp_path, vlm_dataset):
 
 
 def test_eval_vlm_attaches_raw_images_for_teacher_processor(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests that in eval with ULD the prepared inputs carry _raw_images (one list per example) and
+    # _raw_prompts equal to the multimodal-prepared prompts. Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """When a teacher processor is configured (cross-arch / ULD), eval must attach raw images and prompts."""
     trainer = _gold_vlm_trainer(tmp_path, vlm_dataset, use_uld_loss=True)
     trainer.model.eval()
@@ -2166,6 +2686,13 @@ def test_eval_vlm_attaches_raw_images_for_teacher_processor(tmp_path, vlm_datase
 
 
 def test_on_policy_vlm_without_vllm_collates_only_consumed_slice(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Uses tiny LFM2-VL (processor returns spatial_shapes) with grad accumulation 2 and 2 completion
+    # tokens; simulates step 1 with empty buffers, generates on-policy for both raw slices (both buffers
+    # hold raw on-policy examples), then _prepare_inputs consumes slice 1: it has 1 or 2 completion ids,
+    # spatial_shapes, the second example's prompt text, a completion text decoded with special tokens,
+    # and only slice 1's buffer is materialized. Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     # LFM2-VL's processor returns `spatial_shapes`, which generation needs alongside the pixel values
     trainer = GOLDTrainer(
         model=_TINY_LFM2_VL,
@@ -2203,6 +2730,11 @@ def test_on_policy_vlm_without_vllm_collates_only_consumed_slice(tmp_path, vlm_d
 
 
 def test_model_forward_kwargs_preserve_processor_tensor_fields(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Tests _get_model_forward_kwargs keeps only processor tensor fields (pixel_values, spatial_shapes,
+    # custom_processor_tensor, token_type_ids), dropping text/label/mask/raw fields, and honors exclude
+    # (token_type_ids removed). Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     trainer = GOLDTrainer(
         model=_TINY_SMOLVLM,
         teacher_model=_TINY_SMOLVLM,
@@ -2250,6 +2782,12 @@ _VLM_SMOKE_MAX_LENGTH = 4096
 
 
 def test_vlm_jsd_same_family_train_step_smoke(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Loads tiny Qwen3-VL student/teacher (bf16) and processor (skips if unavailable; pad = eos if
+    # missing) and runs one JSD training step without ULD. Off-policy smoke config: bf16, 1 step, batch 1, 8 completion tokens, max_length 4096, lmbda 0,
+    # beta 0.5, temperature 1, no vLLM, no logging/saving/eval, drop last batch. Asserts a finite
+    # training loss. Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """Same-family VLM (tiny Qwen3-VL → tiny Qwen3-VL) runs one off-policy JSD step with a finite loss."""
     try:
         student = AutoModelForImageTextToText.from_pretrained(_TINY_QWEN3_VL, dtype=torch.bfloat16)
@@ -2297,6 +2835,12 @@ _TINY_LLAMA = "trl-internal-testing/tiny-LlamaForCausalLM-3.2"
 
 
 def test_vlm_uld_cross_arch_train_step_smoke(tmp_path, vlm_dataset):
+    # [FUNCTION DOC]
+    # Loads tiny SmolVLM student and Qwen3-VL teacher (bf16) with the student processor (skips if
+    # unavailable) and runs one ULD step (crossentropy and distillation weights 0.5). Off-policy smoke config: bf16, 1 step, batch 1, 8 completion tokens, max_length 4096, lmbda 0,
+    # beta 0.5, temperature 1, no vLLM, no logging/saving/eval, drop last batch.
+    # Expects a cross-architecture UserWarning at init and asserts a finite training loss. Inputs: tmp_path, vlm_dataset. Outputs: none. Exceptions: AssertionError on failure.
+    # Side effects: downloads tiny models/datasets; writes to tmp_path.
     """Cross-arch VLM (tiny SmolVLM student → tiny Qwen3-VL teacher) runs one off-policy ULD step.
 
     Exercises `_build_teacher_vlm_inputs` (teacher rendered through its own processor), the separate teacher image
@@ -2352,6 +2896,11 @@ _TINY_QWEN2_REVISION = "8913f5819566"
 
 
 def _uld_revision_trainer(tmp_path, teacher_tokenizer_name_or_path):
+    # [FUNCTION DOC]
+    # HELPER: Builds a ULD GOLDTrainer on tiny Qwen2 (student and teacher) with teacher_model_revision
+    # pinned to a fixed commit and the given teacher_tokenizer_name_or_path, on 3 zen rows.
+    # Inputs: tmp_path, teacher_tokenizer_name_or_path (str). Outputs: GOLDTrainer.
+    # Exceptions: propagates hub errors. Side effects: downloads.
     args = GOLDConfig(
         output_dir=str(tmp_path),
         report_to="none",
@@ -2369,12 +2918,20 @@ def _uld_revision_trainer(tmp_path, teacher_tokenizer_name_or_path):
 
 
 def test_uld_teacher_tokenizer_keeps_the_teacher_revision_within_one_repo(tmp_path):
+    # [FUNCTION DOC]
+    # Tests that with the teacher tokenizer in the same repo, the pinned revision is used (its chat
+    # template has length 2558). Inputs: tmp_path. Outputs: none. Exceptions: AssertionError.
+    # Side effects: downloads.
     trainer = _uld_revision_trainer(tmp_path, _TINY_QWEN2)
 
     assert len(trainer.teacher_tokenizer.chat_template) == 2558
 
 
 def test_uld_teacher_tokenizer_drops_the_teacher_revision_across_repos(tmp_path):
+    # [FUNCTION DOC]
+    # Tests that with the teacher tokenizer from another repo (tiny Llama), the revision is not carried
+    # over and the tokenizer loads from that repo. Inputs: tmp_path. Outputs: none.
+    # Exceptions: AssertionError. Side effects: downloads.
     """A teacher commit exists only in the teacher's own repo, so pointing ULD's cross-tokenizer setup at another
     repo must not carry it over: `revision` would 404 there.
     """
@@ -2384,12 +2941,25 @@ def test_uld_teacher_tokenizer_drops_the_teacher_revision_across_repos(tmp_path)
 
 
 class TestGOLDTrainerLoss(TrlTestCase):
+    # [CLASS DOC]
+    # Text-only GOLDTrainer tests for loss normalization and eval dataset handling; inherits TrlTestCase.
+    # setup_method loads the tiny Qwen2 tokenizer with pad = eos.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets self.model_id and self.tokenizer (pad = eos). Inputs/Outputs: none.
+        # Exceptions: load errors. Side effects: network/cache.
         self.model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def test_loss_normalizes_by_num_items_in_batch(self):
+        # [FUNCTION DOC]
+        # Builds a CPU trainer on two conversations with very different prompt lengths, perturbs the teacher
+        # with seeded noise, and collates a batch. Asserts the batch exposes the old bug (batch prompt width
+        # exceeds row 0's first supervised index, and slicing at prompt width would miss labels). In eval
+        # mode asserts compute_loss with num_items_in_batch equal to all valid labels matches the local mean,
+        # and double the count halves the loss.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: downloads; tmp_dir.
         # When `num_items_in_batch` is passed (as under gradient accumulation), the JSD loss must be reduced as
         # sum / num_items_in_batch rather than the local per-microbatch mean. The batch uses variable-length prompts
         # to ensure the loss covers every valid completion token instead of slicing by the batch-max prompt width.
@@ -2464,6 +3034,11 @@ class TestGOLDTrainerLoss(TrlTestCase):
         ],
     )
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over regular and streaming dataset, dataset dict, dict of datasets, and none. Tests
+        # None stays None; dicts keep keys data1/data2 with each split tokenized (has input_ids); a single
+        # dataset is tokenized. Inputs: eval_dataset_type (str). Outputs: none.
+        # Exceptions: AssertionError. Side effects: downloads; tmp_dir.
         train_dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_completion", split="train")
 
         if eval_dataset_type == "none":
