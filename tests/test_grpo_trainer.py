@@ -4608,8 +4608,6 @@ class TestGRPOTrainer(TrlTestCase):
     @require_response_parsing
     @patch.dict(os.environ, {"TRL_EXPERIMENTAL_SILENCE": "1"})
     def test_environment_owned_reward_mixed_environments(self):
-            # [CLASS DOC]
-            # HELPER: Environment that owns its reward.
         # [FUNCTION DOC]
         # Tests a dict environment_factory where only some environment classes own a reward: two names map to ScoredEnvironment (one deduplicated reward column), one to PlainEnvironment.
         # Assertions: reward_func_names is format_reward then ScoredEnvironment, weights 1.0 and 1.0; calling the env reward function with a Scored and a Plain instance returns 1.0 and None.
@@ -4620,6 +4618,8 @@ class TestGRPOTrainer(TrlTestCase):
         # deduplicated by class: two names mapping to the same `get_reward` class share a single column (no
         # double-counting).
         class ScoredEnvironment:  # owns its reward
+            # [CLASS DOC]
+            # HELPER: Environment that owns its reward.
             def reset(self, **kwargs):
                 # [FUNCTION DOC]
                 # HELPER: No-op reset.
@@ -4642,14 +4642,14 @@ class TestGRPOTrainer(TrlTestCase):
                 return x
 
             def get_reward(self) -> float:
-            # [CLASS DOC]
-            # HELPER: Environment without get_reward (scored by reward_funcs).
                 # [FUNCTION DOC]
                 # HELPER: Returns reward 1.0.
                 # Inputs: none. Outputs: float. Exceptions: none. Side effects: none.
                 return 1.0
 
         class PlainEnvironment:  # no `get_reward`; scored by `reward_funcs`
+            # [CLASS DOC]
+            # HELPER: Environment without get_reward (scored by reward_funcs).
             def reset(self, **kwargs):
                 # [FUNCTION DOC]
                 # HELPER: No-op reset.

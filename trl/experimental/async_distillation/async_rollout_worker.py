@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Rollout generation for AsyncDistillationTrainer, run in a spawned CPU-only child process. For each dataset row the
+# child samples one completion from the student's vLLM server, teacher-forces it through a teacher vLLM server
+# (routed per row when several teachers are configured) to obtain sparse top-k per-position logprobs, and pushes a
+# RolloutSample onto a multiprocessing queue for the trainer. Ported from the async_grpo worker without groups,
+# rewards, tools or advantages.
+# Contents: RolloutSample, child bootstrap helpers (_scrub_child_env, _spawn_stop_watcher, _child_main),
+# _parse_teacher_logprobs_at_position, _AsyncRolloutLoop, AsyncRolloutWorker.
+# Import-time side effects: imports aiohttp and defines _RETRYABLE_HTTP_ERRORS when available; module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +62,11 @@ Messages: TypeAlias = list[dict[str, str]]
 
 @dataclass(slots=True)
 class RolloutSample:
+    # [CLASS DOC]
+    # Slotted dataclass for one training row (see docstring): prompt/completion messages, input_ids and completion_mask
+    # (int64, prompt positions 0), teacher_topk_ids (int64, rows of width teacher_top_k + 1 padded with -1) and
+    # teacher_topk_logprobs (float32, padded with negative infinity) for every input position (prompt rows all padding),
+    # model_version at dispatch, metrics (currently empty), teacher_id, prompt_id (row counter across epochs), enqueued_at.
     """One training row: a student on-policy completion plus the teacher's sparse per-position scoring.
 
     Unlike [`~trl.experimental.async_grpo.async_rollout_worker.RolloutSample`], there is no `advantage` (no
@@ -97,6 +112,10 @@ _CHILD_ENV_TO_STRIP = (
 
 
 def _scrub_child_env() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Hides GPUs from the child (CUDA_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES empty) and removes distributed and
+    # torchelastic environment variables listed in _CHILD_ENV_TO_STRIP.
+    # Inputs/Outputs: none. Exceptions: none. Side effects: mutates os.environ.
     # The child has no business touching CUDA; any library that imports torch
     # and lazily probes devices would race the parent's allocator.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -107,9 +126,16 @@ def _scrub_child_env() -> None:
 
 
 def _spawn_stop_watcher(rollout_loop: "_AsyncRolloutLoop", stop_event: MPEvent) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Starts daemon thread "distillation-mp-stop-watcher" that waits for the multiprocessing stop event and then
+    # sets the loop's asyncio stop event via call_soon_threadsafe (RuntimeError from a closed loop ignored).
+    # Inputs: rollout_loop, stop_event. Outputs: none. Side effects: thread creation.
     # Daemon thread that translates the parent's mp.Event into the child's
     # asyncio.Event so _run_loops breaks out of its gather.
     def _watch():
+        # [FUNCTION DOC]
+        # HELPER: Thread body: waits on stop_event, then schedules the asyncio stop event set; ignores RuntimeError.
+        # Inputs/Outputs: none. Side effects: sets the event.
         stop_event.wait()
         try:
             rollout_loop._loop.call_soon_threadsafe(rollout_loop._stop_event.set)
@@ -131,6 +157,12 @@ def _child_main(
     exception_info_queue: MPQueue,
     metrics_queue: MPQueue,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Child process entry point: scrubs env, initializes accelerate PartialState, builds _AsyncRolloutLoop from
+    # loop_kwargs plus shared IPC objects, sets the ready event, starts the stop watcher and runs the loop; exceptions are
+    # printed and re-raised.
+    # Inputs: loop_kwargs and the shared queues/values/events. Outputs: none. Exceptions: re-raised loop errors.
+    # Side effects: env mutation.
     _scrub_child_env()
     # `accelerate.logging.get_logger` requires `PartialState()` to have been called.
     from accelerate.state import PartialState
@@ -156,6 +188,12 @@ def _child_main(
 
 
 def _parse_teacher_logprobs_at_position(position_logprobs: dict[str, dict] | None) -> tuple[list[int], list[float]]:
+    # [FUNCTION DOC]
+    # HELPER: Converts one position of vLLM prompt_logprobs (token id string -> dict with logprob and rank) into parallel
+    # lists of int token ids and logprobs sorted by ascending rank, dropping NaN logprobs. Empty/None input or all-NaN
+    # entries give two empty lists.
+    # Inputs: position_logprobs (dict or None). Outputs: (ids, logprobs). Exceptions: KeyError on missing rank/logprob.
+    # Side effects: none.
     """Parse one completion position's entry of a vLLM `prompt_logprobs` response.
 
     vLLM reports `{token_id: {"logprob": ..., "rank": ...}}` per position, holding the top-`teacher_top_k` candidates
@@ -178,6 +216,13 @@ def _parse_teacher_logprobs_at_position(position_logprobs: dict[str, dict] | Non
 
 
 class _AsyncRolloutLoop:
+    # [CLASS DOC]
+    # Asyncio generate-and-score loop in the child (see docstring). One task per sample (_generate_and_score_one), up to
+    # max_inflight_tasks concurrently, pushes samples directly to rollout_buffer. State: tokenizer, eos ids, shared IPC
+    # objects, metric accumulators (_counters, _rates), sampling params, student server URL, teacher_server_urls (default
+    # {"default": "http://localhost:8001"}, trailing slashes stripped), teacher_top_k, teacher_temperature,
+    # teacher_model_names (resolved at startup), counters for tokens/samples, aiohttp session, private event loop and stop
+    # event.
     """Asyncio generate-and-score loop. Lives entirely inside the spawned child process.
 
     Structurally this is [`~trl.experimental.async_grpo.async_rollout_worker._AsyncRolloutLoop`] with the
@@ -229,6 +274,12 @@ class _AsyncRolloutLoop:
         num_completions_to_print: int | None = None,
         dataset_start_index: int = 0,
     ):
+        # [FUNCTION DOC]
+        # Stores configuration; starts the dataset iterator at dataset_start_index modulo length when positive; normalizes
+        # server URLs; creates accumulators, a new event loop and stop event. Unlike the GRPO loop there is no tool/env setup
+        # and no response-schema handling.
+        # Inputs: keyword args per signature. Outputs: none. Exceptions: ZeroDivisionError for an empty dataset with a positive
+        # start index. Side effects: event loop creation.
         self.model_name = model_name
         self.lora_name = lora_name
         self.dataset = dataset
@@ -284,10 +335,15 @@ class _AsyncRolloutLoop:
 
     @property
     def model_version(self) -> int:
+        # [FUNCTION DOC]
+        # Current policy version read from the shared value, as int. No inputs, exceptions or side effects.
         return int(self._model_version_value.value)
 
     @property
     def _request_model(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Student model name for requests: model_name, or "<lora_name>-v<model_version>" when LoRA sync is active.
+        # Inputs: none. Outputs: str. Side effects: none.
         # In vLLM's API an adapter *is* a model name: naming the base model while an adapter is loaded silently
         # serves the base model, so the published version has to be part of the request. `model_version` reads the
         # shared `mp.Value`, so a sync is picked up without extra IPC.
@@ -296,6 +352,10 @@ class _AsyncRolloutLoop:
         return f"{self.lora_name}-v{self.model_version}"
 
     def run(self) -> None:
+        # [FUNCTION DOC]
+        # Runs _run_loops on the private loop. On any BaseException: best-effort puts (type name, message, traceback) on the
+        # exception queue, sets the failed event, logs, re-raises. Always closes the loop.
+        # Inputs/Outputs: none. Exceptions: re-raised. Side effects: IPC signalling.
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._run_loops(stop_event=self._stop_event))
@@ -314,6 +374,10 @@ class _AsyncRolloutLoop:
             self._loop.close()
 
     async def _run_loops(self, stop_event: asyncio.Event) -> None:
+        # [FUNCTION DOC]
+        # Opens an aiohttp session (connection limit twice max_inflight_tasks, since each task makes student and teacher
+        # calls), logs sampling config, resolves teacher model names, then runs the generate loop.
+        # Inputs: stop_event. Outputs: none. Exceptions: propagates. Side effects: network.
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=2 * self.max_inflight_tasks)) as session:
             self.session = session
             logger.info(
@@ -325,6 +389,11 @@ class _AsyncRolloutLoop:
             await self._generate_loop(stop_event=stop_event)
 
     async def _resolve_teacher_model_names(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For each teacher, GETs /v1/models (outer retry up to 30 attempts) and records the first model id in
+        # teacher_model_names; logs it. Serves as the teacher readiness wait.
+        # Inputs: none. Outputs: none. Exceptions: HTTP errors after retries; KeyError/IndexError on malformed JSON.
+        # Side effects: network, logging.
         """Ask every teacher server which model it serves, so `_score_with_teacher` can name it in its request.
 
         Doubles as the readiness wait for the teachers: the retry budget is the same generous one the generation and
@@ -341,6 +410,14 @@ class _AsyncRolloutLoop:
             logger.info(f"teacher {teacher_id!r} at {url} serves {self.teacher_model_names[teacher_id]}")
 
     async def _generate_loop(self, stop_event: asyncio.Event) -> None:
+        # [FUNCTION DOC]
+        # Main loop: each iteration writes the wall-clock heartbeat, fills free slots with _generate_and_score_one tasks for the
+        # next (prompt_id, row), sleeps 10 ms if nothing is in flight (returning when stopping), else waits up to 0.1 s for
+        # completions. For each finished task: frees slot, re-raises its exception, counts completion tokens and samples, pushes
+        # rollout/inflight and windowed rollout/generated_tok_s, prints a completion sample every log_completions_steps samples
+        # when log_completions is on, then put_nowait's the sample (stamping enqueued_at), polling every 0.1 s while full
+        # (returns if stopping) and pushing rollout/backpressure_s if it blocked. Finally cancels and awaits in-flight tasks.
+        # Inputs: stop_event. Outputs: none. Exceptions: task errors propagate. Side effects: IPC, metrics, logging.
         inflight_tasks: dict[asyncio.Task, int] = {}
         free_slots = set(range(self.max_inflight_tasks))
         work_iter = self._repeat_iterator()
@@ -425,6 +502,11 @@ class _AsyncRolloutLoop:
                 await asyncio.gather(*inflight_tasks, return_exceptions=True)
 
     async def _retry(self, coro_factory: Callable[[], Awaitable], *, label: str, max_attempts: int = 1):
+        # [FUNCTION DOC]
+        # HELPER: Awaits coro_factory up to max_attempts (default 1), retrying only _RETRYABLE_HTTP_ERRORS with sleep
+        # min(2 ** min(attempt, 4), 16) seconds, incrementing rollout/vllm_retry_total and warning each retry.
+        # Inputs: coro_factory, label, max_attempts. Outputs: coroutine result. Exceptions: last retryable error or any other.
+        # Side effects: sleep, metrics, logging.
         """Retry an aiohttp coroutine on transport errors with bounded exponential backoff, counting the retries.
 
         Ported from [`~trl.experimental.async_grpo.async_rollout_worker._AsyncRolloutLoop._retry`]. Every retried call
@@ -445,6 +527,10 @@ class _AsyncRolloutLoop:
                 await asyncio.sleep(sleep)
 
     def _push_metrics(self, values: dict[str, float | tuple[float, float]]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sends given values plus accumulated counters and rates ((num, den) tuples) to the metrics queue without
+        # blocking (dropped when full) and clears the accumulators.
+        # Inputs: values dict. Outputs: none. Exceptions: none. Side effects: IPC write, clears accumulators.
         """Send metrics to the trainer, along with the counters and rates accumulated since the last push."""
         payload = dict(values)
         payload.update(self._counters)
@@ -459,6 +545,11 @@ class _AsyncRolloutLoop:
     def _push_rollout_metrics(
         self, *, completion_ids: list[int], teacher_id: str, score_s: float, duration_s: float
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Accumulates completions/mean_length and rollout/score_s rates, teacher_score_s/<teacher_id> when several
+        # teachers exist, and completions/clipped_ratio (last token not EOS/pad) for non-empty completions; then pushes
+        # rollout/duration_s and completions/max_length and min_length.
+        # Inputs: keyword completion_ids, teacher_id, score_s, duration_s. Outputs: none. Side effects: metrics.
         """One rollout: what the student generated, and the teacher call that scored it.
 
         A rollout yields exactly one training sample here — one turn, no group baseline, no re-tokenization forking —
@@ -492,6 +583,11 @@ class _AsyncRolloutLoop:
         )
 
     def _repeat_iterator(self) -> Iterator[tuple[int, dict[str, Any]]]:
+        # [FUNCTION DOC]
+        # HELPER: Infinite generator yielding (prompt_id, row) once per row, restarting the dataset in order when exhausted;
+        # prompt_id increments per yield.
+        # Inputs: none. Outputs: iterator. Exceptions: StopIteration-derived RuntimeError for an empty dataset.
+        # Side effects: replaces _dataset_iter.
         prompt_id = 0
         while True:
             try:
@@ -504,6 +600,9 @@ class _AsyncRolloutLoop:
             prompt_id += 1
 
     def _resolve_teacher_server_url(self, row: dict[str, Any]) -> tuple[str, str]:
+        # [FUNCTION DOC]
+        # HELPER: With one teacher returns its (id, url) regardless of row; otherwise uses row "teacher_id" and returns
+        # (id, url). Inputs: row. Outputs: tuple. Exceptions: ValueError when the id is missing or unknown. Side effects: none.
         """Pick which teacher server scores `row` (MOPD: multi-teacher on-policy distillation).
 
         A single configured teacher scores every row regardless of any `teacher_id` column (plain on-policy
@@ -524,6 +623,17 @@ class _AsyncRolloutLoop:
         return teacher_id, self.teacher_server_urls[teacher_id]
 
     async def _generate_and_score_one(self, prompt_id: int, row: dict[str, Any]) -> RolloutSample:
+        # [FUNCTION DOC]
+        # Produces one RolloutSample.
+        # Behavior: snapshots model_version before generating; tokenizes row "prompt" with the chat template (generation prompt
+        # added, chat_template_kwargs); samples completion ids from the student; decodes them (special tokens kept) into a
+        # single assistant message; resolves the teacher and scores prompt+completion (timed). Builds input_ids, completion_mask
+        # (0 for prompt, 1 for completion) and full-length teacher arrays filled at completion positions with the candidate
+        # lists. Pushes rollout metrics.
+        # Inputs: prompt_id, row. Outputs: RolloutSample (metrics empty).
+        # Exceptions: KeyError if row lacks prompt; ValueError for teacher routing; HTTP errors; ValueError/IndexError if the
+        # teacher returned more candidates than teacher_top_k + 1 or fewer positions than expected.
+        # Side effects: network, metrics.
         model_version = self.model_version
         t_dispatch = time.monotonic()
         prompt = row["prompt"]
@@ -569,6 +679,14 @@ class _AsyncRolloutLoop:
         )
 
     async def _generate_one_turn(self, prompt_ids: list[int]) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /v1/completions to the student server (model _request_model, token prompt, max_tokens, temperature,
+        # top_p, top_k, repetition_penalty, n 1, return_token_ids, random 63-bit seed, min_p when set; no logprobs requested)
+        # with outer retry of 30 attempts.
+        # Inputs: prompt_ids. Outputs: list of completion token ids.
+        # KNOWN ISSUE: _post already retries 3 times internally, so retries compound (up to 90 attempts) and the retry counter
+        # counts both layers; same pattern as the async_grpo worker.
+        # Exceptions: HTTP errors; KeyError on malformed response. Side effects: network.
         payload = {
             "model": self._request_model,
             "prompt": prompt_ids,
@@ -596,6 +714,13 @@ class _AsyncRolloutLoop:
     async def _score_with_teacher(
         self, prompt_ids: list[int], completion_ids: list[int], teacher_server_url: str, teacher_model_name: str
     ) -> tuple[list[list[int]], list[list[float]]]:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /v1/completions to the teacher with the full prompt+completion, max_tokens 1, teacher_temperature and
+        # prompt_logprobs = teacher_top_k (outer retry 30 attempts). Parses prompt_logprobs from index len(prompt_ids) to the
+        # end with _parse_teacher_logprobs_at_position.
+        # Inputs: prompt_ids, completion_ids, teacher_server_url, teacher_model_name.
+        # Outputs: (list of candidate id lists, list of logprob lists), one per completion position.
+        # Exceptions: HTTP errors; KeyError on malformed response. Side effects: network.
         """Teacher-force the student's completion through a teacher and read back its per-position distribution.
 
         `max_tokens=1` generates a single throwaway token (the teacher is never sampled from), and
@@ -633,9 +758,15 @@ class _AsyncRolloutLoop:
         return topk_ids, topk_logprobs
 
     async def _get(self, base_url: str, path: str, timeout: float, max_retries: int = 3) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: GET base_url + path with a total timeout, raise_for_status and return JSON, retried up to max_retries
+        # (default 3). Inputs: base_url, path, timeout, max_retries. Outputs: dict. Exceptions: aiohttp errors.
+        # Side effects: network.
         client_timeout = aiohttp.ClientTimeout(total=timeout)
 
         async def _do_get():
+            # [FUNCTION DOC]
+            # HELPER: Single GET attempt on the shared session returning parsed JSON. Exceptions: aiohttp errors.
             async with self.session.get(f"{base_url}{path}", timeout=client_timeout) as response:
                 response.raise_for_status()
                 return await response.json()
@@ -643,9 +774,15 @@ class _AsyncRolloutLoop:
         return await self._retry(_do_get, label=f"GET {base_url}{path}", max_attempts=max_retries)
 
     async def _post(self, base_url: str, path: str, payload: dict, timeout: float, max_retries: int = 3) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: POST JSON payload to base_url + path with a total timeout, raise_for_status, return the JSON (empty dict if
+        # empty), retried up to max_retries (default 3).
+        # Inputs: base_url, path, payload, timeout, max_retries. Outputs: dict. Exceptions: aiohttp errors. Side effects: network.
         client_timeout = aiohttp.ClientTimeout(total=timeout)
 
         async def _do_post():
+            # [FUNCTION DOC]
+            # HELPER: Single POST attempt returning parsed JSON or an empty dict. Exceptions: aiohttp errors.
             async with self.session.post(f"{base_url}{path}", json=payload, timeout=client_timeout) as response:
                 response.raise_for_status()
                 content = await response.json()
@@ -655,6 +792,10 @@ class _AsyncRolloutLoop:
 
 
 class AsyncRolloutWorker:
+    # [CLASS DOC]
+    # Parent-side controller of the distillation rollout child (see docstring); same lifecycle and IPC primitives as the
+    # async_grpo AsyncRolloutWorker (spawn context, rollout_buffer, model version value, stop/ready/failed events,
+    # heartbeat, exception queue, metrics_queue of maxsize 4096), but always runs this module's _AsyncRolloutLoop.
     """Parent-side controller: spawns a child process running `_AsyncRolloutLoop`.
 
     Ported from [`~trl.experimental.async_grpo.async_rollout_worker.AsyncRolloutWorker`], same lifecycle contract
@@ -670,6 +811,10 @@ class AsyncRolloutWorker:
         child_ready_timeout: int = 300,
         **loop_kwargs: Any,
     ):
+        # [FUNCTION DOC]
+        # Creates IPC primitives, stores loop kwargs (adding queue_maxsize and defaulting dataset_start_index to 0).
+        # Inputs: queue_maxsize (default 0), child_ready_timeout (default 300 s), loop kwargs. Outputs: none.
+        # Exceptions: ImportError if vLLM or aiohttp missing. Side effects: IPC object creation.
         if not is_vllm_available():
             raise ImportError("vLLM is required to use AsyncRolloutWorker. Install it with: pip install vllm")
         if not is_aiohttp_available():
@@ -697,18 +842,29 @@ class AsyncRolloutWorker:
 
     @property
     def model_version(self) -> int:
+        # [FUNCTION DOC]
+        # Reads the shared model version as int. No side effects.
         return int(self._model_version_value.value)
 
     @model_version.setter
     def model_version(self, value: int) -> None:
+        # [FUNCTION DOC]
+        # Setter: writes int(value) to the shared value under its lock. Side effects: visible to the child.
         # NOTE Read/write ops like += are not atomic with mp.Value
         with self._model_version_value.get_lock():
             self._model_version_value.value = int(value)
 
     def update_model_version(self, model_version: int) -> None:
+        # [FUNCTION DOC]
+        # Sets model_version via the property. Inputs: model_version (int). Outputs: none.
         self.model_version = model_version
 
     def start(self) -> None:
+        # [FUNCTION DOC]
+        # No-op with warning if already started. Resets heartbeat, checks kwargs pickle (TypeError otherwise), spawns daemon
+        # process "distillation-rollout-worker-child" running _child_main, then polls the ready event every second, raising
+        # RuntimeError if the child dies or child_ready_timeout passes.
+        # Inputs/Outputs: none. Side effects: process creation, logging.
         if self._process is not None:
             logger.warning("AsyncRolloutWorker.start() called but child process is already running; ignoring.")
             return
@@ -761,6 +917,10 @@ class AsyncRolloutWorker:
         logger.info("AsyncRolloutWorker child is ready")
 
     def check_health(self, stale_after_s: float) -> None:
+        # [FUNCTION DOC]
+        # Raises RuntimeError if the failed event is set (chaining a RuntimeError built from queued exception info if any), or
+        # if the heartbeat is older than stale_after_s. Inputs: stale_after_s. Outputs: none.
+        # Side effects: consumes queued exception info.
         """Raise if the child crashed or hasn't ticked the heartbeat within `stale_after_s`."""
         if self._failed_event.is_set():
             try:
@@ -774,6 +934,9 @@ class AsyncRolloutWorker:
             raise RuntimeError(f"Rollout worker heartbeat stale: {age:.0f}s > {stale_after_s:.0f}s; child is hung.")
 
     def stop(self) -> None:
+        # [FUNCTION DOC]
+        # No-op without a process; else sets the stop event and, if the process was started, joins 15 s, terminates and joins
+        # 5 s, then kills if still alive; clears _process. Inputs/Outputs: none. Side effects: process termination, logging.
         if self._process is None:
             return
         logger.info("Stopping AsyncRolloutWorker child process...")
