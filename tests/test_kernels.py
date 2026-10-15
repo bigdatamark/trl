@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests for the Triton/PyTorch kernels in trl.kernels: the fused selective log-softmax + entropy kernel, the chunked log-prob autograd function ChunkedLogProbFunction (and its fp32 addmm helper), and the chunked divergence autograd function ChunkedDivergenceFunction.
+# Each kernel is compared against a plain PyTorch reference (values and gradients) across dtypes, temperatures, masks, logit scaling/softcapping, bias and frozen parameters, and under torch.compile.
+# All test classes require a torch accelerator and Triton (gated with require_torch_accelerator and require_triton).
+# Import-time side effects: kernel symbols are imported only when Triton is available.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +36,12 @@ if is_triton_available():
 
 
 def reference(logits, index, temperature, row_mask):
+    # [FUNCTION DOC]
+    # HELPER: Plain PyTorch reference for selective_log_softmax_and_entropy.
+    # Behavior: cast logits to float32 and divide by temperature; take log-softmax over the last (vocab) dimension; gather the log-prob of the token in index for each position; compute entropy as minus the sum of p times log p over the vocab; if row_mask is given, zero both outputs where the mask is False.
+    # Inputs: logits (batch, seq, vocab), index (batch, seq) token ids, temperature (float), row_mask (bool tensor of shape (batch, seq) or None).
+    # Outputs: tuple (selected_logprobs, entropy), each float32 of shape (batch, seq).
+    # Exceptions: none beyond tensor shape errors. Side effects: none.
     logits = logits.float() / temperature
     logprobs = logits.log_softmax(-1)
     selected_logprobs = logprobs.gather(-1, index.unsqueeze(-1)).squeeze(-1)
@@ -43,12 +55,21 @@ def reference(logits, index, temperature, row_mask):
 @require_torch_accelerator
 @require_triton
 class TestLogProbEntropy:
+    # [CLASS DOC]
+    # Tests selective_log_softmax_and_entropy (fused Triton kernel) against the reference helper, for forward values, gradients and torch.compile compatibility.
+    # No state; plain pytest class. Requires an accelerator and Triton.
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
     @pytest.mark.parametrize(
         ("logprob_weight", "entropy_weight", "use_mask"),
         [(2, None, True), (None, 0.5, True), (2, 0.5, True), (2, 0.5, False)],
     )
     def test_forward_and_backward(self, dtype, logprob_weight, entropy_weight, use_mask):
+        # [FUNCTION DOC]
+        # Tests forward values and backward gradients of selective_log_softmax_and_entropy against the reference.
+        # Setup: vocab size 2053 (two full Triton blocks plus a partial one); random logits of shape (2, 5, vocab) in the given dtype with the first 1024 columns shifted up by 20 and columns 1024-2047 shifted down by 20 to stress online normalization; logits and indices sliced on the sequence dimension (positions 1-3) to produce non-contiguous views; one index forced into the partial last block; temperature 0.7; an optional sliced boolean row mask.
+        # Then overwrites one logprob output element with zero (to verify the outputs are not aliased with saved backward state), builds a loss from weighted logprob and/or entropy sums depending on logprob_weight / entropy_weight, and backpropagates. The same is done on a detached clone with the reference.
+        # Assertions: logprobs and entropy close to reference (tolerance 1e-5), gradient of the base logits close to reference (tolerance 1e-3).
+        # Inputs: dtype (float32/float16/bfloat16), logprob_weight, entropy_weight (each a number or None), use_mask (bool) from parametrize. Outputs: none. Exceptions: AssertionError on mismatch. Side effects: none.
         # Cross two full Triton blocks and leave a partial final block.
         vocab_size = 2053
         base_logits = torch.randn(2, 5, vocab_size, device=torch_device, dtype=dtype)
@@ -93,11 +114,20 @@ class TestLogProbEntropy:
         torch.testing.assert_close(actual_grad, reference_logits.grad, rtol=1e-3, atol=1e-3)
 
     def test_torch_compile_fullgraph(self):
+        # [FUNCTION DOC]
+        # Tests that selective_log_softmax_and_entropy works under torch.compile with fullgraph enabled.
+        # Setup: bfloat16 logits (2, 3, 257) requiring grad, random indices, a row mask with some False entries; a local loss sums logprobs plus 0.1 times entropy at temperature 0.8; compiled with fullgraph and backpropagated.
+        # Assertions: logits gradient exists, is all finite, and is exactly zero for masked-out rows.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError; torch compile errors if graph breaks. Side effects: none.
         logits = torch.randn(2, 3, 257, device=torch_device, dtype=torch.bfloat16, requires_grad=True)
         index = torch.randint(257, (2, 3), device=torch_device)
         row_mask = torch.tensor([[1, 0, 1], [0, 1, 1]], device=torch_device, dtype=torch.bool)
 
         def loss(logits, index, row_mask):
+            # [FUNCTION DOC]
+            # HELPER: Loss closure compiled in the test.
+            # Behavior: computes logprobs and entropy with selective_log_softmax_and_entropy at temperature 0.8 using the given row mask, returns the sum of logprobs plus 0.1 times entropy.
+            # Inputs: logits, index, row_mask tensors. Outputs: scalar tensor. Exceptions: none. Side effects: none.
             logprobs, entropy = selective_log_softmax_and_entropy(logits, index, temperature=0.8, row_mask=row_mask)
             return (logprobs + 0.1 * entropy).sum()
 
@@ -111,10 +141,19 @@ class TestLogProbEntropy:
 @require_torch_accelerator
 @require_triton
 class TestChunkedLogProbFunction:
+    # [CLASS DOC]
+    # Tests ChunkedLogProbFunction, the autograd function that computes per-token log-probs (plus optional entropy, log-sum of squared probs, mean logits and is-top1 flags) from hidden states and an LM head weight without materializing the full logits.
+    # Class attributes: N=64 tokens, H=32 hidden size, V=128 vocab, CHUNK_SIZE=32 vocab chunk size.
+    # Uses the helper _reference_logprobs_and_entropy as ground truth for values and gradients. Also tests the _addmm_fp32 helper.
     N, H, V = 64, 32, 128
     CHUNK_SIZE = 32
 
     def test_torch_compile(self):
+        # [FUNCTION DOC]
+        # Tests that ChunkedLogProbFunction gives the same hidden-state gradient eagerly and under torch.compile (Inductor passes float arguments as fp64).
+        # Setup: seed 42; random hidden (requires grad), weight, labels; a local loss applies the function with temperature 0.7, softcapping 30.0 and logit scale 0.5 and sums logprobs and entropy.
+        # Assertions: compiled gradient equals the eager gradient.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError. Side effects: none.
         # Inductor passes the float arguments (temperature, logit scale, softcapping) as fp64
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, device=torch_device, requires_grad=True)
@@ -122,6 +161,10 @@ class TestChunkedLogProbFunction:
         labels = torch.randint(0, self.V, (self.N,), device=torch_device)
 
         def loss(hidden):
+            # [FUNCTION DOC]
+            # HELPER: Loss closure used for eager and compiled runs.
+            # Behavior: applies ChunkedLogProbFunction to the given hidden states with the captured weight and labels, no bias, temperature 0.7, chunk size CHUNK_SIZE, softcapping 30.0, logit scale 0.5; returns sum of logprobs plus sum of entropy.
+            # Inputs: hidden (N, H). Outputs: scalar tensor. Exceptions: none. Side effects: none.
             logprobs, entropy, *_ = ChunkedLogProbFunction.apply(
                 hidden, weight, None, labels, 0.7, self.CHUNK_SIZE, 30.0, 0.5
             )
@@ -136,6 +179,12 @@ class TestChunkedLogProbFunction:
     def _reference_logprobs_and_entropy(
         self, hidden, weight, labels, temperature, bias=None, logit_scale=1.0, final_logit_softcapping=None
     ):
+        # [FUNCTION DOC]
+        # HELPER: Plain PyTorch reference for ChunkedLogProbFunction outputs.
+        # Behavior: logits are hidden times transposed weight, plus bias if given; cast to float32 and multiply by logit_scale; if final_logit_softcapping is set, apply tanh softcapping (divide by cap, tanh, multiply by cap); divide by temperature. Then log-softmax over vocab, gather log-prob at labels, and compute entropy as minus the sum of p times log p.
+        # Inputs: hidden (N, H), weight (V, H), labels (N,), temperature (float), bias (V,) optional, logit_scale (float, defaults to 1.0), final_logit_softcapping (float, optional).
+        # Outputs: tuple (logprobs, entropy), float32 tensors of shape (N,).
+        # Exceptions: none. Side effects: none.
         logits = hidden @ weight.t()
         if bias is not None:
             logits = logits + bias
@@ -153,6 +202,11 @@ class TestChunkedLogProbFunction:
     @pytest.mark.parametrize("device", [torch_device, "cpu"])
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_forward(self, device, temperature):
+        # [FUNCTION DOC]
+        # Tests forward values of ChunkedLogProbFunction and that it processes tokens in row chunks of at most TOKEN_CHUNK_SIZE.
+        # Setup: on the accelerator or on CPU (CPU stands in for an accelerator without Triton); patches trl.kernels.chunked_logprob.TOKEN_CHUNK_SIZE to 17 and wraps torch.mm in that module to record the row count of each chunk.
+        # Assertions: logprobs and entropy close to the reference (1e-5); maximum chunk size is at most 17 and the last chunk has 13 rows (64 = 3 times 17 plus 13).
+        # Inputs: device, temperature from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: patches are restored on exit.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, device=device)
         weight = torch.randn(self.V, self.H, device=device)
@@ -161,6 +215,10 @@ class TestChunkedLogProbFunction:
         torch_mm = torch.mm
 
         def record_chunk(input, mat2, *, out=None):
+            # [FUNCTION DOC]
+            # HELPER: Side effect for the patched torch.mm that records chunk sizes.
+            # Behavior: appends the row count of input to the enclosing chunk_rows list and delegates to the original torch.mm (with out if given).
+            # Inputs: input, mat2 tensors, keyword-only out. Outputs: the matrix product. Exceptions: none. Side effects: mutates chunk_rows.
             chunk_rows.append(input.size(0))
             return torch_mm(input, mat2, out=out)
 
@@ -179,6 +237,11 @@ class TestChunkedLogProbFunction:
         assert chunk_rows[-1] == 13
 
     def test_log_sum_sq_probs(self):
+        # [FUNCTION DOC]
+        # Tests the third output (log of the sum of squared probabilities) of ChunkedLogProbFunction.
+        # Setup: random hidden, weight, labels; temperature 0.7.
+        # Assertions: output is close to logsumexp of twice the logits minus twice logsumexp of the logits, with logits being hidden times transposed weight divided by temperature.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError. Side effects: none.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, device=torch_device)
         weight = torch.randn(self.V, self.H, device=torch_device)
@@ -192,6 +255,11 @@ class TestChunkedLogProbFunction:
 
     @pytest.mark.parametrize("outputs", [(), ("entropy",), ("is_top1", "mean_logits")])
     def test_outputs_subset(self, outputs):
+        # [FUNCTION DOC]
+        # Tests the outputs argument of ChunkedLogProbFunction: outputs not requested are None, requested ones (and log_probs, always returned) match a full run, and gradients are unchanged.
+        # Setup: run the function with all outputs and backprop the logprob sum, saving hidden/weight gradients; reset grads; run again with only the requested outputs (softcapping None, logit scale 1.0) and backprop.
+        # Assertions: for each of the five outputs (log_probs, entropy, log_sum_sq_probs, mean_logits, is_top1), equal to the full run if requested or log_probs, otherwise None; hidden and weight gradients equal those of the full run.
+        # Inputs: outputs (tuple of names) from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         # Outputs that are not requested are `None`, and the others, with the gradients, are unchanged
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, device=torch_device, requires_grad=True)
@@ -215,6 +283,10 @@ class TestChunkedLogProbFunction:
         torch.testing.assert_close(weight.grad, grads[1])
 
     def test_mean_logits(self):
+        # [FUNCTION DOC]
+        # Tests the fourth output (mean logits) of ChunkedLogProbFunction.
+        # Assertions: equals the mean over vocab of hidden times transposed weight, divided by temperature 0.7, within 1e-5.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError. Side effects: none.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, device=torch_device)
         weight = torch.randn(self.V, self.H, device=torch_device)
@@ -230,6 +302,11 @@ class TestChunkedLogProbFunction:
     )
     @pytest.mark.parametrize("entropy_weight", [0.0, 0.5])
     def test_backward_frozen_head(self, temperature, logit_scale, final_logit_softcapping, entropy_weight):
+        # [FUNCTION DOC]
+        # Tests hidden-state gradients when the LM head is frozen (weight does not require grad, as with a PEFT adapter).
+        # Setup: function applied with given temperature, softcapping and logit scale; loss is twice the logprob sum plus entropy_weight times the entropy sum; same loss computed with the reference.
+        # Assertions: hidden gradients close to reference (1e-4).
+        # Inputs: temperature, logit_scale, final_logit_softcapping, entropy_weight from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         # Only the hidden states need a gradient, as with a PEFT adapter
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, device=torch_device, requires_grad=True)
@@ -256,6 +333,11 @@ class TestChunkedLogProbFunction:
         torch.testing.assert_close(grad, hidden.grad, atol=1e-4, rtol=1e-4)
 
     def test_is_top1_matches_argmax_with_ties(self):
+        # [FUNCTION DOC]
+        # Tests that the is_top1 output breaks exact ties the same way argmax does (first index wins).
+        # Setup: the second half of the weight rows duplicates the first half, producing exact logit ties; labels alternate between the argmax and its duplicate half a vocab later (clamped to V-1).
+        # Assertions: is_top1 equals the boolean comparison of argmax with labels.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError. Side effects: none.
         # Duplicated head rows make exact ties; `argmax` picks the first one, and so must `is_top1`
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, device=torch_device)
@@ -281,6 +363,11 @@ class TestChunkedLogProbFunction:
         ],
     )
     def test_logit_scale_and_softcapping(self, device, logit_scale, final_logit_softcapping):
+        # [FUNCTION DOC]
+        # Tests logit scaling and final logit softcapping in ChunkedLogProbFunction (scale applied before softcapping).
+        # Setup: on accelerator or CPU; temperature 0.7; combinations of scale only, softcap only, and both.
+        # Assertions: logprobs and entropy close to the reference with the same scale/softcap (1e-5).
+        # Inputs: device, logit_scale, final_logit_softcapping from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, device=device)
         weight = torch.randn(self.V, self.H, device=device)
@@ -300,6 +387,11 @@ class TestChunkedLogProbFunction:
     @pytest.mark.parametrize("device", [torch_device, "cpu"])
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_backward(self, device, temperature):
+        # [FUNCTION DOC]
+        # Tests gradients of hidden and weight through the logprob output of ChunkedLogProbFunction in float32.
+        # Setup: on accelerator or CPU; backprop the logprob sum through the chunked function, save grads, reset, backprop the reference logprob sum.
+        # Assertions: hidden and weight gradients close to reference (1e-5).
+        # Inputs: device, temperature from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, requires_grad=True, device=device)
         weight = torch.randn(self.V, self.H, requires_grad=True, device=device)
@@ -323,6 +415,9 @@ class TestChunkedLogProbFunction:
 
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_backward_bfloat16(self, temperature):
+        # [FUNCTION DOC]
+        # Same as test_backward but with bfloat16 hidden and weight on the accelerator, with looser tolerance (1e-2).
+        # Inputs: temperature from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, dtype=torch.bfloat16, requires_grad=True, device=torch_device)
         weight = torch.randn(self.V, self.H, dtype=torch.bfloat16, requires_grad=True, device=torch_device)
@@ -345,6 +440,11 @@ class TestChunkedLogProbFunction:
         torch.testing.assert_close(grad_weight_chunked, weight.grad, atol=1e-2, rtol=1e-2)
 
     def test_backward_bfloat16_hidden_float32_weight(self):
+        # [FUNCTION DOC]
+        # Tests mixed dtypes: bfloat16 hidden states with a float32 weight.
+        # Setup: chunked function at temperature 1.0; reference computed with the weight cast to the hidden dtype.
+        # Assertions: logprobs, hidden gradient and weight gradient close to reference (1e-2).
+        # Inputs: none. Outputs: none. Exceptions: AssertionError. Side effects: none.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, dtype=torch.bfloat16, requires_grad=True, device=torch_device)
         weight = torch.randn(self.V, self.H, dtype=torch.float32, requires_grad=True, device=torch_device)
@@ -365,6 +465,11 @@ class TestChunkedLogProbFunction:
         torch.testing.assert_close(grad_weight, weight.grad, atol=1e-2, rtol=1e-2)
 
     def test_backward_uses_autocast_hidden_for_weight_gradient(self):
+        # [FUNCTION DOC]
+        # Tests that under autocast the weight gradient is computed from the autocast (bfloat16) hidden states, not the original float32 ones.
+        # Setup: float32 hidden values exactly representable in bfloat16, and a perturbed copy (plus 1e-4) that rounds to the same bfloat16 values (asserted); two identical weights; the function is run on both under bfloat16 autocast and backpropagated.
+        # Assertions: the two logprob outputs are exactly equal and the two weight gradients are exactly equal.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError. Side effects: none.
         torch.manual_seed(42)
         hidden = (
             torch.linspace(1.0, 2.0, self.N * self.H, device=torch_device)
@@ -395,6 +500,10 @@ class TestChunkedLogProbFunction:
 
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_backward_entropy(self, temperature):
+        # [FUNCTION DOC]
+        # Tests gradients through the entropy output alone of ChunkedLogProbFunction.
+        # Assertions: hidden and weight gradients close to reference entropy gradients (1e-4).
+        # Inputs: temperature from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Backprop through the `entropy` output alone (as opposed to `logprobs`, covered above)."""
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, requires_grad=True, device=torch_device)
@@ -421,6 +530,11 @@ class TestChunkedLogProbFunction:
 
     @pytest.mark.parametrize("temperature", [1.0, 0.7])
     def test_backward_combined(self, temperature):
+        # [FUNCTION DOC]
+        # Tests that gradients from logprobs and entropy accumulate (not overwrite) when both are used.
+        # Setup: TOKEN_CHUNK_SIZE patched to 17 so multiple row chunks are used; loss is twice logprob sum plus half entropy sum; reference computed the same way.
+        # Assertions: hidden and weight gradients close to reference (1e-4).
+        # Inputs: temperature from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: patch restored on exit.
         """Backprop through `logprobs` and `entropy` together, to catch the gradients overwriting each other
         instead of accumulating."""
         torch.manual_seed(42)
@@ -449,6 +563,11 @@ class TestChunkedLogProbFunction:
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_bias(self, dtype):
+        # [FUNCTION DOC]
+        # Tests ChunkedLogProbFunction with an LM head bias.
+        # Setup: hidden, weight and bias all requiring grad in the given dtype; temperature 0.7; loss is twice logprob sum plus half entropy sum, compared to the reference with bias.
+        # Assertions: logprobs, entropy and the gradients of hidden, weight and bias close to reference (atol 5e-2 / rtol 2e-2 for bfloat16, 1e-4 otherwise).
+        # Inputs: dtype from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, dtype=dtype, requires_grad=True, device=torch_device)
         weight = torch.randn(self.V, self.H, dtype=dtype, requires_grad=True, device=torch_device)
@@ -472,6 +591,11 @@ class TestChunkedLogProbFunction:
             torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
     def test_backward_skips_frozen_parameter_gradients(self):
+        # [FUNCTION DOC]
+        # Tests that backward does not allocate full-size gradient buffers for a frozen weight and bias.
+        # Setup: only hidden requires grad; torch.zeros is wrapped with a spy during backward.
+        # Assertions: no torch.zeros call used the weight shape or the bias shape; hidden gradient exists.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError. Side effects: torch.zeros patch restored on exit.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, requires_grad=True, device=torch_device)
         weight = torch.randn(self.V, self.H, device=torch_device)
@@ -491,6 +615,11 @@ class TestChunkedLogProbFunction:
 
     @pytest.mark.parametrize("requires_grad", [(True, False, False), (False, True, False), (False, False, True)])
     def test_backward_with_partially_frozen_inputs(self, requires_grad):
+        # [FUNCTION DOC]
+        # Tests backward when only one of hidden, weight, bias requires grad.
+        # Setup: run the chunked function and the reference on detached clones with the same requires_grad flags; backprop logprob sums.
+        # Assertions: for each input whose reference gradient exists, the chunked gradient is close to it (1e-5).
+        # Inputs: requires_grad (3-tuple of bools) from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         torch.manual_seed(42)
         hidden = torch.randn(self.N, self.H, requires_grad=requires_grad[0], device=torch_device)
         weight = torch.randn(self.V, self.H, requires_grad=requires_grad[1], device=torch_device)
@@ -513,6 +642,11 @@ class TestChunkedLogProbFunction:
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
     def test_addmm_fp32(self, dtype):
+        # [FUNCTION DOC]
+        # Tests the _addmm_fp32 helper, which adds the product of two matrices into a float32 accumulator in place, accumulating in fp32.
+        # Setup: a (64, 256) and b (256, 32) in the given dtype, a float32 accumulator (64, 32); expected value computed in float64.
+        # Assertions: accumulator after the call is close to the expected sum (atol 1e-3, rtol 1e-4).
+        # Inputs: dtype from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         # Accumulates the product in fp32, without rounding it to `dtype` first
         torch.manual_seed(42)
         a = torch.randn(64, 256, device=torch_device, dtype=dtype)
@@ -528,8 +662,16 @@ class TestChunkedLogProbFunction:
 @require_torch_accelerator
 @require_triton
 class TestChunkedDivergenceFunction:
+    # [CLASS DOC]
+    # Tests ChunkedDivergenceFunction, the autograd function computing a chunked student/teacher divergence from hidden states and LM heads.
+    # No state; contains a torch.compile consistency test.
     @pytest.mark.parametrize("beta", [0.0, 0.7, 1.0])
     def test_torch_compile(self, beta):
+        # [FUNCTION DOC]
+        # Tests that ChunkedDivergenceFunction gives the same student hidden gradient eagerly and under torch.compile (Inductor passes float arguments as fp64).
+        # Setup: student hidden (64, 32) requiring grad with weight (128, 32); teacher hidden (64, 48) with weight (128, 48); no biases.
+        # Assertions: compiled gradient equals the eager gradient.
+        # Inputs: beta (0.0, 0.7, 1.0) from parametrize. Outputs: none. Exceptions: AssertionError. Side effects: none.
         # Inductor passes the float arguments (beta, temperature, logit scales, softcapping) as fp64
         torch.manual_seed(42)
         student_hidden = torch.randn(64, 32, device=torch_device, requires_grad=True)
@@ -538,6 +680,10 @@ class TestChunkedDivergenceFunction:
         teacher_weight = torch.randn(128, 48, device=torch_device)
 
         def loss(student_hidden):
+            # [FUNCTION DOC]
+            # HELPER: Loss closure used for eager and compiled runs.
+            # Behavior: applies ChunkedDivergenceFunction to student hidden/weight and teacher hidden/weight (no biases) with the captured beta and the positional float arguments 0.7, 0.5, 30.0, and returns the sum of the divergence output.
+            # Inputs: student_hidden (64, 32). Outputs: scalar tensor. Exceptions: none. Side effects: none.
             divergence, _ = ChunkedDivergenceFunction.apply(
                 student_hidden, student_weight, None, teacher_hidden, teacher_weight, None, beta, 0.7, 0.5, 30.0
             )
