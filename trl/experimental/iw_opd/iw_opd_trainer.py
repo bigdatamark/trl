@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Experimental IW-OPD (Importance-Weighted On-Policy Distillation) trainer, a frozen snapshot of the earlier
+# DistillationTrainer extended with the sampled-token IW-OPD objective.
+# Main contents: module helpers (_print_completions_sample, _add_tail_bucket, _jsd_divergence,
+# build_teacher_request_inputs), _DistillationCollator (separate prompt/completion budgets), _RepeatBatchDataLoader
+# (repeats collated batches across gradient accumulation), and IWOPDTrainer.
+# Supports generalized JSD (optionally on top-k support with a tail bucket), sparse top-1 mixed losses, IW-OPD, local or
+# vLLM-server teachers, and student generation via vLLM or model.generate.
+# Import-time side effects: conditional imports of peft, rich, trackio and wandb.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -68,6 +78,13 @@ if is_wandb_available():
 
 
 def _print_completions_sample(prompts: list[str], completions: list[str], step: int, num_samples: int = None) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints a rich panel titled with the step containing a Prompt/Completion table; silently returns if rich is
+    # missing. num_samples at least the list length means all rows; zero or negative prints nothing; otherwise random
+    # subsample.
+    # Inputs: prompts, completions (lists of str), step (int), num_samples (int, optional).
+    # Outputs: none. Exceptions: ValueError from strict zip if lengths differ.
+    # Side effects: console output; random state use.
     """Print a sample of prompt-completion pairs using rich."""
     if not is_rich_available():
         return
@@ -97,6 +114,13 @@ def _print_completions_sample(prompts: list[str], completions: list[str], step: 
 
 
 def _add_tail_bucket(log_probs, valid_mask):
+    # [FUNCTION DOC]
+    # HELPER: Appends a tail element holding the log of the probability mass outside the given support.
+    # Behavior: the log-sum-exp of the support log-probs is clamped to at most -1e-7 (so mass is below 1); the tail is the
+    # log of one minus its exponential (computed stably). The mask gets an always-true extra column.
+    # Inputs: log_probs (..., K), valid_mask (..., K) bool.
+    # Outputs: tuple (log-probs (..., K+1), mask (..., K+1)).
+    # Exceptions: none. Side effects: none.
     """Append a (K+1)-th tail element: log(1 - sum(exp(top_k_logps))).
 
     This creates a proper probability distribution over K+1 elements, preventing trivial zero loss when top_k is small
@@ -110,6 +134,16 @@ def _add_tail_bucket(log_probs, valid_mask):
 
 
 def _jsd_divergence(student_log_probs, teacher_log_probs, beta, support_mask=None):
+    # [FUNCTION DOC]
+    # HELPER: Elementwise generalized JSD / KL between two log-probability tensors (to be summed/reduced by the caller).
+    # Behavior: with a support mask, entries outside the support are zeroed: beta 0 gives teacher prob times (teacher log
+    # minus student log) (forward KL), beta 1 gives student prob times (student log minus teacher log) (reverse KL), other
+    # beta gives beta times KL(teacher || mixture) plus (1 - beta) times KL(student || mixture) with the mixture
+    # (1 - beta) student plus beta teacher (clamped to the smallest float before the log); NaNs become 0. Without a mask
+    # the same formulas use F.kl_div with log targets and a log-sum-exp mixture.
+    # Inputs: student_log_probs, teacher_log_probs (same shape), beta (float), support_mask (bool tensor or None).
+    # Outputs: tensor of the same shape.
+    # Exceptions: none. Side effects: none.
     """Compute JSD (or forward/reverse KL) from log-probability tensors.
 
     When *support_mask* is not None, uses manual computation with masked positions zeroed. When None, uses
@@ -159,6 +193,16 @@ def build_teacher_request_inputs(
     prompt_attention_mask: torch.Tensor | None = None,
     labels: torch.Tensor | None = None,
 ) -> tuple[list[list[int]], list[int], list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: Converts padded batch tensors into per-sample token lists for teacher-server requests.
+    # Behavior: removes masked (padding) positions from each row. Prompt length is the sum of prompt_attention_mask when
+    # given, else total attended length minus the count of labels not equal to -100. Completion length is trimmed length
+    # minus prompt length.
+    # Inputs: input_ids (B, L), attention_mask (B, L), prompt_attention_mask (optional), labels (optional).
+    # Outputs: tuple (list of token lists, list of prompt lengths, list of completion lengths).
+    # Exceptions: ValueError on shape mismatches, missing labels without a prompt mask, or a prompt length outside the
+    # trimmed row.
+    # Side effects: none (copies to CPU).
     """Trim padded batch tensors into per-sample sequences for teacher-server requests."""
 
     if input_ids.shape != attention_mask.shape:
@@ -199,6 +243,10 @@ def build_teacher_request_inputs(
 
 
 class _DistillationCollator:
+    # [CLASS DOC]
+    # HELPER: Collator for conversational "messages" data that tokenizes prompt and completion with independent budgets.
+    # State: tokenizer (must have a pad token), max_length, max_prompt_length, messages_key ("messages"), ignore_index
+    # (-100). Outputs left-padded tensors input_ids, attention_mask, labels, prompts and prompt_attention_mask.
     """Data collator for the distillation trainer with independent prompt/completion budgets.
 
     Unlike ``DataCollatorForChatML``, this collator tokenizes prompts and completions separately so that long
@@ -214,6 +262,10 @@ class _DistillationCollator:
         messages_key: str = "messages",
         ignore_index: int = -100,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Stores settings and validates the tokenizer has a pad token id.
+        # Inputs: tokenizer, max_length (int), max_prompt_length (int), messages_key (default "messages"), ignore_index (-100).
+        # Outputs: none. Exceptions: ValueError if pad_token_id is None. Side effects: none.
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_prompt_length = max_prompt_length
@@ -224,6 +276,19 @@ class _DistillationCollator:
             raise ValueError("The tokenizer does not have a pad token. Please set `pad_token_id` in the tokenizer.")
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Collates a list of examples.
+        # Behavior: per example, the completion is the last message if it is an assistant turn and there is more than one
+        # message; the prompt is all earlier messages (or all messages). The prompt is rendered with the chat template
+        # (generation prompt on) and tokenized without special tokens, truncated to max_prompt_length using the tokenizer's
+        # truncation side. With a completion, the full conversation is rendered and tokenized, the completion ids are the full
+        # ids after the untruncated prompt length, and are trimmed so prompt plus completion fit max_length (empty if the
+        # prompt already fills it). Labels are -100 over the prompt and the completion ids elsewhere; prompt-only examples have
+        # all -100 labels. All tensors are left-padded (pad id, 0 for masks, -100 for labels).
+        # Inputs: examples (list of dicts with messages_key).
+        # Outputs: dict of (B, L) tensors as listed on the class.
+        # Exceptions: KeyError for missing messages; TypeError if max_length is None and a completion is present.
+        # Side effects: none.
         all_input_ids: list[list[int]] = []
         all_labels: list[list[int]] = []
         all_prompt_ids: list[list[int]] = []
@@ -319,6 +384,10 @@ class _DistillationCollator:
 
 
 class _RepeatBatchDataLoader:
+    # [CLASS DOC]
+    # HELPER: Wraps a DataLoader so each collated batch is yielded repeat_count times (one generation batch per gradient
+    # accumulation window) without re-collating. Length is the inner length times repeat_count; set_epoch and any other
+    # attribute access are delegated to the inner dataloader.
     """Repeats each collated batch ``repeat_count`` times without re-collation.
 
     ``RepeatSampler`` with ``repeat_count > 1`` causes the DataLoader to re-collate (re-tokenize) the same examples on
@@ -327,26 +396,55 @@ class _RepeatBatchDataLoader:
     """
 
     def __init__(self, dataloader, repeat_count: int):
+        # [FUNCTION DOC]
+        # HELPER: Stores the wrapped dataloader and repeat count.
+        # Inputs: dataloader, repeat_count (int). Outputs: none. Exceptions: none. Side effects: none.
         self.dataloader = dataloader
         self.repeat_count = repeat_count
 
     def __iter__(self):
+        # [FUNCTION DOC]
+        # HELPER: Generator yielding each inner batch repeat_count times in a row (the same object).
+        # Inputs: none. Outputs: iterator of batches. Exceptions: those of the inner loader. Side effects: none.
         for batch in self.dataloader:
             for _ in range(self.repeat_count):
                 yield batch
 
     def __len__(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns inner length times repeat_count.
+        # Inputs: none. Outputs: int. Exceptions: TypeError if the inner loader has no length. Side effects: none.
         return len(self.dataloader) * self.repeat_count
 
     def set_epoch(self, epoch: int):
+        # [FUNCTION DOC]
+        # HELPER: Forwards set_epoch to the inner dataloader when it supports it.
+        # Inputs: epoch (int). Outputs: none. Exceptions: none. Side effects: inner sampler epoch.
         if hasattr(self.dataloader, "set_epoch"):
             self.dataloader.set_epoch(epoch)
 
     def __getattr__(self, attr):
+        # [FUNCTION DOC]
+        # HELPER: Delegates unknown attribute lookups to the inner dataloader.
+        # Inputs: attr (str). Outputs: attribute value. Exceptions: AttributeError from the inner object. Side effects: none.
         return getattr(self.dataloader, attr)
 
 
 class IWOPDTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Distillation trainer (trl _BaseTrainer subclass) implementing IW-OPD and generalized JSD/KL distillation.
+    # Key state: teacher_model (prepared local teacher) or teacher_client (VLLMClient for a teacher server),
+    # use_teacher_server, _local_teacher_tokenizer_matches_student; hyperparameters lmbda, beta, distillation_objective,
+    # iw_opd_gamma, iw_opd_epsilon, temperature, top_p, num_generations, reverse_kl_top_1_mode, loss_top_k, loss_add_tail;
+    # rollout buffer (_buffered_inputs, _buffered_on_policy_flags, _buffered_text_logs, _buffer_step); on/off-policy loss
+    # accumulators; generation_config/kwargs; _metrics and _textual_logs; vLLM generation state.
+    # Flow: get_train_dataloader yields one collated generation batch per accumulation window (repeated by
+    # _RepeatBatchDataLoader); _prepare_inputs fills a buffer at window starts, choosing per slice with probability lmbda to
+    # replace data with student generations; compute_loss dispatches to IW-OPD, sparse top-1, forward-KL (server) or full
+    # JSD; training_step records length and loss stats; log aggregates and logs completions.
+    # KNOWN ISSUE: the class docstring and get_train_dataloader docstring say RepeatSampler repeats each generation batch
+    # gradient_accumulation_steps times, but the sampler uses repeat_count 1 and the repetition is done by
+    # _RepeatBatchDataLoader.
     """
     Trainer for Importance-Weighted On-Policy Distillation (IW-OPD).
 
@@ -401,6 +499,31 @@ class IWOPDTrainer(_BaseTrainer):
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         peft_config: Optional["PeftConfig"] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior:
+        # 1. Defaults args to IWOPDConfig with output_dir "tmp_iw_opd"; seeds; parses model and teacher init kwargs (dicts or
+        # JSON strings). String students are created with create_model_from_path (trust_remote_code default, device_map None
+        # for multi-GPU/DeepSpeed).
+        # 2. Loads a tokenizer from the model path if none is given; sets pad to eos when missing and mirrors the pad id onto
+        # the model text config and generation config.
+        # 3. Wraps with PEFT when peft_config is given (validating availability and type; adapter dtype autocast disabled under
+        # ZeRO-3 for non-quantized models).
+        # 4. Default collator is _DistillationCollator(max_length, max_prompt_length).
+        # 5. Teacher: with use_teacher_server builds a VLLMClient (60 s connection timeout) and drops any local teacher.
+        # Otherwise for a given teacher: rejects init kwargs with an instantiated teacher, requires a name/path, loads the
+        # teacher tokenizer (revision from init kwargs or teacher_model_revision), compares vocabularies with the student
+        # (warning on mismatch), converts dtype strings, and creates string teachers with create_model_from_path.
+        # 6. Sets remove_unused_columns False and calls the base constructor. Resizes teacher embeddings to the student vocab
+        # when tokenizers match and prepares the teacher (DeepSpeed or accelerator eval mode); disables student dropout.
+        # 7. Stores hyperparameters, buffers, accumulators, GenerationConfig (max_new_tokens = max_completion_length,
+        # temperature, top_p, top_k, sampling, pad, eos from the model generation config), metrics and text logs.
+        # 8. With use_vllm, requires vLLM and builds VLLMGeneration (logprobs 0, i.e. sampled-token logprobs, for iw_opd), sync
+        # frequency and last sync step -1.
+        # Inputs: model, teacher_model, args, data_collator, train_dataset, eval_dataset, processing_class, compute_metrics,
+        # callbacks, optimizers, preprocess_logits_for_metrics, peft_config.
+        # Outputs: none.
+        # Exceptions: ImportError (peft, vLLM), TypeError (peft_config), ValueError (teacher configuration).
+        # Side effects: model/tokenizer downloads; mutates args and tokenizer/model pad settings; warnings.
         if args is None:
             args = IWOPDConfig(output_dir="tmp_iw_opd")
 
@@ -670,10 +793,17 @@ class IWOPDTrainer(_BaseTrainer):
         student_processing_class: PreTrainedTokenizerBase,
         teacher_processing_class: PreTrainedTokenizerBase,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Static. True when student and teacher tokenizers have identical vocabularies (token to id dicts).
+        # Inputs: two tokenizers. Outputs: bool. Exceptions: none. Side effects: none.
         """Check whether the student and local teacher tokenizers share the same vocabulary."""
         return student_processing_class.get_vocab() == teacher_processing_class.get_vocab()
 
     def _raise_if_local_teacher_tokenizer_mismatch(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Raises ValueError when a local teacher exists whose tokenizer differs from the student's (the built-in loss
+        # needs a shared vocabulary).
+        # Inputs: none. Outputs: none. Exceptions: ValueError. Side effects: none.
         """Guard the base local-teacher JSD path, while still allowing subclass overrides."""
         if self.teacher_model is not None and not self._local_teacher_tokenizer_matches_student:
             raise ValueError(
@@ -683,6 +813,13 @@ class IWOPDTrainer(_BaseTrainer):
             )
 
     def _compute_prompt_length(self, inputs: dict[str, torch.Tensor | Any]) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Returns the slicing boundary for loss tensors: with labels, the minimum over rows of attended length minus
+        # completion-label count; otherwise the prompts tensor width.
+        # Inputs: inputs dict. Outputs: int. Exceptions: KeyError if required keys are missing. Side effects: none.
+        # KNOWN ISSUE: the attended-length arithmetic gives the number of prompt tokens, not the padded column where the
+        # completion starts; for left-padded rows shorter than the batch width this boundary is too small, so loss tensors
+        # include extra leading positions (harmless only because labels there are -100).
         """Compute the earliest prompt boundary that still includes every completion token in the batch."""
         if inputs.get("labels") is not None:
             attention_mask = inputs["attention_mask"]
@@ -693,6 +830,12 @@ class IWOPDTrainer(_BaseTrainer):
         return inputs["prompts"].shape[1]
 
     def _get_completion_lengths(self, generated_tokens: torch.Tensor, prompt_width: int) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Infers per-row completion lengths from generated sequences after prompt_width.
+        # Behavior: if the pad id is one of the EOS ids, the length runs up to and including the first EOS (or the full width);
+        # else, with a pad id, trailing pad tokens are stripped; else the full width.
+        # Inputs: generated_tokens (B, L), prompt_width (int). Outputs: long tensor (B,).
+        # Exceptions: none. Side effects: none.
         """Infer per-sample completion lengths from generated tokens."""
         completion_tokens = generated_tokens[:, prompt_width:]
         pad_token_id = self.processing_class.pad_token_id
@@ -728,6 +871,10 @@ class IWOPDTrainer(_BaseTrainer):
     # ──────────────────────────────────────────────────────────────────────
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # Behavior: runs the parent hook and adds prompts, prompt_attention_mask, messages, chat_template_kwargs and tools to
+        # the signature columns.
+        # Inputs: none. Outputs: none. Exceptions: none. Side effects: sets _signature_columns.
         super()._set_signature_columns_if_needed()
         extra_columns = ["prompts", "prompt_attention_mask", "messages", "chat_template_kwargs", "tools"]
         if self._signature_columns is None:
@@ -738,6 +885,10 @@ class IWOPDTrainer(_BaseTrainer):
                     self._signature_columns.append(col)
 
     def _get_train_sampler(self, dataset=None):
+        # [FUNCTION DOC]
+        # Behavior: RepeatSampler with each index repeated num_generations times, batch size generation_batch_size times
+        # number of processes, repeat_count 1, shuffled with args.seed.
+        # Inputs: dataset (optional). Outputs: RepeatSampler. Exceptions: none. Side effects: none.
         if dataset is None:
             dataset = self.train_dataset
         return RepeatSampler(
@@ -750,6 +901,13 @@ class IWOPDTrainer(_BaseTrainer):
         )
 
     def get_train_dataloader(self):
+        # [FUNCTION DOC]
+        # Behavior: builds a DataLoader with batch size per-device batch times accumulation steps, the trainer collator,
+        # worker/pin-memory settings, and for map-style datasets the custom sampler, drop_last, seeded worker init and prefetch
+        # factor; prepares it with the accelerator and wraps it in _RepeatBatchDataLoader repeating each batch
+        # gradient_accumulation_steps times. Unused columns are not removed.
+        # Inputs: none. Outputs: _RepeatBatchDataLoader.
+        # Exceptions: ValueError if train_dataset is None. Side effects: none.
         """
         Override to load one generation batch per optimizer window.
 
@@ -791,6 +949,11 @@ class IWOPDTrainer(_BaseTrainer):
 
     @profiling_decorator
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
+        # [FUNCTION DOC]
+        # Behavior: in eval mode returns the batch unchanged. In training, refills the buffer when _buffer_step is at a window
+        # start or the buffer is empty, returns the slice at step modulo accumulation steps and increments _buffer_step.
+        # Inputs: generation_batch (dict). Outputs: dict. Exceptions: those of _fill_buffer.
+        # Side effects: mutates buffers and _buffer_step.
         if not self.model.training:
             return generation_batch
 
@@ -805,6 +968,14 @@ class IWOPDTrainer(_BaseTrainer):
 
     @profiling_decorator
     def _fill_buffer(self, generation_batch: dict[str, torch.Tensor | Any], buffer_steps: int):
+        # [FUNCTION DOC]
+        # Behavior: splits the batch into buffer_steps slices; the main process draws per-slice on-policy flags (random value
+        # at most lmbda), broadcast to all; off-policy slices are buffered unchanged; on-policy slices are generated via
+        # _generate_student_completions. With log_completions, gathers on-policy prompt/completion texts from all processes
+        # into _textual_logs.
+        # Inputs: generation_batch, buffer_steps (int). Outputs: none.
+        # Exceptions: generation errors.
+        # Side effects: resets buffers; collectives; random draw.
         """Split batch into slices and decide which are on-policy (student-generated) vs off-policy."""
         slices = split_tensor_dict(generation_batch, buffer_steps)
 
@@ -845,6 +1016,13 @@ class IWOPDTrainer(_BaseTrainer):
 
     @profiling_decorator
     def _generate_student_completions(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
+        # [FUNCTION DOC]
+        # Behavior: without vLLM delegates to _generate_with_model. With vLLM: strips left padding from each prompt (via the
+        # prompt mask, or by dropping leading pad ids), syncs weights when the global step differs from the last sync step and
+        # is a multiple of vllm_sync_frequency, generates num_generations completions per prompt with sampled-token logprobs,
+        # and stores them via _store_completions_in_buffer.
+        # Inputs: slices (list of dicts), on_policy_indices (list of int). Outputs: none.
+        # Exceptions: generation errors. Side effects: vLLM sync/generation; buffer updates.
         """Generate completions from the student model for on-policy training."""
         if not self.use_vllm:
             self._generate_with_model(slices, on_policy_indices)
@@ -887,6 +1065,14 @@ class IWOPDTrainer(_BaseTrainer):
         )
 
     def _generate_with_model(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
+        # [FUNCTION DOC]
+        # Behavior: inside unwrap_model_for_generation, for each on-policy slice generates from prompts and prompt mask,
+        # computes prompt token lengths (mask sums, or full width) and completion lengths, builds attention mask and labels,
+        # decodes real prompt tokens and completion tokens (special tokens kept) for logging, and buffers a copy of the slice
+        # with new input_ids, attention_mask and labels.
+        # Inputs: slices, on_policy_indices. Outputs: none.
+        # Exceptions: generation errors.
+        # Side effects: buffer and text-log updates.
         """Fallback generation using model.generate() (no vLLM)."""
         with unwrap_model_for_generation(
             self.model, self.accelerator, generation_kwargs=self.generation_kwargs
@@ -953,6 +1139,18 @@ class IWOPDTrainer(_BaseTrainer):
         logprobs: list | None = None,
         logprob_token_ids: list | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: groups completions and prompts by slice; when logprobs are given, extracts per step the logprob of the
+        # sampled token from each step's returned candidates. Per slice: left-pads prompts to the slice's longest prompt and
+        # builds the prompt mask; truncates completions (and their logprobs) to max_new_tokens and right-pads ids with the pad
+        # id and logprobs with 0; concatenates; builds attention mask and labels from lengths; decodes texts for logging; and
+        # buffers a copy of the slice with new input_ids, attention_mask, labels, prompts, prompt mask and, when logprobs exist,
+        # rollout_logprobs left-padded with zeros over the prompt width.
+        # Inputs: slices, on_policy_indices, local_slice_indices, local_prompts (list of 1-D tensors), completion_ids (list of
+        # lists), logprobs and logprob_token_ids (optional nested lists).
+        # Outputs: none.
+        # Exceptions: ValueError if a sampled token is missing from its candidate ids.
+        # Side effects: buffer and text-log updates.
         """Process vLLM completions and store them in the buffer.
 
         Uses original prompt token IDs directly (no decode/re-encode roundtrip), following the same approach as
@@ -1058,6 +1256,12 @@ class IWOPDTrainer(_BaseTrainer):
         prompt_token_lengths: torch.Tensor,
         completion_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Static. Attention mask is true for the last prompt_token_length positions of the prompt block (columns before
+        # prompt_width) and the first completion_length positions after it; labels copy ids on completion positions and are
+        # -100 elsewhere.
+        # Inputs: new_input_ids (B, L), prompt_width (int), prompt_token_lengths (B,), completion_lengths (B,).
+        # Outputs: tuple (attention mask long (B, L), labels (B, L)). Exceptions: none. Side effects: none.
         """Build attention mask and labels from prompt/completion lengths."""
         prompt_token_lengths = prompt_token_lengths.to(device=new_input_ids.device, dtype=torch.long)
         completion_lengths = completion_lengths.to(device=new_input_ids.device, dtype=torch.long)
@@ -1077,6 +1281,12 @@ class IWOPDTrainer(_BaseTrainer):
 
     @staticmethod
     def _reduce_divergence_loss(jsd, labels=None, reduction="batchmean", num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # HELPER: Static. Keeps positions whose label is not -100 (if labels given); then sum over num_items_in_batch when
+        # given, else batchmean (sum over count of valid labels clamped to at least 1, or over the first dimension without
+        # labels), "sum", "mean", or unreduced.
+        # Inputs: jsd (tensor), labels (optional), reduction (default "batchmean"), num_items_in_batch (optional).
+        # Outputs: tensor. Exceptions: none. Side effects: none.
         """Reduce a per-token divergence tensor using the trainer's label mask semantics.
 
         When `num_items_in_batch` is provided (as under gradient accumulation), the divergence is reduced as `sum /
@@ -1119,6 +1329,16 @@ class IWOPDTrainer(_BaseTrainer):
         add_tail=True,
         num_items_in_batch=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: static. Divides logits by temperature. If top_k is positive and below the vocab size, builds a support per
+        # position: teacher top-k for beta 0, student top-k for beta 1, otherwise the concatenation of both with duplicates
+        # masked out; gathers full log-softmax values on the support (invalid entries set to minus infinity) and either adds a
+        # tail bucket or renormalizes over the support. Otherwise uses full log-softmax distributions. Computes the elementwise
+        # divergence with _jsd_divergence and reduces with _reduce_divergence_loss.
+        # Inputs: student_logits, teacher_logits (B, T, V), labels (optional), beta (0.5), temperature (1.0), reduction
+        # ("batchmean"), top_k (0), add_tail (True), num_items_in_batch (optional).
+        # Outputs: scalar tensor (or unreduced).
+        # Exceptions: none expected. Side effects: none.
         """
         Compute the generalized Jensen-Shannon Divergence loss for knowledge distillation.
 
@@ -1198,6 +1418,11 @@ class IWOPDTrainer(_BaseTrainer):
     def _get_reverse_kl_top_1_tokens(
         self, student_scores: torch.Tensor, completion_tokens: torch.Tensor
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Returns the argmax over the last dimension of student_scores in "argmax" mode, else the actual completion
+        # tokens ("sampled").
+        # Inputs: student_scores (B, T, V), completion_tokens (B, T). Outputs: long tensor (B, T).
+        # Exceptions: none. Side effects: none.
         """Return the reverse-KL top-1 token IDs for the mixed top-1 loss path.
 
         Args:
@@ -1218,6 +1443,19 @@ class IWOPDTrainer(_BaseTrainer):
         rollout_logprobs: torch.Tensor | None = None,
         num_items_in_batch=None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: student log-probs of the sampled tokens from temperature-scaled logits. Valid positions are labels not -100;
+        # errors if any valid teacher logprob is not finite. Per-token advantage is teacher minus rollout logprob (rollout
+        # defaults to the current student logprob), detached and zero on invalid positions. Weights are 1 plus gamma times (1
+        # minus the prefix sum of absolute advantages before the token divided by the row total, clamped below by epsilon),
+        # detached. Loss per token is minus student logprob times weight times advantage (zero on invalid positions). Records
+        # iw_opd/mean_advantage, mean_abs_advantage, mean_weight, min_weight and max_weight in _metrics. Reduction: sum over
+        # num_items_in_batch if given, else sum over the count of valid positions (at least 1).
+        # Inputs: student_logits (B, T, V), completion_tokens (B, T), labels (B, T), teacher_actual_logprobs (B, T),
+        # rollout_logprobs (B, T, optional), num_items_in_batch (optional).
+        # Outputs: scalar tensor.
+        # Exceptions: ValueError for missing teacher logprobs.
+        # Side effects: appends metrics.
         """Compute the sampled-token Importance-Weighted On-Policy Distillation loss."""
         student_log_probs = F.log_softmax(student_logits / self.temperature, dim=-1)
         student_actual_logprobs = student_log_probs.gather(dim=-1, index=completion_tokens.unsqueeze(-1)).squeeze(-1)
@@ -1276,6 +1514,14 @@ class IWOPDTrainer(_BaseTrainer):
         labels: torch.Tensor,
         num_items_in_batch=None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: support is the reverse-KL token only when beta is 1; otherwise the teacher top-1 token plus the reverse
+        # token, with the second masked out if identical. Gathers student log-probs on the support, sets invalid entries to
+        # minus infinity, adds a tail bucket or renormalizes (per loss_add_tail), computes the divergence with self.beta and
+        # the support mask, and reduces (batchmean or num_items_in_batch).
+        # Inputs: student_log_probs (B, T, V), teacher_top1_token_ids, teacher_top1_logprobs, reverse_token_ids,
+        # reverse_teacher_logprobs (all (B, T)), labels, num_items_in_batch (optional).
+        # Outputs: scalar tensor. Exceptions: none. Side effects: none.
         """Compute exact generalized JSD/KL on top-1 support for the mixed beta>0 path."""
         neg_inf = torch.full((), float("-inf"), dtype=student_log_probs.dtype, device=student_log_probs.device)
 
@@ -1321,6 +1567,12 @@ class IWOPDTrainer(_BaseTrainer):
         labels: torch.Tensor,
         num_items_in_batch=None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: computes temperature-scaled log-softmax for student and local teacher, takes the teacher's argmax token
+        # and its logprob, the reverse-KL token (sampled or student argmax) and the teacher logprob of it, then delegates to
+        # _compute_sparse_top_1_divergence_loss.
+        # Inputs: student_logits, teacher_logits (B, T, V), completion_tokens, labels, num_items_in_batch.
+        # Outputs: scalar tensor. Exceptions: none. Side effects: none.
         """Compute the mixed top-1 loss for a local teacher using gathered full-logit probabilities."""
         student_log_probs = F.log_softmax(student_logits / self.temperature, dim=-1)
         teacher_log_probs = F.log_softmax(teacher_logits / self.temperature, dim=-1)
@@ -1343,6 +1595,11 @@ class IWOPDTrainer(_BaseTrainer):
         )
 
     def _get_teacher_logits(self, inputs: dict[str, torch.Tensor | Any]) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: runs the local teacher (eval mode, no grad) on input_ids and attention_mask and returns logits.
+        # Inputs: inputs dict. Outputs: tensor (B, L, V).
+        # Exceptions: NotImplementedError when only a teacher server is configured; ValueError when no teacher exists.
+        # Side effects: teacher set to eval.
         """Get teacher logits — dispatches between local model and external server."""
         if self.teacher_model is not None:
             self.teacher_model.eval()
@@ -1365,6 +1622,15 @@ class IWOPDTrainer(_BaseTrainer):
         inputs: dict[str, torch.Tensor | Any],
         aligned_prompt_length: int,
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: trims the batch to per-sample sequences, requests sequence logprobs from the teacher server with
+        # top_logprobs equal to loss_top_k and the trainer temperature, and aligns each sample's completion into the student
+        # loss coordinate system by its first label position minus aligned_prompt_length. Output width is the tightest that
+        # fits all teacher completions; missing positions are minus infinity (token ids 0).
+        # Inputs: inputs (input_ids, attention_mask, labels, optional prompt_attention_mask), aligned_prompt_length (int).
+        # Outputs: dict with actual_logprobs (B, T), topk_logprobs (B, T, K), topk_token_ids (B, T, K) on the input device.
+        # Exceptions: ValueError if labels are missing (raised after the request); errors from the client.
+        # Side effects: network request to the teacher server.
         """Fetch per-token teacher logprobs from an external vLLM server.
 
         Returns a dict with:
@@ -1428,6 +1694,10 @@ class IWOPDTrainer(_BaseTrainer):
 
         # actual_logprobs: (B, T) — teacher logprob for the actual token
         def _actual_to_tensor(key):
+            # [FUNCTION DOC]
+            # HELPER: Builds a (B, T) float array filled with minus infinity and writes each sample's first-column logprobs at its
+            # offset, returned as a tensor on the device.
+            # Inputs: key (result field name). Outputs: tensor. Exceptions: none. Side effects: none.
             arr = np.full((batch_size, completion_length), float("-inf"), dtype=np.float32)
             for i, (offset, seq_lps) in enumerate(zip(completion_offsets, result[key], strict=True)):
                 if seq_lps:
@@ -1437,6 +1707,10 @@ class IWOPDTrainer(_BaseTrainer):
 
         # topk: (B, T, K)
         def _topk_to_tensor(key, k, np_dtype, fill):
+            # [FUNCTION DOC]
+            # HELPER: Builds a (B, T, k) array of the given dtype filled with fill and writes each sample's top-k values at its
+            # offset, returned as a tensor on the device.
+            # Inputs: key, k (int), np_dtype, fill. Outputs: tensor. Exceptions: none. Side effects: none.
             arr = np.full((batch_size, completion_length, k), fill, dtype=np_dtype)
             for i, (offset, seq_vals) in enumerate(zip(completion_offsets, result[key], strict=True)):
                 if seq_vals:
@@ -1457,6 +1731,13 @@ class IWOPDTrainer(_BaseTrainer):
         completion_tokens: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: errors if any required position lacks a finite actual-token teacher logprob, or (beta below 1) a finite
+        # top-1 logprob. Zeroes teacher logprobs on padding positions, takes the reverse token via
+        # _get_reverse_kl_top_1_tokens, and delegates to _compute_sparse_top_1_divergence_loss with batchmean reduction (not
+        # num_items_in_batch).
+        # Inputs: teacher_result dict, student_log_probs (B, T, V), completion_tokens (B, T), labels (B, T).
+        # Outputs: scalar tensor. Exceptions: ValueError on missing teacher logprobs. Side effects: none.
         """Compute exact sparse top-1 generalized JSD/KL from server-provided teacher logprobs.
 
         Args:
@@ -1519,6 +1800,12 @@ class IWOPDTrainer(_BaseTrainer):
         student_log_probs: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: forward KL on the teacher's top-k support from the server: valid entries are finite teacher logprobs;
+        # student log-probs are gathered at the teacher token ids; invalid entries set to minus infinity; tail bucket or
+        # renormalization; divergence with beta 0 and the support mask; batchmean reduction over valid labels.
+        # Inputs: teacher_result, student_log_probs, labels. Outputs: scalar tensor.
+        # Exceptions: none. Side effects: none.
         """Compute sparse forward KL from server-provided teacher top-k logprobs (beta==0 path).
 
         Args:
@@ -1558,6 +1845,18 @@ class IWOPDTrainer(_BaseTrainer):
         return self._reduce_divergence_loss(jsd, labels=labels, reduction="batchmean")
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Behavior: checks tokenizer compatibility for local teachers; runs the student; computes the prompt boundary and slices
+        # labels, completion tokens and rollout logprobs from it; student logits are shifted (from boundary minus one to the
+        # second to last position). Server teacher: fetches teacher logprobs, trims to the returned window; iw_opd requires the
+        # window to cover all valid labels and uses _compute_iw_opd_loss; beta above 0 uses the server sparse top-1 loss;
+        # beta 0 the server forward-KL loss. Local teacher: shifted teacher logits; iw_opd gathers teacher sampled-token
+        # logprobs and uses _compute_iw_opd_loss; beta above 0 with loss_top_k 1 uses the local sparse top-1 loss; otherwise
+        # generalized_jsd_loss with beta, temperature, loss_top_k and loss_add_tail.
+        # Inputs: model, inputs, return_outputs (default False), num_items_in_batch.
+        # Outputs: loss, or (loss, student outputs).
+        # Exceptions: ValueError for tokenizer mismatch or insufficient teacher coverage; errors from helpers.
+        # Side effects: may call the teacher server; metrics from IW-OPD.
         self._raise_if_local_teacher_tokenizer_mismatch()
 
         # Student forward pass
@@ -1668,6 +1967,14 @@ class IWOPDTrainer(_BaseTrainer):
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: runs the base training step; determines whether the slice just consumed was on-policy; from that buffered
+        # slice's labels gathers completion lengths across processes and records completions/{on_policy or off_policy}_mean,
+        # max and min length, plus completions/truncated_fraction (length at least max_new_tokens) for on-policy slices; adds
+        # the loss with a step-equivalent of 1 over accumulation steps to the on- or off-policy accumulator.
+        # Inputs: model, inputs, num_items_in_batch. Outputs: loss tensor.
+        # Exceptions: those of the base step.
+        # Side effects: metrics and accumulators; cross-process gather.
         """Training step with on/off-policy loss tracking and completion stats."""
         buffer_steps = self.args.gradient_accumulation_steps
 
@@ -1711,6 +2018,16 @@ class IWOPDTrainer(_BaseTrainer):
         return loss
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: averages the mode's metrics; in training all-reduces (sum) the on/off-policy accumulators when distributed,
+        # adds on_policy_loss and off_policy_loss (rounded to 4 decimals) and resets them; prefixes eval metrics with "eval_";
+        # merges, calls the base log, clears metrics. On logging-interval steps (log_completions, step positive and a multiple
+        # of log_completions_steps) the main process prints a sample table and logs a "completions" table to wandb (active run)
+        # and/or trackio when reported, subsampling to num_completions_to_print rows; text logs are then cleared on all
+        # processes.
+        # Inputs: logs (dict), start_time (optional). Outputs: none.
+        # Exceptions: none expected.
+        # Side effects: logging backends, console output, collective all-reduce.
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}
 
