@@ -817,9 +817,8 @@ class IWOPDTrainer(_BaseTrainer):
         # HELPER: Returns the slicing boundary for loss tensors: with labels, the minimum over rows of attended length minus
         # completion-label count; otherwise the prompts tensor width.
         # Inputs: inputs dict. Outputs: int. Exceptions: KeyError if required keys are missing. Side effects: none.
-        # KNOWN ISSUE: the attended-length arithmetic gives the number of prompt tokens, not the padded column where the
-        # completion starts; for left-padded rows shorter than the batch width this boundary is too small, so loss tensors
-        # include extra leading positions (harmless only because labels there are -100).
+        # Because each row's completion starts at or after its prompt-token count, the minimum is a boundary that keeps
+        # every completion token; extra leading positions carry -100 labels.
         """Compute the earliest prompt boundary that still includes every completion token in the batch."""
         if inputs.get("labels") is not None:
             attention_mask = inputs["attention_mask"]
