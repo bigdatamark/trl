@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Module trl.kernels.logprob_entropy: fused Triton kernel computing, from already materialized logits, the
+# log-probability of selected tokens and the Shannon entropy per row in a single pass, with a matching
+# backward kernel. Exposes selective_log_softmax_and_entropy (re-exported by trl.kernels when Triton exists).
+# Main contents: _forward_kernel, _backward_kernel, _layout (stride helper), _LogProbEntropyFunction.
+# Import-time side effects: imports triton unconditionally (the module must only be imported when Triton is
+# available); defines _BLOCK_SIZE 1024.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +49,16 @@ def _forward_kernel(
     HAS_MASK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Triton kernel, one program per row of logits (rows indexed across a batch via rows_per_batch).
+    # Behavior: if a row mask is used and this row is masked out, write zeros to all four outputs and return.
+    # Otherwise stream the row in BLOCK_SIZE blocks, dividing logits by TEMPERATURE, maintaining an online
+    # max, a rescaled sum of exps (denominator) and a rescaled exp-weighted sum of logits. Then log Z = max + log
+    # denominator, expected logit = weighted sum over denominator; store target logit minus log Z as logprob, log Z
+    # minus expected logit as entropy, plus log Z and expected logit for backward.
+    # Inputs: pointers to logits, index, row mask and outputs; batch/row strides of logits, index and mask; n_cols,
+    # rows_per_batch, TEMPERATURE, HAS_MASK, BLOCK_SIZE. Outputs: none. Exceptions: none.
+    # Side effects: writes output buffers.
     row = tl.program_id(0).to(tl.int64)
     batch = row // rows_per_batch
     row_in_batch = row - batch * rows_per_batch
@@ -105,6 +123,14 @@ def _backward_kernel(
     HAS_LOGPROB_GRAD: tl.constexpr,
     HAS_ENTROPY_GRAD: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Triton kernel, grid (rows, column blocks), writing the gradient of the loss with respect to logits.
+    # Behavior: masked rows get zero gradient. Otherwise p = exp(logit / T minus log Z); gradient is upstream
+    # logprob grad times (one-hot index minus p) when present, plus upstream entropy grad times p times (expected
+    # logit minus logit / T) when present; divide by TEMPERATURE and store.
+    # Inputs: logits, index, mask, log_z, expected_logit, grad pointers, output pointer, strides, n_cols,
+    # rows_per_batch, TEMPERATURE, HAS_MASK, BLOCK_SIZE, HAS_LOGPROB_GRAD, HAS_ENTROPY_GRAD.
+    # Outputs: none. Exceptions: none. Side effects: writes grad_logits.
     row = tl.program_id(0).to(tl.int64)
     block = tl.program_id(1)
     batch = row // rows_per_batch
@@ -136,6 +162,11 @@ def _backward_kernel(
 
 
 def _layout(tensor: torch.Tensor) -> tuple[int, int, int, int]:
+    # [FUNCTION DOC]
+    # HELPER: Describe a tensor of rank 1, 2 or 3 as (batch_size, rows_per_batch, batch_stride, row_stride):
+    # rank 1 gives (1, 1, 0, 0); rank 2 gives (1, rows, 0, row stride); rank 3 and above use the first two dims and
+    # their strides.
+    # Inputs: tensor. Outputs: tuple of four ints. Exceptions: none. Side effects: none.
     if tensor.ndim == 1:
         return 1, 1, 0, 0
     if tensor.ndim == 2:
@@ -144,6 +175,10 @@ def _layout(tensor: torch.Tensor) -> tuple[int, int, int, int]:
 
 
 class _LogProbEntropyFunction(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd function wrapping the two kernels. Saves logits, index, log Z, expected logit and the row mask along
+    # with layout and stride metadata for the backward pass. Logits may be [V], [R, V] or [B, R, V] with arbitrary
+    # batch/row strides (last dim contiguous assumed).
     @staticmethod
     def forward(
         ctx,
@@ -152,6 +187,13 @@ class _LogProbEntropyFunction(torch.autograd.Function):
         temperature: float,
         row_mask: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: compute the logits layout and the index/mask strides (an index tensor stands in as dummy mask
+        # pointer when no mask is given); allocate float32 outputs shaped like logits without the last dim; launch the
+        # forward kernel on one program per row; disable grad materialization and save state.
+        # Inputs: ctx, logits, index (token ids, shape of logits minus last dim), temperature (float), row_mask
+        # (optional, same shape as index). Outputs: (logprobs, entropy) float32.
+        # Exceptions: Triton launch errors (e.g. non-CUDA tensors). Side effects: none.
         batch_size, rows_per_batch, logits_batch_stride, logits_row_stride = _layout(logits)
         _, _, index_batch_stride, index_row_stride = _layout(index.unsqueeze(-1))
         if row_mask is None:
@@ -198,6 +240,12 @@ class _LogProbEntropyFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_logprobs: torch.Tensor | None, grad_entropy: torch.Tensor | None):
+        # [FUNCTION DOC]
+        # Behavior: allocate a contiguous gradient like logits; substitute saved tensors as dummy pointers for missing
+        # upstream grads (with the HAS flags off), make the provided grads contiguous, and launch the backward kernel
+        # over (rows, column blocks). Return the logits gradient and None for index, temperature and mask.
+        # Inputs: ctx, grad_logprobs (or None), grad_entropy (or None). Outputs: tuple of 4.
+        # Exceptions: Triton launch errors. Side effects: none.
         logits, index, log_z, expected_logit, row_mask = ctx.saved_tensors
         batch_size, rows_per_batch, logits_batch_stride, logits_row_stride = ctx.layout
         n_rows = batch_size * rows_per_batch
@@ -252,5 +300,10 @@ def selective_log_softmax_and_entropy(
     temperature: float = 1.0,
     row_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Public entry point: apply _LogProbEntropyFunction to get per-row selected log-probabilities and entropies of
+    # the temperature-scaled logits; masked rows (row_mask zero) yield 0 and zero gradient.
+    # Inputs: logits, index, temperature (default 1.0), row_mask (optional). Outputs: (logprobs, entropy).
+    # Exceptions: as the autograd function. Side effects: none.
     """Compute selected log-probabilities and Shannon entropy in one pass over logits."""
     return _LogProbEntropyFunction.apply(logits, index, temperature, row_mask)
