@@ -1,3 +1,23 @@
+# [MODULE DOC]
+# Example training script for experimental SDPO (self-distillation policy optimization with reprompting) on GSM8K-style
+# math, using verifiable rewards and optional textual feedback passed to the trainer as privileged_context (from a
+# dataset column or synthesized from the reference answer/solution). Reports greedy answer accuracy on the eval split
+# before and after training.
+# Contents: SYSTEM_PROMPT (asks for reasoning in think tags and a final line of four hashes followed by the answer),
+# SDPOScriptArguments, ExampleSDPOConfig, data/feedback helpers, two reward functions, an accuracy-eval helper and
+# the main-guard script body.
+# Main-guard behavior: parses the three dataclasses with TrlParser; sets model_init_kwargs (revision, attention, dtype,
+# quantization only when set); loads from disk or Hub and requires a DatasetDict; optionally shuffles (seeded) and
+# caps the train split, maps it through _make_conversation removing original columns; does the same for the test
+# split only when eval is enabled; reward functions are the soft format reward and the accuracy reward; loads the
+# tokenizer (eos as pad if missing); builds SDPOTrainer from the model name with optional PEFT; adds
+# LogCompletionsCallback when eval is enabled and eval_num_prompts is non-zero; with an eval set, logs/saves
+# before-training accuracy metrics prefixed before_; trains and saves; with an eval set, logs/saves after_ metrics
+# and delta_ metrics (after minus before); optionally pushes; calls end.
+# Inputs: CLI args. Outputs: trained model and metric files in output_dir. Exceptions: ValueError for non-DatasetDict
+# datasets, rows without prompt text, or an unsupported feedback_from_solution. Side effects: downloads, training,
+# generation, file writes, optional Hub upload. Importing has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -90,6 +110,12 @@ SYSTEM_PROMPT = (
 
 @dataclass
 class SDPOScriptArguments(ScriptArguments):
+    # [CLASS DOC]
+    # ScriptArguments subclass adding: dataset_path (load_from_disk override), feedback_column (column forwarded as
+    # privileged_context), eval_num_prompts (default 8; 0 disables completion logging), accuracy_eval_num_examples
+    # (default 128), accuracy_eval_max_new_tokens (default 128), feedback_from_solution (None, final_answer or
+    # full_solution; synthesizes feedback when no feedback column), max_train_examples / max_eval_examples (optional caps)
+    # and dataset_shuffle_seed (default 42, used before capping). No methods.
     dataset_path: str | None = field(
         default=None,
         metadata={"help": "Optional local dataset path to load with `load_from_disk`. Overrides `dataset_name`."},
@@ -135,6 +161,8 @@ class SDPOScriptArguments(ScriptArguments):
 
 @dataclass
 class ExampleSDPOConfig(SDPOConfig):
+    # [CLASS DOC]
+    # SDPOConfig subclass that redeclares scale_rewards with default group (group, batch or none). No methods.
     scale_rewards: str = field(
         default="group",
         metadata={"help": "Reward normalization mode. Supported: `group`, `batch`, `none`."},
@@ -142,6 +170,12 @@ class ExampleSDPOConfig(SDPOConfig):
 
 
 def _make_solution_feedback(final_answer: str, worked_solution: str, feedback_from_solution: str | None) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Builds a feedback message telling the model its previous answer was wrong.
+    # Behavior: None mode returns None; final_answer returns a message with the correct final answer in the hash-mark
+    # format and an instruction to keep that format; full_solution returns a message embedding the worked solution.
+    # Inputs: final_answer (str), worked_solution (str), feedback_from_solution (str or None). Outputs: str or None.
+    # Exceptions: ValueError for any other mode. Side effects: none.
     if feedback_from_solution is None:
         return None
     if feedback_from_solution == "final_answer":
@@ -162,6 +196,19 @@ def _make_solution_feedback(final_answer: str, worked_solution: str, feedback_fr
 def _make_conversation(
     example: dict[str, Any], feedback_column: str | None, feedback_from_solution: str | None
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Converts a raw row into the SDPO format.
+    # Behavior: prompt is the existing prompt column, else a system (SYSTEM_PROMPT) plus user message from problem, else
+    # from question; raises if none. solution is the solution column, else the GSM8K answer normalized to its final number;
+    # added when found. privileged_context is taken from feedback_column when given and present, else an existing
+    # privileged_context column, else (when a solution exists) synthesized feedback using the worked solution (solution
+    # column, else the stripped raw answer, else the final answer in hash format) if feedback_from_solution is set.
+    # Inputs: example (dict), feedback_column (str or None), feedback_from_solution (str or None).
+    # Outputs: dict with prompt and optionally solution and privileged_context.
+    # Exceptions: ValueError when no prompt source exists or mode is unsupported. Side effects: none.
+    # KNOWN ISSUE: when a dataset has a solution column (full worked solutions, e.g. MATH-style), that whole text is used
+    # as the gold answer that _gsm8k_accuracy_reward compares for exact equality with the extracted final answer, so such
+    # rows can never be scored correct.
     prompt = example.get("prompt")
     if prompt is None and "problem" in example:
         prompt = [
@@ -206,12 +253,22 @@ def _make_conversation(
 
 
 def _normalize_gsm8k_answer(answer_text: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the text after the first four-hash marker with whitespace stripped and commas removed; when no marker
+    # exists, returns the stripped text unchanged. Inputs: answer_text (str). Outputs: str. Exceptions: none.
+    # Side effects: none.
     if "####" not in answer_text:
         return answer_text.strip()
     return answer_text.split("####", 1)[1].strip().replace(",", "")
 
 
 def _extract_predicted_answer(completion_text: str) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Extracts a final answer from a completion.
+    # Behavior: if a four-hash marker is present, returns the rest of that line stripped and without commas; otherwise
+    # returns the last number-like token (optional minus sign and dollar sign, digits with commas, optional decimals) with
+    # dollar signs and commas removed; None when no number is found.
+    # Inputs: completion_text (str). Outputs: str or None. Exceptions: none. Side effects: none.
     match = re.search(r"####\s*([^\n]+)", completion_text)
     if match:
         return match.group(1).strip().replace(",", "")
@@ -223,6 +280,11 @@ def _extract_predicted_answer(completion_text: str) -> str | None:
 
 
 def _gsm8k_accuracy_reward(completions, solution, **kwargs) -> list[float]:
+    # [FUNCTION DOC]
+    # HELPER: Reward function giving 1.0 when the extracted predicted answer exactly equals the gold solution string, else
+    # 0.0. Completions may be conversational (first message content used) or plain strings.
+    # Inputs: completions (list), solution (list of str, same length), extra kwargs ignored. Outputs: list of floats.
+    # Exceptions: ValueError if lengths differ (strict zip). Side effects: none.
     rewards = []
     for completion, gold in zip(completions, solution, strict=True):
         content = completion[0]["content"] if isinstance(completion, list) else completion
@@ -232,6 +294,10 @@ def _gsm8k_accuracy_reward(completions, solution, **kwargs) -> list[float]:
 
 
 def _gsm8k_soft_format_reward(completions, **kwargs) -> list[float]:
+    # [FUNCTION DOC]
+    # HELPER: Reward function giving 0.25 when the completion starts with a think block followed (after whitespace) by a
+    # four-hash answer line, else 0.0 (match anchored at the start, dot matches newlines).
+    # Inputs: completions (list), extra kwargs ignored. Outputs: list of floats. Exceptions: none. Side effects: none.
     pattern = r"<think>.*?</think>\s*####\s*[^\n]+"
     rewards = []
     for completion in completions:
@@ -243,6 +309,17 @@ def _gsm8k_soft_format_reward(completions, **kwargs) -> list[float]:
 def _run_accuracy_eval(
     trainer: SDPOTrainer, eval_dataset, max_new_tokens: int, num_examples: int | None, metric_prefix: str = "math_eval"
 ) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # HELPER: Greedy-decodes eval prompts and measures answer accuracy.
+    # Behavior: optionally keeps the first num_examples rows; renders prompts with the chat template when conversational;
+    # tokenizes them in one left-padded batch truncated to max_prompt_length without special tokens on the accelerator
+    # device; unwraps the model, switches to eval mode, generates greedily under no_grad (max_new_tokens, tokenizer
+    # pad/eos ids), restores train mode if it was training; decodes new tokens, wraps each as an assistant message and
+    # scores with _gsm8k_accuracy_reward against the solution column.
+    # Inputs: trainer (SDPOTrainer), eval_dataset (with prompt and solution), max_new_tokens (int), num_examples (int or
+    # None), metric_prefix (str, default math_eval). Outputs: dict with prefix/accuracy (mean reward) and prefix/num_scored.
+    # Exceptions: KeyError if eval rows lack solution; generation errors propagate.
+    # Side effects: GPU generation in a single batch; toggles model mode temporarily.
     if num_examples is not None:
         eval_dataset = eval_dataset.select(range(min(num_examples, len(eval_dataset))))
 

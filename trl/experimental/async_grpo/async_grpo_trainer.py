@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# AsyncGRPOTrainer and its data pipeline: asynchronous GRPO where a rollout worker (default: AsyncRolloutWorker child
+# process talking to a vLLM server) produces scored samples into a queue while the trainer consumes them, and weights
+# are synced back to vLLM every weight_sync_steps steps (NCCL full weights, or LoRA adapter files when possible).
+# Contents: _reduce_metric (logging-window reduction), protocols for pluggable rollout workers and weight transfer,
+# callbacks (step interval, optimizer timing, train begin, epoch stop), log_rollout_traces (trackio traces), the input
+# pipeline (RolloutQueueDataset -> FixedCountBatcher or TokenBudgetBatcher planners -> DataCollatorForRollout packer
+# using TreeRow tree packing), LoRA sync helpers (_iter_vllm_named_params, round_lora_rank,
+# validate_lora_for_vllm_sync, save_lora_adapter, select_adapter_sync) and the trainer itself.
+# Import-time side effects: imports peft and trackio when available; module logger; type aliases RewardFunc,
+# MetricValue, EnvironmentFactory; constant VLLM_LORA_RANKS.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,6 +91,12 @@ MetricValue = float | tuple[float, float]
 
 
 def _reduce_metric(key: str, values: list[MetricValue]) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Reduces one logging window of values for key (rules in docstring).
+    # Behavior: tuple values -> sum of numerators / sum of denominators (NaN when the denominator sums to 0). Otherwise the
+    # last path component split on "_" is checked: contains "total" -> sum, "max" -> max, "min" -> min, else mean.
+    # Inputs: key (str), values (non-empty list, uniform shape). Outputs: float.
+    # Exceptions: IndexError on empty values. Side effects: none.
     """Reduce one logging window into the number that gets logged.
 
     The value's shape and the key's suffix declare the reduction, so nothing has to be registered or configured:
@@ -106,13 +124,22 @@ def _reduce_metric(key: str, values: list[MetricValue]) -> float:
 
 
 class _SupportsReset(Protocol):
-    def reset(self, **kwargs) -> str | None: ...
+    # [CLASS DOC]
+    # Typing protocol for environments: must expose reset accepting keyword args and returning a str or None.
+    def reset(self, **kwargs) -> str | None:
+        # [FUNCTION DOC]
+        # Protocol stub: resets the environment for a new rollout given the dataset row fields; returns an optional
+        # observation appended to the prompt. Inputs: kwargs. Outputs: str or None. Side effects: implementation-defined.
+        ...
 
 
 EnvironmentFactory = Callable[[], _SupportsReset]
 
 
 class RolloutWorkerProtocol(Protocol):
+    # [CLASS DOC]
+    # Structural interface for a pluggable rollout worker (see docstring): attributes rollout_buffer and metrics_queue,
+    # methods start, stop, update_model_version, check_health. AsyncRolloutWorker satisfies it.
     """Interface a rollout worker must implement to be passed as `rollout_worker` to
     [`experimental.async_grpo.AsyncGRPOTrainer`].
 
@@ -136,23 +163,34 @@ class RolloutWorkerProtocol(Protocol):
     metrics_queue: queue.Queue | MPQueue
 
     def start(self) -> None:
+        # [FUNCTION DOC]
+        # Protocol stub: begin producing rollouts (called once on train begin after the initial sync). No return.
         """Begin producing rollouts. Called once on train begin, after the initial weight sync."""
         ...
 
     def stop(self) -> None:
+        # [FUNCTION DOC]
+        # Protocol stub: stop the worker and release resources (called on train end). No return.
         """Stop the worker and release its resources. Called on train end."""
         ...
 
     def update_model_version(self, model_version: int) -> None:
+        # [FUNCTION DOC]
+        # Protocol stub: receive the new live policy version (int) after a weight sync. No return.
         """Tell the worker which policy version is now live, so it can tag or discard stale samples."""
         ...
 
     def check_health(self, stale_after_s: float) -> None:
+        # [FUNCTION DOC]
+        # Protocol stub: raise if the worker crashed or produced nothing within stale_after_s seconds. No return.
         """Raise if the worker has crashed or stopped producing within `stale_after_s` seconds."""
         ...
 
 
 class WeightTransferProtocol(Protocol):
+    # [CLASS DOC]
+    # Structural interface for a pluggable weight-sync backend (see docstring): init_weight_transfer, pause, send_weights,
+    # resume, destroy. WeightTransferClient satisfies it; a no-op implementation disables trainer-side sync.
     """Interface a weight-sync backend must implement to be passed as `weight_transfer` to
     [`experimental.async_grpo.AsyncGRPOTrainer`].
 
@@ -162,41 +200,62 @@ class WeightTransferProtocol(Protocol):
     """
 
     def init_weight_transfer(self) -> None:
+        # [FUNCTION DOC]
+        # Protocol stub: one-time setup before the first sync (e.g. NCCL group). No return.
         """Set up the transfer (e.g. the NCCL group). Called once on train begin, before the first sync."""
         ...
 
     def pause(self) -> None:
+        # [FUNCTION DOC]
+        # Protocol stub: pause the inference server before weights are swapped. No return.
         """Pause the inference server before weights are swapped in."""
         ...
 
     def send_weights(self, iterator: Iterator[tuple[str, torch.Tensor]]) -> None:
+        # [FUNCTION DOC]
+        # Protocol stub: stream (name, tensor) pairs from iterator to the server. No return.
         """Stream `(name, tensor)` pairs from `iterator` to the inference server."""
         ...
 
     def resume(self) -> None:
+        # [FUNCTION DOC]
+        # Protocol stub: resume the inference server after the update. No return.
         """Resume the inference server after the weights are updated."""
         ...
 
     def destroy(self) -> None:
+        # [FUNCTION DOC]
+        # Protocol stub: release transfer resources at train end. No return.
         """Release transfer resources. Called on train end."""
         ...
 
 
 class StepIntervalCallback(TrainerCallback):
+    # [CLASS DOC]
+    # TrainerCallback calling fn (no arguments) at the end of every optimizer step whose global_step is a multiple of
+    # every_n_steps. Used for periodic weight sync and per-step metric flushing.
     """
     A callback that calls a function every N optimization steps.
     """
 
     def __init__(self, fn, every_n_steps: int):
+        # [FUNCTION DOC]
+        # Stores fn and every_n_steps. Inputs: fn (callable), every_n_steps (int). Outputs: none. Side effects: attributes.
         self.fn = fn
         self.every_n_steps = every_n_steps
 
     def on_step_end(self, _args, state, _control, **_kwargs):
+        # [FUNCTION DOC]
+        # Calls fn when state.global_step modulo every_n_steps is 0. Inputs: args, state, control, kwargs (only state used).
+        # Outputs: none. Exceptions: from fn; ZeroDivisionError if every_n_steps is 0. Side effects: those of fn.
         if state.global_step % self.every_n_steps == 0:
             self.fn()
 
 
 class _OptimizerTimeCallback(TrainerCallback):
+    # [CLASS DOC]
+    # HELPER: TrainerCallback measuring optimizer.step duration into trainer._step_optimizer_s (flushed per step by
+    # _log_step_metrics). State: _trainer, _t0 (perf_counter at pre-step).
     """Times the optimizer step, which `training_step` cannot see.
 
     Without it, clip + step + zero_grad land in the same unmeasured gap as the rollout-queue wait and get read as
@@ -204,26 +263,44 @@ class _OptimizerTimeCallback(TrainerCallback):
     """
 
     def __init__(self, trainer: "AsyncGRPOTrainer"):
+        # [FUNCTION DOC]
+        # HELPER: Stores the trainer and sets _t0 to None. Inputs: trainer. Outputs: none. Side effects: attributes.
         self._trainer = trainer
         self._t0 = None
 
     def on_pre_optimizer_step(self, _args, _state, _control, **_kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Records perf_counter into _t0. Inputs: callback args (unused). Outputs: none. Side effects: sets _t0.
         self._t0 = time.perf_counter()
 
     def on_optimizer_step(self, _args, _state, _control, **_kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Adds elapsed time since _t0 to trainer._step_optimizer_s.
+        # Inputs: callback args (unused). Outputs: none. Exceptions: TypeError if _t0 is None. Side effects: trainer state.
         self._trainer._step_optimizer_s += time.perf_counter() - self._t0
 
 
 class _TrainBeginCallback(TrainerCallback):
+    # [CLASS DOC]
+    # HELPER: One-shot on_train_begin setup (guarded by _fired): main process initializes weight transfer, all ranks run
+    # the initial _sync_weight, then main process starts the rollout worker.
     """Idempotent train-begin setup: NCCL group setup + cold weight sync to vLLM, then start the rollout worker.
     The weight sync must complete before the worker starts, which the ordering here guarantees.
     """
 
     def __init__(self, trainer: "AsyncGRPOTrainer"):
+        # [FUNCTION DOC]
+        # HELPER: Stores trainer and sets _fired False. Inputs: trainer. Outputs: none. Side effects: attributes.
         self._trainer = trainer
         self._fired = False
 
     def on_train_begin(self, _args, _state, _control, **_kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Returns if already fired; else marks fired, then on the main process calls weight_transfer
+        # .init_weight_transfer (if a backend exists), calls trainer._sync_weight on every rank (collective), and starts
+        # the rollout worker on the main process.
+        # Inputs: callback args (unused). Outputs: none. Exceptions: from setup/sync/start. Side effects: network, process
+        # spawn, model_version increment.
         if self._fired:
             return
         self._fired = True
@@ -235,6 +312,9 @@ class _TrainBeginCallback(TrainerCallback):
 
 
 class _EpochStopCallback(TrainerCallback):
+    # [CLASS DOC]
+    # HELPER: Stops training once trained distinct prompt groups (_groups_before_resume plus size of _trained_groups)
+    # reach target_groups; the boolean is sum-reduced across ranks so all ranks stop together.
     """Stop after `num_train_epochs` full passes over the prompt dataset.
 
     An epoch is counted in distinct prompt-groups actually trained (accumulated in the collator, which runs on the main
@@ -245,10 +325,16 @@ class _EpochStopCallback(TrainerCallback):
     """
 
     def __init__(self, trainer: "AsyncGRPOTrainer", target_groups: int):
+        # [FUNCTION DOC]
+        # HELPER: Stores trainer and target group count. Inputs: trainer, target_groups (int). Outputs: none.
         self._trainer = trainer
         self._target = target_groups
 
     def on_step_end(self, args, _state, control, **_kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Computes whether the target is reached on this rank, sum-reduces a 0/1 tensor across ranks; if any rank
+        # reached it, sets control.should_training_stop and, under the STEPS save strategy, control.should_save.
+        # Inputs: args, state (unused), control. Outputs: none. Exceptions: collective errors. Side effects: mutates control.
         acc = self._trainer.accelerator
         trained = self._trainer._groups_before_resume + len(self._trainer._trained_groups)
         reached = torch.tensor(int(trained >= self._target), device=acc.device)
@@ -261,6 +347,12 @@ class _EpochStopCallback(TrainerCallback):
 
 
 def log_rollout_traces(samples: list[RolloutSample], step: int, report_to: list[str], max_traces: int = 16) -> None:
+    # [FUNCTION DOC]
+    # Logs up to max_traces samples as trackio.Trace objects (messages = prompt + completion; metadata = sample metrics,
+    # advantage, group_id, model_version, prompt/completion token counts from completion_mask) under key "rollouts" at
+    # step. No-op if samples is empty, "trackio" not in report_to, or trackio unavailable.
+    # Inputs: samples, step, report_to, max_traces (default 16). Outputs: none.
+    # Exceptions: none (all errors logged as warnings). Side effects: trackio logging.
     """Log rollout samples to trackio as inspectable traces (prompt + completion + reward/advantage per sample).
 
     Call from rank 0 during training, where the HF trackio callback has already initialised the run; the traces then
@@ -301,6 +393,13 @@ def log_rollout_traces(samples: list[RolloutSample], step: int, report_to: list[
 
 
 class RolloutQueueDataset(torch.utils.data.IterableDataset):
+    # [CLASS DOC]
+    # IterableDataset (main process only) that pulls RolloutSamples from the worker queue, drops stale ones, records
+    # queue/staleness metrics into the trainer's shared metric sink and yields sample dicts. Also samples traces for
+    # trackio: for policy versions divisible by _trace_log_interval (8), buffers _traces_per_log (8) samples once per
+    # version and hands them to a daemon thread via a bounded queue (maxsize 4, drop on full).
+    # State: queue, model_version_fn, check_health_fn, stale_after_s, metrics, wait_s (accumulated blocking time, reset by
+    # the trainer), max_staleness, poll_interval_s, report_to, trace buffer/queue state.
     def __init__(
         self,
         rollout_queue,
@@ -312,6 +411,11 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
         poll_interval_s=5.0,
         report_to=None,
     ):
+        # [FUNCTION DOC]
+        # Stores arguments (max_staleness default 3, poll_interval_s default 5.0, report_to default empty list), initializes
+        # trace state and starts the "rollout-trace-logger" daemon thread running _drain_traces.
+        # Inputs: rollout_queue, model_version_fn, check_health_fn, stale_after_s, metrics, max_staleness, poll_interval_s,
+        # report_to. Outputs: none. Exceptions: none. Side effects: starts a thread.
         self.queue = rollout_queue
         self.model_version_fn = model_version_fn
         self.check_health_fn = check_health_fn
@@ -342,6 +446,10 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
         threading.Thread(target=self._drain_traces, name="rollout-trace-logger", daemon=True).start()
 
     def _drain_traces(self):
+        # [FUNCTION DOC]
+        # HELPER: Infinite loop: takes (samples, step, context) from the trace queue and runs log_rollout_traces inside the
+        # captured contextvars context (so trackio's run is visible).
+        # Inputs/Outputs: none. Exceptions: none expected (trace logging swallows errors). Side effects: trackio logging.
         while True:
             samples, step, ctx = self._trace_queue.get()
             # Replay the main-thread context captured at enqueue: trackio's run lives in a ContextVar this daemon
@@ -349,6 +457,14 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
             ctx.run(log_rollout_traces, samples, step=step, report_to=self.report_to)
 
     def __iter__(self):
+        # [FUNCTION DOC]
+        # Infinite generator. For each sample: blocks on queue.get with poll_interval_s timeout, calling check_health_fn on
+        # every timeout (never returns on empty); accumulates wait into wait_s and logs waits over 1 s. Computes staleness =
+        # current version - sample version; if above max_staleness logs, appends sample/dropped_stale_total and skips.
+        # Otherwise appends sample/rollout_queue_size, sample/time_in_queue_s (if enqueued_at set), staleness mean/max, handles
+        # trace sampling, and yields a dict with input_ids, completion_mask, old_log_probs, advantage, group_id, metrics.
+        # Inputs: none. Outputs: iterator of dicts. Exceptions: RuntimeError from check_health_fn.
+        # Side effects: metric sink appends, logging, trace queue writes.
         while True:
             t0 = time.time()
             while True:
@@ -408,6 +524,9 @@ class RolloutQueueDataset(torch.utils.data.IterableDataset):
 
 
 class FixedCountBatcher(torch.utils.data.IterableDataset):
+    # [CLASS DOC]
+    # Planner IterableDataset emitting micro-batches of a fixed sample count partitioned into num_processes TreeRows by
+    # LPT on attention-cost load (see docstring). State: dataset, num_processes, microbatch_size.
     """Fixed-count batcher (the planner) wrapping [`RolloutQueueDataset`].
 
     Buffers `microbatch_size` (= `per_device_train_batch_size × num_processes`) samples, then partitions them across
@@ -430,11 +549,19 @@ class FixedCountBatcher(torch.utils.data.IterableDataset):
     """
 
     def __init__(self, dataset: "RolloutQueueDataset", num_processes: int, microbatch_size: int):
+        # [FUNCTION DOC]
+        # Stores dataset, num_processes and microbatch_size. Outputs: none. Side effects: none.
         self.dataset = dataset
         self.num_processes = num_processes
         self.microbatch_size = microbatch_size
 
     def __iter__(self):
+        # [FUNCTION DOC]
+        # Buffers microbatch_size samples, groups them by group_id (insertion order), repeatedly splits the largest group into
+        # two halves until there are at least num_processes groups, builds a TreeRow per group to price its load, then assigns
+        # groups in descending load to the currently least loaded output row (adding all its samples). Yields the list of
+        # num_processes TreeRows and resets the buffer. Leftover samples at source end are never emitted (source is infinite).
+        # Inputs: none. Outputs: iterator of lists of TreeRow. Exceptions: none expected. Side effects: consumes the source.
         batch = []
         for sample in self.dataset:
             batch.append(sample)
@@ -462,6 +589,9 @@ class FixedCountBatcher(torch.utils.data.IterableDataset):
 
 
 class TokenBudgetBatcher(torch.utils.data.IterableDataset):
+    # [CLASS DOC]
+    # Planner IterableDataset forming micro-batches of num_processes TreeRows under a per-row unique-token and trained-token
+    # budget (see docstring). State: dataset, num_processes, token_budget, metrics (shared sink).
     """Token-budgeted dynamic batcher (the planner) wrapping [`RolloutQueueDataset`].
 
     Keeps `num_processes` open rows (one per DP rank) and pulls single samples from the source one at a time, dropping
@@ -494,12 +624,20 @@ class TokenBudgetBatcher(torch.utils.data.IterableDataset):
     """
 
     def __init__(self, dataset: "RolloutQueueDataset", num_processes: int, token_budget: int, metrics: dict):
+        # [FUNCTION DOC]
+        # Stores dataset, num_processes, token_budget and metrics. Outputs: none. Side effects: none.
         self.dataset = dataset
         self.num_processes = num_processes
         self.token_budget = token_budget
         self.metrics = metrics  # the trainer's sink, for the drop counter below
 
     def __iter__(self):
+        # [FUNCTION DOC]
+        # Starts with num_processes empty TreeRows. For each sample: if its raw length exceeds token_budget, warns, appends
+        # batch/dropped_oversize_total and skips. Otherwise loops: ask _place for a row; if found, add and move on; if None,
+        # yield the current rows and start fresh empty rows, then retry (an empty row always fits).
+        # Inputs: none. Outputs: iterator of lists of TreeRow (all non-empty). Exceptions: none expected.
+        # Side effects: metric appends, logging.
         rows = [TreeRow() for _ in range(self.num_processes)]
         for sample in self.dataset:
             n = len(sample["input_ids"])
@@ -522,6 +660,11 @@ class TokenBudgetBatcher(torch.utils.data.IterableDataset):
                 rows = [TreeRow() for _ in range(self.num_processes)]
 
     def _place(self, rows: list[TreeRow], sample: dict[str, Any]) -> TreeRow | None:
+        # [FUNCTION DOC]
+        # HELPER: Chooses a row for sample. First the least loaded fitting row among rows already containing its group_id;
+        # if none fits and the sample has home rows and every row is non-empty, returns None (close micro-batch); otherwise
+        # the least loaded fitting row overall (None if none fit).
+        # Inputs: rows, sample. Outputs: TreeRow or None. Exceptions: none. Side effects: none.
         """Pick the row `sample` belongs in, or `None` when the micro-batch has to close first.
 
         A sample is cheapest in a row that already holds its `group_id`, so those rows get first refusal — all of them,
@@ -531,6 +674,9 @@ class TokenBudgetBatcher(torch.utils.data.IterableDataset):
         """
 
         def least_loaded(candidates: list[TreeRow]) -> TreeRow | None:
+            # [FUNCTION DOC]
+            # HELPER: Among candidates that fit the sample within token_budget, returns the one with minimal load, or None.
+            # Inputs: candidates. Outputs: TreeRow or None. Side effects: none.
             return min(
                 (row for row in candidates if row.fits(sample, self.token_budget)),
                 key=lambda row: row.load,
@@ -547,14 +693,23 @@ class TokenBudgetBatcher(torch.utils.data.IterableDataset):
 
 
 class _EmptyIterableDataset(torch.utils.data.IterableDataset):
+    # [CLASS DOC]
+    # HELPER: IterableDataset yielding nothing, used on non-main ranks where the dispatching dataloader never iterates.
     """Placeholder for non-rank-0 processes. Never actually iterated."""
 
     def __iter__(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns an empty iterator. Inputs/outputs trivial; no exceptions or side effects.
         return iter([])
 
 
 @dataclass
 class DataCollatorForRollout(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator (the packer) turning one pre-partitioned micro-batch (list of num_processes TreeRows) into a
+    # rectangular padded batch (see docstring). Fields: pad_token_id, num_processes (default 1), return_tensors "pt",
+    # groups_trained (shared set of trained group ids, used for epoch counting), metrics (shared sink), token_budget
+    # (0 when batching by count). Inherits DataCollatorMixin (dispatches to torch_call).
     """
     Padding-free collator (the packer) for rollout samples. Packs a micro-batch into `num_processes` rows (one per DP
     rank) and, for each row, the flat list of loss terms taken over it: which packed position predicts which target,
@@ -590,6 +745,14 @@ class DataCollatorForRollout(DataCollatorMixin):
     token_budget: int = 0
 
     def torch_call(self, examples: list[Any]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Packs each row with TreeRow.pack and pads every key across rows to the longest (padding: pad_token_id for input_ids,
+        # -100 for shift_labels, -1 for token_index and tree index/cu_seqlens keys, 0 otherwise); adds attention_mask (1 for
+        # real positions). Adds group ids to groups_trained. Adds per-rank-repeated tensors of length num_processes:
+        # global_n_tokens (total loss terms), global_n_forward_tokens (total packed tokens), mean_seq_len (packed tokens per
+        # sample). Logs metrics via _log_metrics.
+        # Inputs: examples (length-1 list holding the rows). Outputs: dict of tensors.
+        # Exceptions: ValueError if examples does not have exactly one element. Side effects: groups_trained and metrics updates.
         # The dataloader uses batch_size=1 over a planner that pre-partitions each micro-batch into `num_processes`
         # rows, so `examples` is a length-1 list holding that single micro-batch (one row per rank).
         (rows,) = examples
@@ -620,6 +783,13 @@ class DataCollatorForRollout(DataCollatorMixin):
         return batch
 
     def _log_metrics(self, rows: list[TreeRow], all_examples: list[dict[str, Any]], padded: torch.Tensor) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Appends to the metric sink: per-sample forwarded/trained token mean and max, batch/masked_token_frac rate,
+        # nan-aware mean of every per-sample metric key (union of keys), samples_per_row, row token mean/max, row_imbalance
+        # (max load / mean load), packing_ratio (raw tokens, unique tokens), row_fill_frac when token_budget is set, and
+        # pad_frac (padded positions over total) from the attention mask.
+        # Inputs: rows, all_examples, padded (attention mask). Outputs: none. Exceptions: ZeroDivisionError on empty input or
+        # zero total load. Side effects: metric sink.
         """Append this micro-batch's sample and packing metrics straight into the trainer's sink.
 
         Rank 0 holds the whole micro-batch, so the per-sample rewards can be aggregated here instead of being packed
@@ -661,6 +831,12 @@ class DataCollatorForRollout(DataCollatorMixin):
 
 
 def _iter_vllm_named_params(model: torch.nn.Module) -> Iterator[tuple[str, torch.nn.Parameter]]:
+    # [FUNCTION DOC]
+    # HELPER: Yields (vLLM checkpoint name, parameter) for parameters sent to vLLM in merged sync.
+    # Behavior: skips frozen params unless the model is PEFT; strips "module." prefix and "_checkpoint_wrapped_module.",
+    # then "base_model.model." prefix and ".base_layer"; under PEFT skips names containing the adapter prefix (e.g. lora_);
+    # skips "original_module" entries and removes "modules_to_save.default.". Parameters yielded as-is (possibly DTensor).
+    # Inputs: model. Outputs: iterator. Exceptions: none. Side effects: none.
     """Yield `(name, param)` for every parameter the vLLM server receives, under its base-checkpoint name.
 
     The weight manifest built once in `__init__` and the stream sent by `_streaming_iter` must agree
@@ -694,6 +870,9 @@ VLLM_LORA_RANKS = (1, 8, 16, 32, 64, 128, 256, 320, 512)
 
 
 def round_lora_rank(adapter_rank: int) -> int:
+    # [FUNCTION DOC]
+    # Returns the smallest value in VLLM_LORA_RANKS at least adapter_rank.
+    # Inputs: adapter_rank (int). Outputs: int. Exceptions: ValueError if above 512. Side effects: none.
     """
     Round a LoRA rank up to the smallest `max_lora_rank` vLLM accepts.
 
@@ -724,6 +903,11 @@ def round_lora_rank(adapter_rank: int) -> int:
 
 
 def validate_lora_for_vllm_sync(model: "PeftModel") -> "LoraConfig":
+    # [FUNCTION DOC]
+    # Checks that the single active adapter is a plain LoRA servable by vLLM and returns its config.
+    # Rejects (ValueError): not exactly one active adapter, non-LoraConfig, modules_to_save, use_dora, bias other than
+    # "none", target_parameters, or target_modules (string treated as one entry) mentioning lm_head or embed_tokens.
+    # Inputs: model (PeftModel). Outputs: LoraConfig. Side effects: none.
     """
     Return the active adapter's config, checking it can be served as a plain vLLM LoRA adapter.
 
@@ -788,6 +972,15 @@ def validate_lora_for_vllm_sync(model: "PeftModel") -> "LoraConfig":
 
 
 def save_lora_adapter(model: "PeftModel", accelerator: Accelerator, adapter_name: str, dest_dir: str) -> None:
+    # [FUNCTION DOC]
+    # Collective adapter save (all ranks call it).
+    # Behavior: selects state_dict entries containing "lora_" and ".<adapter_name>."; moves CPU shards to the accelerator
+    # device, materializes DTensors with full_tensor, stores detached CPU copies. Non-main ranks return there. Main rank:
+    # recreates a hidden temp dir ".<basename>.tmp" next to dest_dir, save_pretrained with only that adapter and the
+    # materialized state dict (safetensors), picks the saved directory (temp root for "default", else its adapter
+    # subdirectory), deletes dest_dir and renames into place, then removes the temp dir.
+    # Inputs: model, accelerator, adapter_name, dest_dir. Outputs: none.
+    # Exceptions: OSError from filesystem ops; collective errors. Side effects: GPU all-gathers, files written/deleted.
     """
     Save one PEFT adapter to `dest_dir`, gathering sharded parameters as needed.
 
@@ -837,6 +1030,14 @@ def save_lora_adapter(model: "PeftModel", accelerator: Accelerator, adapter_name
 
 
 def select_adapter_sync(server_info: dict, model: "PeftModel", args: AsyncGRPOConfig) -> bool:
+    # [FUNCTION DOC]
+    # Decides adapter-only sync (True) vs merged sync (False).
+    # Behavior: False with a warning when server lora_config is None, or data_parallel_size above 1, or
+    # validate_lora_for_vllm_sync fails. Computes adapter rank as max of r and rank_pattern values; raises if the server
+    # max_lora_rank is lower (suggesting round_lora_rank); raises if server max_loras is below max_staleness + 2.
+    # Otherwise True.
+    # Inputs: server_info (dict), model, args. Outputs: bool.
+    # Exceptions: ValueError for rank/slot misconfiguration; KeyError on malformed server_info. Side effects: logging.
     """
     Decide whether weight syncs push the adapter alone instead of merged base weights.
 
@@ -908,6 +1109,21 @@ def select_adapter_sync(server_info: dict, model: "PeftModel", args: AsyncGRPOCo
 
 
 class AsyncGRPOTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Asynchronous GRPO trainer built on _BaseTrainer (transformers Trainer). Main process owns the rollout worker,
+    # rollout queue, vLLM client and weight transfer; all ranks train on tree-packed rows dispatched from rank 0.
+    # Loss: token-level clipped PPO surrogate with asymmetric epsilon (no KL/ref model), normalized by global trained token
+    # count per rank and gradient accumulation (loss_is_scaled_for_ga True), plus optional MoE aux loss.
+    # Key state: epsilon_low/high, temperature, eos_token_ids, router_aux_loss_coef/aux_loss_enabled, _is_vlm,
+    # _metrics sink per mode, per-step accumulators (_step_*), model_version, LoRA sync state (_lora_sync, _lora_name
+    # "trl-policy", _lora_dir under output_dir/.vllm_lora, _adapter_name), epoch stop bookkeeping (_trained_groups,
+    # _groups_before_resume, _epoch_stop_groups), rollout_worker, rollout_queue, weight_transfer, vllm_client.
+    # Flow: __init__ builds model/worker/callbacks; on train begin initial sync and worker start; get_train_dataloader
+    # builds the queue pipeline; compute_loss per micro-batch; callbacks sync weights and flush metrics; log reduces
+    # metrics; _save_checkpoint and _inner_training_loop handle resume state and teardown.
+    # KNOWN ISSUE: the class docstring says extra train_dataset columns are ignored, but the rollout worker forwards every
+    # non-prompt column to reward functions as reward kwargs; it also says the default scheduler is linear with warmup
+    # while AsyncGRPOConfig defaults lr_scheduler_type to constant.
     """
     Trainer for the Group Relative Policy Optimization (GRPO) method. This algorithm was initially proposed in the
     paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language
@@ -1060,6 +1276,33 @@ class AsyncGRPOTrainer(_BaseTrainer):
         rollout_worker: RolloutWorkerProtocol | None = None,
         weight_transfer: WeightTransferProtocol | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior, in order: default args named "<model basename>-AsyncGRPO"; sets epsilons (epsilon_high falls back to
+        # epsilon) and temperature; registers tree attention; seeds; loads the model from path with attn_implementation tree
+        # attention and model_init_kwargs defaults (trust_remote_code, dtype). Rejects use_liger_kernel, layer types other than
+        # full/sliding attention, and attention sinks. Resolves router_aux_loss_coef (config value or 0.0 when unset; raises if
+        # set on a non-MoE model) and aux_loss_enabled. For VLMs freezes everything except the text model and output
+        # embeddings. Adds the fused lm head (log_probs and entropy at the training temperature). Loads tokenizer if needed,
+        # sets pad token to eos when missing and mirrors pad id to model configs; collects eos ids (generation config plus the
+        # tokenizer's). Applies PEFT (validating type and not already PEFT), rejects adapters on lm_head, enables input grads
+        # under gradient checkpointing. Normalizes reward_funcs to a list. Without a dataset requires a single
+        # environment_factory and positive max_steps and builds a placeholder dataset of empty user prompts
+        # (per_device_train_batch_size times gradient_accumulation_steps rows). Calls the base constructor.
+        # Then: peak FLOPs for MFU; epoch-driven stop when max_steps is unset and the dataset has a length (target groups =
+        # ceil(epochs x prompts); max_steps set to a ceiling assuming max_tool_calling_iterations+1 or 32 rows per
+        # conversation); auto max_inflight_tasks = max(max_staleness, 1) x samples per step; forces ignore_data_skip True
+        # (warning if it was False); initializes metric and step state. Main process creates VLLMClient. For PEFT without an
+        # injected weight_transfer, rank 0 runs _init_lora_sync and the result (or exception) is broadcast and raised on all.
+        # Main process: weight_transfer = injected, else None for LoRA sync, else WeightTransferClient with a manifest of
+        # names/dtypes/shapes from _iter_vllm_named_params; rollout_worker = injected or AsyncRolloutWorker built from args;
+        # rollout_queue from the worker. Other ranks set these to None. Adds callbacks: optimizer timing, train begin,
+        # weight sync every weight_sync_steps, step metrics every step, and epoch stop when applicable.
+        # Inputs: model (str path/id), reward_funcs, args, train_dataset, processing_class, callbacks, optimizers,
+        # peft_config, tools, environment_factory, rollout_worker, weight_transfer.
+        # Outputs: none.
+        # Exceptions: NotImplementedError (liger), ValueError (unsupported architecture, MoE coef, PEFT conflicts, missing
+        # dataset requirements, LoRA server misconfig), ImportError/TypeError (peft). Side effects: model loading, network
+        # probing of vLLM, broadcast collectives, mutates args (max_steps, max_inflight_tasks, ignore_data_skip).
         # Args
         if args is None:
             model_name = model.split("/")[-1]
@@ -1406,6 +1649,10 @@ class AsyncGRPOTrainer(_BaseTrainer):
             self.add_callback(_EpochStopCallback(self, self._epoch_stop_groups))
 
     def _init_lora_sync(self, model: "PeftModel") -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Main process only: waits for the server, fetches server info and returns select_adapter_sync's decision,
+        # logging the adapter naming and directory when enabled.
+        # Inputs: model. Outputs: bool. Exceptions: TimeoutError, ValueError, HTTP errors. Side effects: network, logging.
         """Probe the server and decide the sync mode. Main process only; the decision itself is [`select_adapter_sync`]."""
         self.vllm_client.wait_for_server_ready()
         lora_sync = select_adapter_sync(self.vllm_client.get_server_info(), model, self.args)
@@ -1417,6 +1664,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
         return lora_sync
 
     def get_train_dataloader(self) -> DataLoader:
+        # [FUNCTION DOC]
+        # Builds the training dataloader. Main process: RolloutQueueDataset (stored as _rollout_dataset), resolves token_budget
+        # from the server's max_model_len when None, wraps in TokenBudgetBatcher if the budget is positive else
+        # FixedCountBatcher with per_device_train_batch_size x num_processes samples. Other ranks: _EmptyIterableDataset.
+        # Returns accelerator.prepare of a DataLoader with batch_size 1, num_workers 0 and a DataCollatorForRollout sharing the
+        # trainer's groups set and metric sink (token_budget clamped to at least 0).
+        # Inputs: none. Outputs: DataLoader. Exceptions: server errors. Side effects: may mutate args.token_budget.
         num_processes = self.accelerator.num_processes
         if self.accelerator.is_main_process:
             dataset = RolloutQueueDataset(
@@ -1473,6 +1727,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
         )
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets _signature_columns (if unset) to the packed batch keys produced by the collator so the base Trainer
+        # does not drop them. Inputs/Outputs: none. Side effects: sets attribute.
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs (usually, "input_ids"
         if self._signature_columns is None:
@@ -1495,6 +1752,21 @@ class AsyncGRPOTrainer(_BaseTrainer):
             ]
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Per micro-batch on each rank (one packed row).
+        # Behavior: strips inter-rank padding using attention_mask (sequence keys) and non-negative filters (token_index and
+        # tree index keys), unsqueezing to batch 1; takes max seqlens from tree_max_seqlens. Forwards with fused_lm_head,
+        # shift_labels, tree kwargs and output_router_logits when aux loss is enabled; gathers log_probs and entropy at
+        # token_index (timed). Loss: ratio = exp(logp - old logp); per-term loss = negative min(ratio x A, clamp(ratio,
+        # 1 - epsilon_low, 1 + epsilon_high) x A); summed, divided by max(global_n_tokens / world_size, 1) and by
+        # current_gradient_accumulation_steps; adds router_aux_loss_coef x aux_loss / GA steps when enabled.
+        # Metrics (no grad, all-reduced sums over terms): ratio, kl (k3 estimator), entropy, clip_ratio low_mean/high_mean/
+        # region_mean (low: ratio below 1-eps with negative advantage; high: above 1+eps with positive advantage); per-sample
+        # low clip fraction nan-min and high nan-max gathered across ranks (clip_ratio/low_min, high_max); aux_loss mean across
+        # ranks. Accumulates step counters (forward tokens, trained tokens, length-weighted mean length, samples, forward time).
+        # Inputs: model, inputs (collator batch slice), return_outputs and num_items_in_batch (ignored).
+        # Outputs: scalar loss tensor (outputs never returned).
+        # Exceptions: collective/forward errors. Side effects: metric sink appends, collectives, step accumulators.
         mask_bool = inputs["attention_mask"].bool()
         selected = inputs["token_index"] >= 0
         input_ids = inputs["input_ids"][mask_bool].unsqueeze(0)
@@ -1595,6 +1867,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
             num_seq = int(segment_id.max()) + 1  # completions in this rank's row
 
             def seg_sum(vals):  # per-completion segment sum over the flat selection
+                # [FUNCTION DOC]
+                # HELPER: Sums vals per sample index (segment_id) into a zero vector of length num_seq via index-add.
+                # Inputs: vals tensor. Outputs: tensor of length num_seq. Side effects: none.
                 return torch.zeros(num_seq, device=vals.device).index_add_(0, segment_id, vals)
 
             seq_tokens = seg_sum(torch.ones_like(coef_1, dtype=torch.float32))
@@ -1625,6 +1900,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
         return loss
 
     def training_step(self, model, inputs, num_items_in_batch):
+        # [FUNCTION DOC]
+        # Wraps the base training_step, counting micro-batches and accumulating wall time into _current_train_step_time.
+        # Inputs: model, inputs, num_items_in_batch. Outputs: base loss output. Side effects: step accumulators.
         time_before = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
         self._step_microbatches += 1
@@ -1632,6 +1910,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
         return output
 
     def _log_step_metrics(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Called after each optimizer step. Appends perf/fwd_bwd_s, fwd_s, optimizer_s, step_s (time since previous
+        # call; skipped on first), batch/microbatches, forwarded/trained tokens and samples per step. Main process also flushes
+        # perf/rollout_wait_s (resetting the dataset's wait_s) and batch/groups_per_step. When tokens were forwarded, computes
+        # FLOPs per token at the mean sequence length and logs forwarded_tok_s and MFU on fwd/bwd time and on wall-clock step
+        # time (plus trained_tok_s wall clock); MFU only when peak FLOPs are known. Resets all step accumulators.
+        # Inputs/Outputs: none. Exceptions: ZeroDivisionError if fwd_bwd_s is 0 with tokens. Side effects: metric sink.
         """Flush one optimizer step's worth of accounting: the time budget, what the batch held, and throughput.
 
         Called from `on_step_end`, i.e. after `optimizer.step()`, so `perf/optimizer_s` covers this step.
@@ -1696,6 +1981,11 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self._step_samples = 0.0
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Main process drains the worker's metrics_queue into the train sink (even in eval mode). Reduces each key of the
+        # current mode's sink with _reduce_metric after dropping NaN floats (None if nothing left), prefixes "eval_" in eval
+        # mode, merges into logs, calls the base log and clears that mode's sink.
+        # Inputs: logs (dict), start_time. Outputs: none. Side effects: logging backends, clears sink.
         mode = "train" if self.model.training else "eval"
         if self.accelerator.is_main_process and self.rollout_worker:
             while True:
@@ -1721,6 +2011,11 @@ class AsyncGRPOTrainer(_BaseTrainer):
         self._metrics[mode].clear()
 
     def _streaming_iter(self):
+        # [FUNCTION DOC]
+        # HELPER: Generator over _iter_vllm_named_params of the unwrapped model yielding (name, full tensor): DTensors are
+        # all-gathered via full_tensor (a collective, so every rank must iterate), others detached; moved to the accelerator
+        # device when needed.
+        # Inputs: none. Outputs: iterator. Side effects: collectives, temporary GPU memory.
         # Iterate parameters one at a time. For FSDP2 (DTensor), full_tensor() all-gathers just this parameter across
         # FSDP ranks, then frees it once the generator advances — avoiding materializing the full model in memory.
         device = self.accelerator.device
@@ -1731,6 +2026,9 @@ class AsyncGRPOTrainer(_BaseTrainer):
             yield name, full
 
     def _sync_weight(self):
+        # [FUNCTION DOC]
+        # Runs _sync_weight_lora or _sync_weight_merged and logs perf/weight_sync_s and its pause, barrier and transfer phases.
+        # Inputs/Outputs: none. Exceptions: from the sync path. Side effects: metrics, logging, server state, model_version.
         """Publish the current policy to vLLM, then bump the version the rollout worker requests.
 
         Dispatches to the sync mode picked at init, logging `perf/weight_sync_*` for both here so they stay comparable.
@@ -1749,6 +2047,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
         logger.info(f"Weight sync: done. Total {weight_sync_s:.1f}s")
 
     def _sync_weight_merged(self, t0: float) -> tuple[float, float, float]:
+        # [FUNCTION DOC]
+        # Main pauses the server via weight_transfer (if any); barrier; merges the PEFT adapter if present; main streams
+        # weights through weight_transfer.send_weights while other ranks drain _streaming_iter for the collectives (main
+        # without a backend also drains); unmerges in finally; barrier; main resumes, increments model_version and notifies the
+        # worker.
+        # Inputs: t0. Outputs: (t_pause, t_barrier, t_transfer) timestamps. Exceptions: transfer errors.
+        # Side effects: network/NCCL, temporary adapter merge, model_version.
         """Fold the adapter, if any, into the base weights and stream every parameter to vLLM over NCCL.
 
         Args:
@@ -1800,6 +2105,13 @@ class AsyncGRPOTrainer(_BaseTrainer):
         return t_pause, t_barrier, t_transfer
 
     def _sync_weight_lora(self, t0: float) -> tuple[float, float, float]:
+        # [FUNCTION DOC]
+        # Publishes version N+1 as adapter "<lora_name>-v<N+1>" under _lora_dir. Main pauses the server; barrier; all ranks
+        # call save_lora_adapter; barrier; main loads the adapter on the server, resumes, unloads version N+1-(max_staleness+1)
+        # when positive, deletes the directory of the version before that when above 1, sets model_version and notifies the
+        # worker.
+        # Inputs: t0. Outputs: (t_pause, t_barrier, t_transfer). Exceptions: HTTP/filesystem errors.
+        # Side effects: files, server adapter registry, model_version.
         """Publish the trained adapter to vLLM under a fresh versioned name, moving no base weight.
 
         Each sync publishes `{lora_name}-v{N}` instead of overwriting the previous adapter in place, because
@@ -1858,6 +2170,11 @@ class AsyncGRPOTrainer(_BaseTrainer):
         return t_pause, t_barrier, t_transfer
 
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # When main and the worker is the default AsyncRolloutWorker, writes rollout_state.json into the checkpoint folder
+        # with prompt_index (dataset_start_index plus the smallest group id not yet trained) and model_version, then calls the
+        # base _save_checkpoint.
+        # Inputs: model, trial. Outputs: none. Exceptions: OSError. Side effects: files written.
         if self.accelerator.is_main_process and isinstance(self.rollout_worker, AsyncRolloutWorker):
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
             checkpoint_dir = os.path.join(self._get_output_dir(trial=trial), checkpoint_folder)
@@ -1873,6 +2190,14 @@ class AsyncGRPOTrainer(_BaseTrainer):
         super()._save_checkpoint(model, trial)
 
     def _inner_training_loop(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # With the default worker: resets dataset_start_index and _groups_before_resume to 0; when resume_from_checkpoint is
+        # in kwargs, restores prompt_index (as start index and groups-before-resume) and model_version from rollout_state.json
+        # if present and the dataset is a map-style Dataset (warning otherwise). Runs the base loop; finally on main stops the
+        # worker and destroys the weight transfer.
+        # KNOWN ISSUE: the leading comment refers to _StartRolloutWorkerCallback, which does not exist; the worker is started
+        # by _TrainBeginCallback.
+        # Inputs: base loop args/kwargs. Outputs: base result. Exceptions: propagates. Side effects: worker lifecycle.
         # When resuming, pass the saved prompt position to the worker before _StartRolloutWorkerCallback fires.
         # Skipped for IterableDataset since len() isn't available on streaming datasets.
         # Always reset first so a stale value from a prior train() call is never carried over.

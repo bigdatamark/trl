@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Experimental GOLD (General Online Logit Distillation) trainer: on-policy distillation that works across model
+# families, including different tokenizers (via Universal Logit Distillation, ULD) and vision-language models.
+# Main contents: print_prompt_completions_sample_uld (rich console table), build_teacher_inputs_from_texts (teacher
+# re-tokenization with byte offsets), ULDLoss (cross-tokenizer loss module), and GOLDTrainer (SFTTrainer subclass
+# with buffered on/off-policy batches, optional vLLM generation, generalized JSD or ULD loss, and VLM support).
+# Import-time side effects: conditional imports of peft, rich and wandb.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -104,6 +112,14 @@ def print_prompt_completions_sample_uld(
     step: int,
     num_samples: int = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints a rich panel titled with the step containing a two-column Prompt/Completion table.
+    # Behavior: if num_samples is at least the number of prompts it is ignored; if it is 0 or negative nothing is printed;
+    # otherwise that many random pairs are sampled. One row per pair with section separators.
+    # Inputs: prompts (list of str), completions (list of str), step (int), num_samples (int, optional).
+    # Outputs: none.
+    # Exceptions: ImportError if rich is not installed.
+    # Side effects: console output; consumes Python random state when subsampling.
     """
     Print out a sample of model completions to the console.
 
@@ -177,6 +193,18 @@ def build_teacher_inputs_from_texts(
     completion_texts: list[str],
     use_extended_uld: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Tokenizes prompt and completion texts with the teacher tokenizer into right-padded tensors for ULD.
+    # Behavior: prompts are tokenized with special tokens; a trailing EOS on a prompt is dropped. Completions are tokenized
+    # without special tokens, with per-token UTF-8 byte offsets from the fast backend when use_extended_uld, else zero
+    # offsets. Each sequence is prompt plus completion plus EOS (if the tokenizer has one; its offset is a zero-width span
+    # at the completion byte length, or zero when not extended). Labels copy ids with the prompt set to -100. Ids are
+    # padded with the pad id (0 if none), attention masks with 0 (as bool), labels with -100, offsets with zeros.
+    # Inputs: tokenizer, prompt_texts (list of str), completion_texts (list of str, same length), use_extended_uld
+    # (default True).
+    # Outputs: tuple (input_ids (B, L), labels (B, L), attention_mask (B, L) bool, byte_offsets (B, L, 2)).
+    # Exceptions: ValueError from strict zip on length mismatch; AttributeError if extended ULD with a slow tokenizer.
+    # Side effects: none.
     """Tokenize teacher prompts/completions and produce tensors ready for GOLD loss.
 
     Returns ``(input_ids, labels, attention_mask, byte_offsets)``. ``byte_offsets`` is a ``[batch, seq, 2]`` tensor of
@@ -254,6 +282,15 @@ def build_teacher_inputs_from_texts(
 
 
 class ULDLoss(nn.Module):
+    # [CLASS DOC]
+    # Universal Logit Distillation loss between student and teacher with different vocabularies.
+    # State (from GOLDConfig): crossentropy_weight, distillation_weight, student/teacher temperatures, skip_student_eos,
+    # skip_teacher_eos, use_extended_uld (byte-offset alignment vs positional truncation), token_merge_strategy ("observed"
+    # or "bayesian"), ignore_index -100, tokenizers, hybrid settings (use_hybrid_loss, fixed weights, beta), vocabulary
+    # mapping (_vocab_mapping, matched id sets, mapping_tensor) built when hybrid is on, and last_matched_loss /
+    # last_unmatched_loss written by the hybrid path for logging.
+    # Calling the module returns optional CE loss plus the distillation loss. Subclasses nn.Module but overrides the call
+    # method directly rather than forward.
     """
     Universal Logit Distillation Loss.
     """
@@ -265,6 +302,12 @@ class ULDLoss(nn.Module):
         teacher_tokenizer=None,
         device=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: copies ULD settings from config, stores tokenizers and device, and builds the vocabulary mapping when the
+        # hybrid loss is enabled and both tokenizers are provided.
+        # Inputs: config (GOLDConfig), student_tokenizer, teacher_tokenizer, device (all optional except config).
+        # Outputs: none. Exceptions: those of _initialize_vocabulary_mapping.
+        # Side effects: sets attributes.
         super().__init__()
         self.device = device
         self.crossentropy_weight = config.uld_crossentropy_weight
@@ -305,6 +348,14 @@ class ULDLoss(nn.Module):
         student_byte_offsets=None,
         teacher_byte_offsets=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: if crossentropy_weight is positive, computes next-token cross-entropy of the student (shifted by one,
+        # ignoring -100) times that weight, else 0. Adds _compute_distillation_loss.
+        # Inputs: student/teacher logits (B, T, V), student/teacher labels (B, T), student/teacher input ids (B, T),
+        # student_byte_offsets and teacher_byte_offsets (B, T, 2; required for extended ULD).
+        # Outputs: scalar loss tensor.
+        # Exceptions: ValueError if byte offsets are missing in extended mode.
+        # Side effects: may set last_matched_loss/last_unmatched_loss.
         """
         Compute ULD loss with GKD trainer interface.
 
@@ -348,6 +399,13 @@ class ULDLoss(nn.Module):
         return crossentropy_loss + distillation_loss
 
     def _initialize_vocabulary_mapping(self):
+        # [FUNCTION DOC]
+        # HELPER: Maps teacher token ids to student token ids for tokens whose string is identical in both vocabularies.
+        # Behavior: fills _vocab_mapping and the matched id sets, then builds mapping_tensor sized by the largest matched
+        # teacher id plus one, with -1 for unmapped ids, moved to device if set.
+        # Inputs: none. Outputs: none.
+        # Exceptions: ValueError from max if no tokens match.
+        # Side effects: sets mapping attributes.
         """Initialize vocabulary mapping for hybrid ULD loss."""
         # Computing vocabulary mapping for hybrid ULD
 
@@ -390,6 +448,21 @@ class ULDLoss(nn.Module):
         student_byte_offsets=None,
         teacher_byte_offsets=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: finds each row's answer start and size from labels (first non -100 index and count of non -100 labels);
+        # reduces sizes by one when skipping EOS. Returns a zero (graph-attached) loss if any list is empty or every size is
+        # non-positive. Per sample: rows with a non-positive size contribute zero. For the bayesian strategy with a span
+        # starting at position 0, drops the first aligned group (extended) or first token (positional) from both sides. Answer
+        # logits are taken over the span (bayesian: shifted one earlier so each logit predicts the token at that position) and
+        # turned into temperature-scaled softmax probabilities. Extended: aligns by byte offsets, discards pairs where either
+        # group is empty, and merges probabilities per group; positional: truncates both to the shorter length. Then the
+        # hybrid loss if enabled with a mapping, else the sum of L1 distances between descending-sorted probability vectors
+        # (zero-padded to the same vocab size) divided by the aligned length. Final loss is the mean over samples times
+        # distillation_weight.
+        # Inputs: same tensors as the call method.
+        # Outputs: scalar tensor.
+        # Exceptions: ValueError if byte offsets are missing in extended mode.
+        # Side effects: none beyond hybrid logging attributes.
         """
         Compute the Universal Logit Distillation loss with token mapping.
 
@@ -528,6 +601,14 @@ class ULDLoss(nn.Module):
 
     @staticmethod
     def _align_by_byte_offsets(s_offsets, t_offsets):
+        # [FUNCTION DOC]
+        # HELPER: Static. Groups student and teacher token positions into pairs covering identical byte spans.
+        # Behavior: two-pointer walk over the end offsets; advances the side whose current token ends earlier; when ends are
+        # equal, advances both and closes a group pair. Any leftover tokens on either side form a final group pair (possibly
+        # with one side empty).
+        # Inputs: s_offsets, t_offsets (lists of (start, end)).
+        # Outputs: tuple (student groups, teacher groups), lists of lists of positions of equal length.
+        # Exceptions: none. Side effects: none.
         """
         Walk both byte-offset arrays, advancing the side whose current token ends earlier. A group closes when both
         sides reach the same byte boundary — the points where the two tokenizers agree on a split.
@@ -553,6 +634,16 @@ class ULDLoss(nn.Module):
         return s_groups, t_groups
 
     def _merge_probabilities_with_alignment_groups(self, probs, alignment_groups, token_ids=None):
+        # [FUNCTION DOC]
+        # HELPER: Collapses per-token distributions into one per alignment group.
+        # Behavior: returns probs unchanged if there are no groups. Single-token groups copy that row; empty groups become zeros.
+        # Multi-token groups: "bayesian" takes the last position's full distribution times the probabilities (clamped at 1e-8)
+        # of the actual tokens at earlier positions; "observed" takes the first position's distribution times the actual-token
+        # probabilities at later positions. Results are unnormalized.
+        # Inputs: probs (L, V), alignment_groups (list of lists), token_ids (list of int, required for multi-token groups).
+        # Outputs: tensor (number of groups, V).
+        # Exceptions: ValueError if token_ids is None for a multi-token group.
+        # Side effects: none.
         """
         Merge probabilities based on alignment groups, using either the "observed" or "bayesian" strategy
         (`self.token_merge_strategy`).
@@ -623,6 +714,17 @@ class ULDLoss(nn.Module):
         return aligned_probs
 
     def _compute_hybrid_uld_loss(self, student_aligned, teacher_aligned):
+        # [FUNCTION DOC]
+        # HELPER: Hybrid ULD loss.
+        # Behavior: matched vocabulary ids (shared token strings) are compared directly via generalized JSD on the selected
+        # probability columns; the remaining unmatched columns on each side are sorted descending, zero-padded to equal width
+        # and compared with a summed L1 divided by sequence length (only if both sides have unmatched columns). Weights are the
+        # fixed config weights, or adaptive: matched weight is matched count over teacher vocab size and unmatched weight is one
+        # minus that. Returns the weighted sum.
+        # Inputs: student_aligned (L, Vs), teacher_aligned (L, Vt).
+        # Outputs: scalar tensor.
+        # Exceptions: AttributeError if mapping_tensor was never built.
+        # Side effects: sets last_matched_loss and last_unmatched_loss.
         """
         Compute hybrid ULD loss on aligned probability distributions. This method:
         1. Directly compares probabilities for tokens with matching vocabulary entries
@@ -722,6 +824,11 @@ class ULDLoss(nn.Module):
         return total_loss
 
     def _compute_jsd_loss_for_matched_tokens(self, student_logits, teacher_logits):
+        # [FUNCTION DOC]
+        # HELPER: Applies GOLDTrainer.generalized_jsd_loss in probability mode (logits_are_probs True, temperature 1,
+        # batchmean, no labels) with self.beta to matched-vocabulary probability columns.
+        # Inputs: student_logits, teacher_logits (actually probabilities, shape (L, matched count)).
+        # Outputs: scalar tensor. Exceptions: none. Side effects: none.
         """
         Compute JSD loss for matched vocabulary tokens.
 
@@ -751,6 +858,10 @@ class ULDLoss(nn.Module):
         return jsd_loss
 
     def _get_start_and_size_answers(self, answer_tensors):
+        # [FUNCTION DOC]
+        # HELPER: For each label row returns the first index not equal to ignore_index and the count of such positions (0 and
+        # 0 if none).
+        # Inputs: answer_tensors (B, T). Outputs: tuple of two int lists. Exceptions: none. Side effects: none.
         answers_index = []
         answers_size = []
 
@@ -768,6 +879,19 @@ class ULDLoss(nn.Module):
 
 
 class GOLDTrainer(SFTTrainer):
+    # [CLASS DOC]
+    # SFTTrainer subclass implementing GOLD.
+    # Key state: tokenizer/VLM flags (_tokenizer, _is_vlm, _is_vision_dataset, _is_cross_architecture_vlm,
+    # _teacher_processor, _vlm_collator), teacher_model and teacher_tokenizer, use_uld_loss and uld_loss_fn, lmbda, beta,
+    # temperature, top_p, seq_kd, num_generations, generation_config/generation_kwargs, rollout buffer (_buffered_inputs,
+    # _buffered_on_policy, _buffered_text_logs, _step), on/off-policy and matched/unmatched loss accumulators, _metrics,
+    # _textual_logs deques, and vLLM state (vllm_generation, vllm_sync_frequency, _last_vllm_sync_step).
+    # Flow: the dataloader yields one generation batch per gradient-accumulation window (RepeatSampler); _prepare_inputs
+    # fills a buffer on the first micro-step by splitting the batch into slices and, per slice with probability lmbda,
+    # replacing it with on-policy student generations (vLLM or model.generate); compute_loss uses generalized JSD (shared
+    # tokenizer) or ULD (cross tokenizer, teacher inputs rebuilt from text); training_step tracks on/off-policy losses; log
+    # aggregates and prints/logs completions.
+    # Class constants: _SEQUENCE_KEYS (token_type_ids, mm_token_type_ids) and _MODEL_INPUT_RESERVED_KEYS (non-forward keys).
     _tag_names = ["trl", "gold"]
     _name = "GOLD"
     _paper = {
@@ -804,6 +928,36 @@ class GOLDTrainer(SFTTrainer):
         preprocess_logits_for_metrics: (Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None) = None,
         peft_config: Optional["PeftConfig"] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior:
+        # 1. Records model name/revision and teacher revision (teacher init kwargs revision or teacher_model_revision); peeks
+        # the first train example; loads an AutoProcessor from the model id when no processing class is given.
+        # 2. Processor means VLM: tokenizer taken from it with pad defaulting to eos. For VLMs validates the teacher is a VLM
+        # (processor type or vision_config sub-config), detects cross-architecture (different model_type, warns), and loads
+        # the teacher processor when cross-architecture or ULD. Cross-architecture without ULD is rejected. Rejects image
+        # datasets with non-VLM models, keep_end truncation with VLMs, and custom collators for image datasets.
+        # 3. Collator: VLM datasets use an identity collator plus a stored DataCollatorForVisionLanguageChatML; text uses
+        # DataCollatorForChatML.
+        # 4. Teacher init kwargs (only with a string teacher; dtype converted), teacher tokenizer path defaults for ULD (from
+        # teacher id or config), teacher tokenizer revision only when the tokenizer path equals the teacher id. String teachers
+        # are created with create_model_from_path (revision, trust_remote_code, device_map None for multi-GPU/DeepSpeed).
+        # Teacher tokenizer from the teacher processor or AutoTokenizer, pad defaulting to eos.
+        # 5. Runs the SFTTrainer constructor; disables dropout; resizes teacher embeddings to the student vocab when not ULD;
+        # prepares the teacher via DeepSpeed or accelerator eval mode.
+        # 6. Stores hyperparameters, initialises accumulators and buffers, builds ULDLoss when ULD, the sampling
+        # GenerationConfig (max_new_tokens = max_completion_length, temperature, top_p, top_k, pad, eos from the model's
+        # generation config), metrics and text-log deques sized to processes times batch times accumulation.
+        # 7. If use_vllm, checks vLLM is installed and builds VLLMGeneration with the config's vLLM settings, sets sync
+        # frequency and an initial last-sync step forcing a first sync.
+        # Inputs: model, teacher_model, args (GOLDConfig), data_collator, train_dataset, eval_dataset, processing_class,
+        # compute_metrics, callbacks, optimizers, preprocess_logits_for_metrics, peft_config.
+        # Outputs: none.
+        # Exceptions: ValueError for unsupported VLM/collator/truncation/teacher configurations; ImportError when vLLM is
+        # missing.
+        # Side effects: downloads processors/models; mutates args.teacher_tokenizer_name_or_path and tokenizers' pad tokens;
+        # warnings.
+        # KNOWN ISSUE: args defaults to None but is dereferenced immediately; a teacher_model_init_kwargs dict without "dtype"
+        # raises KeyError.
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = (args.model_init_kwargs or {}).get("revision") if isinstance(model, str) else None
         teacher_revision = (
@@ -1107,6 +1261,12 @@ class GOLDTrainer(SFTTrainer):
             self._last_vllm_sync_step = -self.vllm_sync_frequency
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # Behavior: runs the parent hook, then makes sure the signature columns include the raw and auxiliary columns GOLD's
+        # collators need (prompt, completion, prompts, prompt_attention_mask, messages, chat_template_kwargs, tools, original
+        # texts, byte_offsets, completion_mask, image fields and multimodal tensors), so they are not removed.
+        # Inputs: none. Outputs: none. Exceptions: none.
+        # Side effects: sets or extends _signature_columns.
         super()._set_signature_columns_if_needed()
         required_columns = [
             "prompt",
@@ -1139,6 +1299,12 @@ class GOLDTrainer(SFTTrainer):
                     self._signature_columns.append(column)
 
     def _get_train_sampler(self, dataset=None):
+        # [FUNCTION DOC]
+        # Behavior: returns a RepeatSampler that repeats each index num_generations times consecutively, with batch size
+        # generation_batch_size times number of processes, repeats each batch gradient_accumulation_steps times, shuffled with
+        # args.seed.
+        # Inputs: dataset (optional, defaults to train_dataset). Outputs: RepeatSampler.
+        # Exceptions: none. Side effects: none.
         if dataset is None:
             dataset = self.train_dataset
         return RepeatSampler(
@@ -1151,6 +1317,13 @@ class GOLDTrainer(SFTTrainer):
         )
 
     def get_train_dataloader(self):
+        # [FUNCTION DOC]
+        # Behavior: like Trainer's, but with batch size per-device batch times gradient_accumulation_steps; removes unused
+        # columns (or wraps the collator for non-Dataset inputs); for map-style datasets uses _get_train_sampler, drop_last,
+        # seeded worker init and prefetch factor when workers are used. Returns the accelerator-prepared DataLoader.
+        # Inputs: none. Outputs: DataLoader.
+        # Exceptions: ValueError if train_dataset is None.
+        # Side effects: none beyond dataloader creation.
         """
         Override Trainer.get_train_dataloader to load one generation batch per optimizer window.
 
@@ -1192,6 +1365,16 @@ class GOLDTrainer(SFTTrainer):
 
     @profiling_decorator
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
+        # [FUNCTION DOC]
+        # Behavior: in eval mode returns the batch as is, except VLM batches, which are collated (with raw images/prompts for
+        # the teacher processor) via _materialize_vlm_slice. In training, refills the buffer when the step counter is at a
+        # window start or the buffer is empty, picks slice step modulo gradient_accumulation_steps, lazily generates
+        # (non-vLLM on-policy VLM) or collates (lazy VLM) that slice and stores the result back, increments _step, and returns
+        # it.
+        # Inputs: generation_batch (collated dict or list of raw dicts).
+        # Outputs: dict of model inputs.
+        # Exceptions: those of buffer filling/generation.
+        # Side effects: mutates buffers and _step; generation; profiling.
         if not self.model.training:
             # Evaluation is off-policy (no generation): the student never samples, both models are forwarded over
             # the dataset's ground-truth prompt+completion and the distillation loss is taken over the completion.
@@ -1228,6 +1411,17 @@ class GOLDTrainer(SFTTrainer):
     def _generate_on_policy_vlm_slice(
         self, pending_slice: dict[str, Any]
     ) -> tuple[dict[str, torch.Tensor | Any], tuple[list[str], list[str]]]:
+        # [FUNCTION DOC]
+        # HELPER: Generates and collates one deferred on-policy VLM slice (non-vLLM path).
+        # Behavior: blanks each example's completion (empty assistant text block, or empty string), collates with the VLM
+        # collator and moves tensors to device, generates with the unwrapped student, replaces input_ids, attention_mask and
+        # labels, rebuilds sequence-aligned keys as prompt-aligned values followed by zeros for the completion, sets original
+        # prompt text (if missing) and completion text (special tokens kept), adds byte offsets when needed, and attaches raw
+        # images/prompts for the teacher processor.
+        # Inputs: pending_slice (dict with raw examples and optional raw images/prompts).
+        # Outputs: tuple (updated slice dict, (prompt texts, completion texts)).
+        # Exceptions: generation/collation errors.
+        # Side effects: none beyond computation.
         """Generate and collate one non-vLLM on-policy VLM slice immediately before it is consumed."""
         raw_examples = pending_slice["_gold_vlm_on_policy_raw_examples"]
         generation_examples = []
@@ -1294,6 +1488,13 @@ class GOLDTrainer(SFTTrainer):
         return updated_slice, (prompt_texts, completion_texts)
 
     def _materialize_vlm_slice(self, pending_slice: dict[str, Any]) -> dict[str, torch.Tensor | Any]:
+        # [FUNCTION DOC]
+        # HELPER: Collates a lazy VLM slice (copying examples since the collator mutates them), moves tensors to device; for
+        # cross-tokenizer ULD fills original text fields from tokens if absent; attaches raw images/prompts for the teacher
+        # processor.
+        # Inputs: pending_slice. Outputs: dict of inputs.
+        # Exceptions: ValueError if ULD text fields are still missing.
+        # Side effects: none.
         """Collate one pending VLM slice immediately before it is consumed."""
         slice_inputs = self._vlm_collator([dict(example) for example in pending_slice["_gold_vlm_lazy_examples"]])
         slice_inputs = {
@@ -1321,6 +1522,11 @@ class GOLDTrainer(SFTTrainer):
         prompt_lengths: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Static. Labels are -100 except at positions at or after each row's prompt length that are attended, where
+        # they copy the ids; attention mask is cast to the ids dtype and device.
+        # Inputs: new_input_ids (B, L), prompt_lengths (B,), attention_mask (B, L).
+        # Outputs: tuple (attention_mask, labels). Exceptions: none. Side effects: none.
         """Build attention mask and labels from full sequences and prompt lengths."""
         prompt_lengths = prompt_lengths.to(device=new_input_ids.device, dtype=torch.long)
         positions = torch.arange(new_input_ids.shape[1], device=new_input_ids.device).unsqueeze(0)
@@ -1336,6 +1542,12 @@ class GOLDTrainer(SFTTrainer):
         return new_attention_mask, new_labels
 
     def _extract_images_and_prompts(self, examples: list[dict]) -> tuple[list | None, list]:
+        # [FUNCTION DOC]
+        # HELPER: Collects per-example images (from "images", or "image" wrapped in a list, None when missing) and prompts;
+        # images becomes None when every entry is None or empty; when images exist, prompts are converted to multimodal
+        # messages with the images.
+        # Inputs: examples (list of dicts). Outputs: tuple (images or None, prompts).
+        # Exceptions: KeyError if an example lacks "prompt". Side effects: none.
         """
         Extract per-example images and build prompts with multimodal messages, mirroring GRPOTrainer.
 
@@ -1360,6 +1572,10 @@ class GOLDTrainer(SFTTrainer):
         return images, prompts
 
     def _decode_completion_texts_from_labels(self, slice_inputs: dict[str, torch.Tensor | Any]) -> list[str] | None:
+        # [FUNCTION DOC]
+        # HELPER: Decodes, per row, the label tokens not equal to -100 (special tokens kept, no space cleanup); returns None
+        # if labels are missing or not a tensor.
+        # Inputs: slice_inputs (dict). Outputs: list of str or None. Exceptions: none. Side effects: none.
         """Decode completion text from labels when raw text is absent."""
         labels = slice_inputs.get("labels")
         if labels is None or not isinstance(labels, torch.Tensor):
@@ -1380,6 +1596,12 @@ class GOLDTrainer(SFTTrainer):
     def _ensure_original_text_fields(
         self, slice_inputs: dict[str, torch.Tensor | Any]
     ) -> dict[str, torch.Tensor | Any]:
+        # [FUNCTION DOC]
+        # HELPER: If original prompt/completion text is missing and prompts tensor and labels exist, returns a copy with
+        # prompt text decoded from the prompts tensor and completion text decoded from labels; otherwise returns the input.
+        # Inputs: slice_inputs. Outputs: dict. Exceptions: none. Side effects: none.
+        # KNOWN ISSUE: prompt text is decoded from the left-padded prompts tensor without removing padding, so pad tokens are
+        # included in original_prompt_text.
         """Populate original prompt/completion text fields when missing."""
         if "original_prompt_text" in slice_inputs and "original_completion_text" in slice_inputs:
             return slice_inputs
@@ -1404,6 +1626,12 @@ class GOLDTrainer(SFTTrainer):
 
     @staticmethod
     def _get_prompt_sequence_key(inputs: dict[str, torch.Tensor | Any], key: str) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Static. Re-lays a sequence-aligned key (e.g. token_type_ids) to match the left-padded prompt tensor: without
+        # a prompt mask, takes the first prompt-width columns; otherwise copies each row's first real-prompt-length values
+        # into the masked (real) positions of a zero tensor shaped like the prompts.
+        # Inputs: inputs (dict with the key, prompts, optional prompt_attention_mask), key (str).
+        # Outputs: tensor shaped like prompts. Exceptions: KeyError on missing keys. Side effects: none.
         """Align a sequence-length-dependent key with the left-padded prompt tensor."""
         values = inputs[key]
         prompts = inputs["prompts"]
@@ -1438,6 +1666,10 @@ class GOLDTrainer(SFTTrainer):
     def _get_model_forward_kwargs(
         self, inputs: dict[str, torch.Tensor | Any], exclude: tuple[str, ...] = ()
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Returns tensor entries of inputs that are not reserved, not in exclude, and not starting with an underscore
+        # (the multimodal kwargs to forward to a model).
+        # Inputs: inputs (dict), exclude (tuple of keys, default empty). Outputs: dict. Exceptions: none. Side effects: none.
         reserved_keys = self._MODEL_INPUT_RESERVED_KEYS | set(exclude)
         return {
             k: v
@@ -1446,6 +1678,13 @@ class GOLDTrainer(SFTTrainer):
         }
 
     def _maybe_add_completion_byte_offsets(self, updated_slice: dict[str, torch.Tensor | Any]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For extended cross-tokenizer ULD only, computes completion-relative byte offsets for an on-policy slice from
+        # the sampled ids: walking each row, every supervised position (label not -100) gets a span from a running byte
+        # counter advanced by the token piece's byte length; other positions get zero spans. Stores a (B, L, 2) tensor under
+        # byte_offsets.
+        # Inputs: updated_slice (dict with input_ids and labels; mutated). Outputs: none.
+        # Exceptions: none expected. Side effects: mutates updated_slice.
         """Attach completion-relative byte offsets to on-policy ULD batches.
 
         Derived from the sampled ids via ``piece_byte_len`` (no decode→re-encode round-trip).
@@ -1484,6 +1723,17 @@ class GOLDTrainer(SFTTrainer):
         generation_batch: dict[str, torch.Tensor | Any] | list[dict],
         buffer_steps: int,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Splits a generation batch into gradient_accumulation_steps slices and decides on/off-policy per slice.
+        # Behavior: requires the batch length to be divisible by the step count. VLM: slices raw example lists; text:
+        # split_tensor_dict. The main process draws one flag per slice (random value at most lmbda) and broadcasts them. Off-
+        # policy slices are buffered as is (VLM as lazy slices with raw images/prompts if a teacher processor exists); text ULD
+        # slices must carry original texts and, in extended mode, byte_offsets. On-policy slices are then generated via
+        # _generate_on_policy_vlm_raw or _generate_on_policy_for_slices.
+        # Inputs: generation_batch (dict or list), buffer_steps (int).
+        # Outputs: none.
+        # Exceptions: ValueError for indivisible batches or missing ULD fields.
+        # Side effects: resets _buffered_inputs, _buffered_on_policy, _buffered_text_logs; cross-process broadcast; random draw.
         # The batch is split into `buffer_steps` equal chunks via floor division (here and in
         # `split_tensor_dict` below). A batch size that is not divisible by `buffer_steps` would
         # silently drop examples or produce empty chunks, so fail fast instead.
@@ -1568,6 +1818,17 @@ class GOLDTrainer(SFTTrainer):
     def _generate_on_policy_for_slices(
         self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]
     ):
+        # [FUNCTION DOC]
+        # HELPER: Text on-policy generation for selected slices.
+        # Behavior: collects unpadded prompt ids for every row of the on-policy slices, keeping only the last max_length minus
+        # max_new_tokens tokens (at least 1) when max_length is set, and decodes them. Without vLLM delegates to
+        # _generate_non_vllm_for_slices. With vLLM, syncs weights when the global step changed and at least
+        # vllm_sync_frequency steps passed since the last sync, generates num_generations completions per prompt, and writes
+        # results via _process_completions_to_buffer.
+        # Inputs: slices (list of dicts), on_policy_indices (list of int).
+        # Outputs: none.
+        # Exceptions: generation errors.
+        # Side effects: vLLM weight sync and generation; buffer updates.
         prompt_ids_list = []
         local_slice_indices = []
         # Budget the prompt to max_length - max_new_tokens before generation, keeping the END of the
@@ -1620,6 +1881,15 @@ class GOLDTrainer(SFTTrainer):
         )
 
     def _generate_non_vllm_for_slices(self, slices: list[dict[str, torch.Tensor | Any]], on_policy_indices: list[int]):
+        # [FUNCTION DOC]
+        # HELPER: Generates on-policy completions with model.generate per slice inside unwrap_model_for_generation.
+        # Behavior: when max_length is set and any row's real prompt exceeds the budget (max_length minus max_new_tokens), the
+        # slice's prompts are rebuilt keeping each row's last budget tokens, left-padded, with a new prompt mask. Calls
+        # generate_on_policy_outputs and stores a copy of the slice with new input_ids, attention_mask, labels, original
+        # texts and byte offsets, plus text logs.
+        # Inputs: slices, on_policy_indices. Outputs: none.
+        # Exceptions: generation errors.
+        # Side effects: writes _buffered_inputs and _buffered_text_logs.
         """Fallback generation without vLLM (uses model.generate per slice)."""
         with unwrap_model_for_generation(
             self.model,
@@ -1683,6 +1953,19 @@ class GOLDTrainer(SFTTrainer):
                 self._buffered_text_logs[slice_idx] = (prompt_texts, completion_texts)
 
     def _generate_on_policy_vlm_raw(self, raw_slices: list[list[dict]], on_policy_indices: list[int]):
+        # [FUNCTION DOC]
+        # HELPER: On-policy generation for VLM slices of raw examples.
+        # Behavior: per slice extracts images and prompts and wraps string message contents as text blocks. Without vLLM,
+        # stores deferred slices (raw examples plus teacher raw images/prompts) to be generated lazily in _prepare_inputs.
+        # With vLLM: tokenizes prompts with the chat template (padding then unpadding on transformers 5.3.x as a workaround),
+        # errors if any prompt exceeds the prompt budget (no truncation for VLMs), syncs weights per the sync rule, generates
+        # with images, truncates completions to max_new_tokens and decodes them with special tokens. Builds synthetic examples
+        # whose completion is an assistant message holding the generated text, buffered as lazy slices (plus teacher raw
+        # data), and records text logs.
+        # Inputs: raw_slices (list of example lists), on_policy_indices.
+        # Outputs: none.
+        # Exceptions: ValueError for over-long VLM prompts; generation errors.
+        # Side effects: buffer updates; vLLM sync/generation.
         """On-policy generation from raw VLM examples, preserving PIL images for vLLM."""
         all_prompt_ids = []
         all_images = []
@@ -1855,6 +2138,18 @@ class GOLDTrainer(SFTTrainer):
         prompts_text: list[str],
         max_completion_length: int,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Turns vLLM completion ids into buffered training slices.
+        # Behavior: groups completions, prompt ids and prompt texts by slice. Per slice: left-pads prompts with a new mask;
+        # decodes prompts with special tokens for the teacher; truncates each completion to max_completion_length or
+        # right-pads it with the pad id (mask zeros on padding); concatenates prompt and completion; labels via
+        # _build_sequence_batch with every prompt length equal to the padded prompt width; decodes completions; stores a copy
+        # of the slice with new ids, mask, labels, prompts, prompt mask, original texts and byte offsets, plus text logs.
+        # Inputs: slices, on_policy_indices, local_slice_indices (slice of each row), completion_ids (list of id lists),
+        # prompt_ids_list, prompts_text, max_completion_length (int).
+        # Outputs: none.
+        # Exceptions: none expected.
+        # Side effects: writes buffers.
         """
         Process vLLM completions and update buffered inputs for on-policy slices.
         """
@@ -1988,6 +2283,13 @@ class GOLDTrainer(SFTTrainer):
         formatting_func: Callable[[dict], str] | None,
         dataset_name: str,
     ) -> Dataset | IterableDataset:
+        # [FUNCTION DOC]
+        # Behavior: vision datasets are returned unprocessed. Rejects packing with cross-tokenizer ULD. Unprocessed datasets
+        # (no input_ids column) or cross-tokenizer ULD use _prepare_dataset_with_original_text; otherwise the SFT preparation.
+        # Inputs: dataset, processing_class, args, packing (bool), formatting_func, dataset_name (str).
+        # Outputs: prepared dataset.
+        # Exceptions: ValueError for packing with cross-tokenizer ULD.
+        # Side effects: dataset map caching.
         """Preserve original text fields for ULD when needed."""
         # For VLM datasets, skip dataset preparation entirely — the VLM collator handles tokenization
         # and image processing on the fly, similar to how SFTTrainer skips prep for vision datasets.
@@ -2019,6 +2321,16 @@ class GOLDTrainer(SFTTrainer):
         formatting_func: Callable[[dict], str] | None,
         dataset_name: str,
     ) -> Dataset | IterableDataset:
+        # [FUNCTION DOC]
+        # Behavior: under main-process-first, optionally applies formatting_func into a "text" column, converts to ChatML
+        # (dropping "conversations"), tokenizes with tokenize_with_original_text (passing dataset_text_field, max_length and
+        # use_extended_uld), and if packing, keeps input_ids and original text columns and packs to max_length. num_proc and
+        # progress descriptions are used only for map-style datasets.
+        # Inputs: dataset, processing_class, args, packing, formatting_func, dataset_name.
+        # Outputs: dataset with input_ids, attention_mask, byte_offsets, completion_mask, original_prompt_text,
+        # original_completion_text.
+        # Exceptions: ValueError if packing without max_length.
+        # Side effects: dataset map caching.
         """
         Prepare dataset while preserving original text for cross-tokenizer distillation.
         """
@@ -2034,6 +2346,9 @@ class GOLDTrainer(SFTTrainer):
                     map_kwargs["desc"] = f"Applying formatting function to {dataset_name} dataset"
 
                 def _func(example):
+                    # [FUNCTION DOC]
+                    # HELPER: Map function returning a dict whose "text" is formatting_func applied to the example.
+                    # Inputs: example (dict). Outputs: dict. Exceptions: those of formatting_func. Side effects: none.
                     return {"text": formatting_func(example)}
 
                 dataset = dataset.map(_func, batched=False, **map_kwargs)
@@ -2055,6 +2370,23 @@ class GOLDTrainer(SFTTrainer):
             def tokenize_with_original_text(
                 example, processing_class, dataset_text_field, max_length, use_extended_uld
             ):
+                # [FUNCTION DOC]
+                # HELPER: Tokenizes one example while recording the prompt/completion text split and byte offsets.
+                # Behavior: texts: prompt-completion examples render prompt (with generation prompt) and full conversation via the chat
+                # template, taking the common character prefix as the prompt and the rest as completion (plain strings concatenate);
+                # "messages" examples split at the last assistant message the same way (no assistant: empty prompt, whole render as
+                # completion); otherwise the dataset text field (or "text") is the completion. Tokenization of the full text without
+                # special tokens: extended ULD uses the fast backend for ids and byte offsets, with the completion starting at the first
+                # token ending past the prompt byte length and offsets made completion-relative (prompt positions zero); positional
+                # uses char offsets for the boundary and zero byte offsets. Appends EOS for non-conversational examples lacking it
+                # (zero-width span at the completion byte length in extended mode). If longer than max_length, keeps the last
+                # max_length tokens, shifts the boundary, rebases completion offsets to start at zero, and re-decodes the original
+                # texts from the kept ids (excluding an appended EOS).
+                # Inputs: example, processing_class, dataset_text_field, max_length, use_extended_uld.
+                # Outputs: dict with input_ids, attention_mask (all ones), byte_offsets, completion_mask (0 for prompt, 1 for
+                # completion), original_prompt_text, original_completion_text.
+                # Exceptions: AttributeError for slow tokenizers in extended mode; chat template errors.
+                # Side effects: none.
                 """Emit input_ids, attention_mask, byte_offsets, completion_mask, and the original prompt/completion
                 text.
                 """
@@ -2256,6 +2588,17 @@ class GOLDTrainer(SFTTrainer):
         logits_are_probs=False,
         num_items_in_batch=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: static. Log-probabilities come from log of clamped (1e-8) inputs when logits_are_probs, else from
+        # log-softmax of temperature-scaled logits. beta 0: KL(teacher || student); beta 1: KL(student || teacher); otherwise
+        # beta times KL(teacher || mixture) plus (1 - beta) times KL(student || mixture), where the mixture log-probs are the
+        # log-sum-exp of student plus log(1 - beta) and teacher plus log(beta); all elementwise. Labels (if given) select
+        # positions whose label is not -100. Reduction: sum over num_items_in_batch if given; batchmean divides the sum by the
+        # count of valid positions (at least 1) or by the first dimension; "sum"; "mean"; else unreduced.
+        # Inputs: student_logits, teacher_logits (..., V), labels (optional), beta (0.5), temperature (1.0), reduction
+        # ("batchmean"), logits_are_probs (False), num_items_in_batch (optional).
+        # Outputs: tensor (scalar unless unreduced).
+        # Exceptions: none expected. Side effects: none.
         """
         Compute the generalized Jensen-Shannon Divergence loss for knowledge distillation using F.kl_div. See Eq. (1)
         of https://huggingface.co/papers/2306.13649 for the definition.
@@ -2344,6 +2687,18 @@ class GOLDTrainer(SFTTrainer):
     def _build_teacher_vlm_inputs(
         self, completion_texts: list[str], raw_images: list, raw_prompts: list
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Builds teacher inputs for VLM cross-tokenizer ULD.
+        # Behavior: renders raw prompts with the teacher processor's chat template (generation prompt on) and processes them
+        # with the raw images (padded tensors). Completion texts are tokenized by the teacher tokenizer (byte offsets in
+        # extended mode, else zero offsets). Per row: real prompt ids (trailing EOS removed), completion ids, appended EOS (if
+        # any), offsets, labels with the prompt masked, and sequence-aligned keys made of prompt values plus zeros. Pads
+        # everything to the right and collects teacher multimodal forward kwargs (excluding sequence keys, which are added
+        # from the padded per-row values) on the device.
+        # Inputs: completion_texts (list of str), raw_images (list), raw_prompts (list of message lists).
+        # Outputs: tuple (input_ids, labels, attention_mask bool, byte_offsets, forward kwargs dict).
+        # Exceptions: processor errors.
+        # Side effects: none.
         """Build image-aware teacher inputs for cross-architecture VLM ULD distillation.
 
         The teacher prompt is rendered through the teacher's own processor so image placeholders and pixel tensors
@@ -2448,6 +2803,19 @@ class GOLDTrainer(SFTTrainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Behavior: student multimodal kwargs come from the batch. Cross-tokenizer ULD: rebuilds teacher inputs from the
+        # original texts (VLM path requires _raw_images and _raw_prompts, else build_teacher_inputs_from_texts), moves them to
+        # device, runs the student (use_cache False) and the teacher (eval, no grad), checks byte offsets in extended mode, and
+        # computes the ULD loss; when hybrid component losses exist, accumulates their values with a step-equivalent of 1 over
+        # gradient_accumulation_steps. Otherwise: runs student and teacher on the same ids and kwargs, shifts logits and labels
+        # by one, and computes generalized JSD with beta, temperature and num_items_in_batch. Empties the device cache.
+        # Inputs: model, inputs, return_outputs (default False), num_items_in_batch.
+        # Outputs: loss, or (loss, student outputs).
+        # Exceptions: ValueError for missing VLM raw fields or byte offsets.
+        # Side effects: teacher set to eval; matched/unmatched accumulators updated; cache emptied.
+        # KNOWN ISSUE: the hybrid matched/unmatched values logged are those of the last sample processed in the batch, not an
+        # average over the batch.
         # Extract multimodal fields (pixel_values, image_grid_thw, ...) for student forward passes.
         # Standard JSD reuses these for the teacher (same-family VLM); cross-tokenizer ULD rebuilds
         # teacher inputs separately below.
@@ -2580,6 +2948,14 @@ class GOLDTrainer(SFTTrainer):
         return (loss, outputs_student) if return_outputs else loss
 
     def generate_on_policy_outputs(self, model, inputs, generation_config):
+        # [FUNCTION DOC]
+        # Behavior: generates from left-padded prompts with multimodal kwargs (sequence-aligned keys excluded). Completion
+        # starts after the padded prompt width; completion mask keeps tokens up to and including the first EOS (or all when no
+        # EOS id). Attention mask is the prompt mask followed by the completion mask; labels via _build_sequence_batch.
+        # Decodes per row the real prompt tokens and the supervised completion tokens with special tokens kept.
+        # Inputs: model (unwrapped), inputs (prompts, prompt_attention_mask, multimodal tensors), generation_config.
+        # Outputs: tuple (input_ids, attention_mask, labels, prompt texts, completion texts).
+        # Exceptions: generation errors. Side effects: none.
         # Generate output with respect to the prompt only
         # Drop sequence-aligned multimodal keys (token_type_ids, mm_token_type_ids): generate recomputes them from
         # `input_ids` as it extends the sequence, and some models (e.g. Qwen3-VL) reject them as unknown
@@ -2663,6 +3039,11 @@ class GOLDTrainer(SFTTrainer):
     # collate via _prepare_inputs and force compute_loss, evaluating the off-policy distillation loss over the
     # ground-truth completion (no generation).
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Behavior: prepares inputs (eval path, no generation), computes the off-policy distillation loss without gradients
+        # under the loss context manager, and returns (mean detached loss, None, None).
+        # Inputs: model, inputs, prediction_loss_only (ignored), ignore_keys (ignored).
+        # Outputs: tuple. Exceptions: those of compute_loss. Side effects: none.
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
             with self.compute_loss_context_manager():
@@ -2677,6 +3058,15 @@ class GOLDTrainer(SFTTrainer):
         inputs: dict[str, torch.Tensor | Any],
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: runs the base training step, then determines whether the slice just used (step minus one modulo
+        # accumulation steps) was on-policy; if so and text logs exist, gathers prompt and completion texts from all processes
+        # into _textual_logs. Adds the loss value with a step-equivalent of 1 over accumulation steps to the on- or off-policy
+        # accumulators.
+        # Inputs: model, inputs, num_items_in_batch.
+        # Outputs: loss tensor.
+        # Exceptions: those of the base step.
+        # Side effects: updates accumulators and text logs; cross-process gather.
         """
         Perform a training step for the General Online Logit Distillation (GOLD) model.
 
@@ -2711,6 +3101,20 @@ class GOLDTrainer(SFTTrainer):
         return loss
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: averages _metrics for the current mode. In training, all-reduces (sum) the on/off-policy and
+        # matched/unmatched accumulators across processes when distributed, adds on_policy_loss, off_policy_loss,
+        # matched_loss and unmatched_loss (rounded to 4 decimals, only when their step-equivalents are positive), and resets the
+        # accumulators. Eval metrics are prefixed with "eval_". Merges metrics, calls the base log, clears the mode's metrics.
+        # On the main process with log_completions every log_completions_steps steps: prints a rich table (if rich available)
+        # and, if reporting to wandb with an active run, logs a "completions" table (optionally deduplicated by prompt and
+        # sampled to num_completions_to_print rows).
+        # Inputs: logs (dict), start_time (optional).
+        # Outputs: none.
+        # Exceptions: ValueError from DataFrame sampling (see known issue).
+        # Side effects: logging, console output, wandb, collective all-reduce.
+        # KNOWN ISSUE: the wandb table is sampled with num_completions_to_print rows without replacement, which raises when
+        # fewer rows remain (for example after deduplicating prompts).
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 

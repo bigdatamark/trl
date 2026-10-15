@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Tests for the experimental IWOPDTrainer / IWOPDConfig (trl.experimental.iw_opd), importance-
+# weighted on-policy distillation built on a generalized distillation trainer that supports JSD and
+# iw_opd objectives with a local teacher or a vLLM teacher server. Covers config validation,
+# build_teacher_request_inputs, server logprob padding with -inf sentinels, tail-bucket JSD finiteness,
+# generalized_jsd_loss, trainer training/eval/loss normalization, local vs server parity, the IW-OPD
+# loss and rollout logprob buffering, ragged server batches, and _RepeatBatchDataLoader delegation.
+# Contains helpers that fabricate teacher-server responses. Import-time side effects: none.
+# KNOWN ISSUE: several tests build trainers with object.__new__ and SimpleNamespace / MagicMock
+# stand-ins, contrary to the repository test guideline of exercising real objects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,10 +47,24 @@ from ..testing_utils import TrlTestCase
 
 
 def _make_distillation_config_kwargs(tmp_path):
+    # [FUNCTION DOC]
+    # HELPER: Returns minimal IWOPDConfig kwargs: output_dir as str(tmp_path) and report_to none.
+    # Inputs: tmp_path. Outputs: dict. Exceptions: none. Side effects: none.
     return {"output_dir": str(tmp_path), "report_to": "none"}
 
 
 def _build_server_result(teacher_logits, inputs, temperature=1.0):
+    # [FUNCTION DOC]
+    # HELPER: Simulates a vLLM teacher-server response from local teacher logits. Uses
+    # build_teacher_request_inputs to get per-sample completion lengths; for each sample with a
+    # completion, finds the first supervised label position, takes the teacher logits from one position
+    # earlier for comp_len steps, applies temperature-scaled log-softmax, and records the actual
+    # completion-token logprobs plus top-1 logprobs and ids (each as nested lists of shape comp_len by 1).
+    # Empty completions get empty lists.
+    # Inputs: teacher_logits (batch, seq, vocab), inputs dict (input_ids, attention_mask, labels,
+    # optional prompt_attention_mask), temperature (float, default 1.0).
+    # Outputs: dict with actual_logprobs, logprobs, logprob_token_ids. Exceptions: none expected.
+    # Side effects: none.
     """Simulate a vLLM server response with variable-length per-sample completions."""
     _, _, completion_lengths = build_teacher_request_inputs(
         inputs["input_ids"],
@@ -81,11 +106,20 @@ def _build_server_result(teacher_logits, inputs, temperature=1.0):
 
 
 class RecordingTeacherClient:
+    # [CLASS DOC]
+    # HELPER: Fake teacher server client returning a preset result and recording call arguments.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes calls to an empty list and result to None. Inputs: none. Outputs: none.
+        # Exceptions: none. Side effects: sets attributes.
         self.calls = []
         self.result = None
 
     def get_sequence_logprobs(self, sequences, prompt_lengths, top_logprobs, temperature):
+        # [FUNCTION DOC]
+        # HELPER: Records sequences, prompt_lengths, top_logprobs, temperature in a dict appended to calls,
+        # and returns self.result. Inputs: those four args. Outputs: the preset result. Exceptions: none.
+        # Side effects: mutates calls.
         self.calls.append(
             {
                 "sequences": sequences,
@@ -98,6 +132,10 @@ class RecordingTeacherClient:
 
 
 def _ragged_server_response():
+    # [FUNCTION DOC]
+    # HELPER: Returns a fixed server response for two samples with completion lengths 1 and 3 (top-k 1
+    # logprobs, token ids, and actual logprobs). Inputs: none. Outputs: dict. Exceptions: none.
+    # Side effects: none.
     # Two samples with completion lengths 1 and 3 respectively; matches the wire format
     # of VLLMClient.get_sequence_logprobs (per-sample shape (comp_len, top_k=1)).
     return {
@@ -108,6 +146,13 @@ def _ragged_server_response():
 
 
 def _canned_teacher_logprobs(**kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Fabricates a ragged server response for requested sequences: for each sequence, comp_len
+    # is its length minus its prompt length; position i gets logprob -1.0 - 0.05 i repeated top_k times
+    # (top_logprobs, default 1), token id equal to the sequence's own completion token, and the same
+    # value as actual logprob. Inputs: kwargs sequences, prompt_lengths, optional top_logprobs.
+    # Outputs: dict with logprobs, logprob_token_ids, actual_logprobs. Exceptions: KeyError if required
+    # keys are missing; ValueError on length mismatch. Side effects: none.
     # Fabricate ragged per-sample logprobs matching the requested sequence shapes.
     sequences = kwargs["sequences"]
     prompt_lengths = kwargs["prompt_lengths"]
@@ -122,6 +167,10 @@ def _canned_teacher_logprobs(**kwargs):
 
 
 def _variable_length_dataset():
+    # [FUNCTION DOC]
+    # HELPER: Returns a 2-row conversational messages Dataset with a very short and a long assistant
+    # reply (variable completion lengths). Inputs: none. Outputs: Dataset. Exceptions: none.
+    # Side effects: none.
     return Dataset.from_list(
         [
             {"messages": [{"role": "user", "content": "What's 2+2?"}, {"role": "assistant", "content": "4."}]},
@@ -139,26 +188,46 @@ def _variable_length_dataset():
 
 
 def test_distillation_config_rejects_invalid_reverse_kl_top_1_mode(tmp_path):
+    # [FUNCTION DOC]
+    # Tests an unknown reverse_kl_top_1_mode raises ValueError ("must be one of").
+    # Inputs: tmp_path (pytest fixture). Outputs: none. Exceptions: AssertionError if no matching ValueError.
+    # Side effects: none.
     with pytest.raises(ValueError, match="reverse_kl_top_1_mode must be one of"):
         IWOPDConfig(**_make_distillation_config_kwargs(tmp_path), reverse_kl_top_1_mode="invalid")
 
 
 def test_distillation_config_rejects_invalid_distillation_objective(tmp_path):
+    # [FUNCTION DOC]
+    # Tests an unknown distillation_objective raises ValueError ("must be one of").
+    # Inputs: tmp_path (pytest fixture). Outputs: none. Exceptions: AssertionError if no matching ValueError.
+    # Side effects: none.
     with pytest.raises(ValueError, match="distillation_objective must be one of"):
         IWOPDConfig(**_make_distillation_config_kwargs(tmp_path), distillation_objective="invalid")
 
 
 def test_distillation_config_rejects_invalid_iw_opd_gamma(tmp_path):
+    # [FUNCTION DOC]
+    # Tests a negative iw_opd_gamma raises ValueError ("must be non-negative").
+    # Inputs: tmp_path (pytest fixture). Outputs: none. Exceptions: AssertionError if no matching ValueError.
+    # Side effects: none.
     with pytest.raises(ValueError, match="iw_opd_gamma must be non-negative"):
         IWOPDConfig(**_make_distillation_config_kwargs(tmp_path), iw_opd_gamma=-0.1)
 
 
 def test_distillation_config_rejects_invalid_iw_opd_epsilon(tmp_path):
+    # [FUNCTION DOC]
+    # Tests iw_opd_epsilon 0.0 raises ValueError ("must be positive").
+    # Inputs: tmp_path (pytest fixture). Outputs: none. Exceptions: AssertionError if no matching ValueError.
+    # Side effects: none.
     with pytest.raises(ValueError, match="iw_opd_epsilon must be positive"):
         IWOPDConfig(**_make_distillation_config_kwargs(tmp_path), iw_opd_epsilon=0.0)
 
 
 def test_distillation_config_rejects_iw_opd_when_not_fully_on_policy(tmp_path):
+    # [FUNCTION DOC]
+    # Tests the iw_opd objective with lmbda 0.5 raises ValueError (requires lmbda 1.0).
+    # Inputs: tmp_path (pytest fixture). Outputs: none. Exceptions: AssertionError if no matching ValueError.
+    # Side effects: none.
     with pytest.raises(ValueError, match="distillation_objective='iw_opd' requires lmbda=1.0"):
         IWOPDConfig(
             **_make_distillation_config_kwargs(tmp_path),
@@ -168,6 +237,10 @@ def test_distillation_config_rejects_iw_opd_when_not_fully_on_policy(tmp_path):
 
 
 def test_distillation_config_rejects_iw_opd_with_argmax_top_1_mode(tmp_path):
+    # [FUNCTION DOC]
+    # Tests the iw_opd objective with reverse_kl_top_1_mode argmax raises ValueError (requires sampled).
+    # Inputs: tmp_path (pytest fixture). Outputs: none. Exceptions: AssertionError if no matching ValueError.
+    # Side effects: none.
     with pytest.raises(ValueError, match="distillation_objective='iw_opd' requires reverse_kl_top_1_mode='sampled'"):
         IWOPDConfig(
             **_make_distillation_config_kwargs(tmp_path),
@@ -177,6 +250,10 @@ def test_distillation_config_rejects_iw_opd_with_argmax_top_1_mode(tmp_path):
 
 
 def test_distillation_config_rejects_teacher_server_with_reverse_kl_argmax(tmp_path):
+    # [FUNCTION DOC]
+    # Tests the jsd objective with a teacher server and argmax top-1 mode raises ValueError (not supported).
+    # Inputs: tmp_path (pytest fixture). Outputs: none. Exceptions: AssertionError if no matching ValueError.
+    # Side effects: none.
     with pytest.raises(ValueError, match="reverse_kl_top_1_mode='argmax' is not supported"):
         IWOPDConfig(
             **_make_distillation_config_kwargs(tmp_path),
@@ -188,6 +265,10 @@ def test_distillation_config_rejects_teacher_server_with_reverse_kl_argmax(tmp_p
 
 
 def test_distillation_config_rejects_teacher_server_mixed_loss_without_top_1(tmp_path):
+    # [FUNCTION DOC]
+    # Tests a teacher server with beta 0.5 and loss_top_k 2 raises ValueError (loss_top_k must be 1).
+    # Inputs: tmp_path (pytest fixture). Outputs: none. Exceptions: AssertionError if no matching ValueError.
+    # Side effects: none.
     with pytest.raises(ValueError, match="loss_top_k must be 1 when using use_teacher_server=True with beta>0"):
         IWOPDConfig(
             **_make_distillation_config_kwargs(tmp_path),
@@ -199,6 +280,10 @@ def test_distillation_config_rejects_teacher_server_mixed_loss_without_top_1(tmp
 
 
 def test_distillation_config_requires_teacher_server_url(tmp_path):
+    # [FUNCTION DOC]
+    # Tests use_teacher_server without teacher_model_server_url raises ValueError.
+    # Inputs: tmp_path (pytest fixture). Outputs: none. Exceptions: AssertionError if no matching ValueError.
+    # Side effects: none.
     with pytest.raises(ValueError, match="teacher_model_server_url must be set when use_teacher_server=True"):
         IWOPDConfig(
             **_make_distillation_config_kwargs(tmp_path),
@@ -275,6 +360,13 @@ def test_build_teacher_request_inputs(
     expected_prompt_lengths,
     expected_completion_lengths,
 ):
+    # [FUNCTION DOC]
+    # Parametrized cases: variable (left-padded) prompt lengths, padded on-policy completions with a
+    # prompt_attention_mask and right padding, and an empty completion. Tests that
+    # build_teacher_request_inputs strips padding to return unpadded sequences, real prompt lengths, and
+    # completion lengths (count of supervised labels) as expected.
+    # Inputs: input_ids, attention_mask, prompt_attention_mask (optional), labels tensors and expected
+    # lists. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     sequences, prompt_lengths, completion_lengths = build_teacher_request_inputs(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -288,7 +380,15 @@ def test_build_teacher_request_inputs(
 
 
 class TestGetTeacherTokenLogprobsFromServer(TrlTestCase):
+    # [CLASS DOC]
+    # Tests _get_teacher_token_logprobs_from_server densification of ragged server output.
     def test_variable_lengths_use_neg_inf_sentinel_at_padding(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Patches VLLMClient with a MagicMock returning the ragged response, builds a server-mode trainer, and
+        # calls the getter for a 2-row batch with aligned prompt length 2. Asserts actual_logprobs shape
+        # (2, 3) and topk_logprobs shape (2, 3, 1), real values preserved, sample 0's padded positions set
+        # to negative infinity, and sample 1 fully finite.
+        # Inputs: monkeypatch. Outputs: none. Exceptions: AssertionError. Side effects: downloads; tmp_dir.
         from trl.generation import vllm_client as vllm_client_module
 
         # Stand in for the teacher server, which cannot run here
@@ -332,7 +432,15 @@ class TestGetTeacherTokenLogprobsFromServer(TrlTestCase):
 
 
 class TestServerReverseKLPaddingMask(TrlTestCase):
+    # [CLASS DOC]
+    # Tests that masking -inf padded teacher logprobs before divergence math keeps loss and gradients
+    # finite.
     def test_mask_keeps_forward_and_backward_finite(self):
+        # [FUNCTION DOC]
+        # Replaces -inf teacher top-k values at label -100 positions with 0, adds a tail bucket via
+        # _add_tail_bucket (all-valid mask), asserts it is finite, computes _jsd_divergence (beta 1.0) with
+        # random student log-probs over 2 buckets, and asserts loss and student gradients are finite.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
         # Simulates the getter's output: sample 0 has completion length 1 (positions 1-2
         # padded with -inf), sample 1 is full-length.
         teacher_topk = torch.tensor(
@@ -360,7 +468,13 @@ class TestServerReverseKLPaddingMask(TrlTestCase):
 
 
 class TestGeneralizedJSDLoss(TrlTestCase):
+    # [CLASS DOC]
+    # Tests the static IWOPDTrainer.generalized_jsd_loss on random logits (batch 2, seq 3, vocab 5) built
+    # in setup_method.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets batch_size 2, seq_length 3, vocab_size 5 and random student_logits / teacher_logits
+        # of that shape. Inputs/Outputs: none. Exceptions: none. Side effects: consumes global torch RNG.
         self.batch_size = 2
         self.seq_length = 3
         self.vocab_size = 5
@@ -368,11 +482,19 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         self.teacher_logits = torch.randn(self.batch_size, self.seq_length, self.vocab_size)
 
     def test_uniform_distribution(self):
+        # [FUNCTION DOC]
+        # Tests identical uniform logits give a loss of 0 to 5 decimals.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         logits = torch.ones(1, 1, self.vocab_size)
         loss = IWOPDTrainer.generalized_jsd_loss(logits, logits)
         assert round(abs(loss.item() - 0), 5) == 0
 
     def test_generalized_jsd_loss_edge_cases(self):
+        # [FUNCTION DOC]
+        # Tests on two-token distributions (0.1/0.9 vs 0.9/0.1) that beta=1 equals the batchmean KL
+        # divergence computed with teacher log-probs as input and student probs as target, and beta=0 equals
+        # the one with student log-probs as input and teacher probs as target (5-decimal tolerance).
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         # Setup
         student_logits = torch.log(torch.tensor([[0.1, 0.9]])).unsqueeze(0)
         teacher_logits = torch.log(torch.tensor([[0.9, 0.1]])).unsqueeze(0)
@@ -392,21 +514,33 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         assert round(abs(loss_beta_0.item() - expected_loss_beta_0.item()), 5) == 0
 
     def test_output_shape(self):
+        # [FUNCTION DOC]
+        # Tests the default reduction returns a scalar tensor.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         loss = IWOPDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits)
         assert torch.is_tensor(loss)
         assert loss.shape == torch.Size([])
 
     def test_beta_values(self):
+        # [FUNCTION DOC]
+        # Tests beta 0 and beta 1 give different losses.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         loss_beta_0 = IWOPDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=0)
         loss_beta_1 = IWOPDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=1)
         assert loss_beta_0 != loss_beta_1
 
     def test_temperature_scaling(self):
+        # [FUNCTION DOC]
+        # Tests temperature 1 and 2 give different losses.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         loss_temp_1 = IWOPDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, temperature=1)
         loss_temp_2 = IWOPDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, temperature=2)
         assert loss_temp_1 != loss_temp_2
 
     def test_reduction_methods(self):
+        # [FUNCTION DOC]
+        # Tests batchmean, sum, and mean reductions return scalars and none returns the logits' shape.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         loss_batchmean = IWOPDTrainer.generalized_jsd_loss(
             self.student_logits, self.teacher_logits, reduction="batchmean"
         )
@@ -420,6 +554,9 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         assert loss_none.shape == self.student_logits.shape
 
     def test_symmetry(self):
+        # [FUNCTION DOC]
+        # Tests swapping student and teacher changes the loss at beta 0.1 but not at beta 0.5 (symmetric JSD).
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         student_teacher = IWOPDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=0.1)
         teacher_student = IWOPDTrainer.generalized_jsd_loss(self.teacher_logits, self.student_logits, beta=0.1)
         assert student_teacher != teacher_student
@@ -429,18 +566,32 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         assert student_teacher == teacher_student
 
     def test_zero_loss_for_identical_inputs(self):
+        # [FUNCTION DOC]
+        # Tests identical random logits give a loss of 0 to 6 decimals.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         identical_logits = torch.randn(self.batch_size, self.seq_length, self.vocab_size)
         loss = IWOPDTrainer.generalized_jsd_loss(identical_logits, identical_logits)
         assert round(abs(loss.item() - 0), 6) == 0
 
 
 class TestIWOPDTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # Integration tests for IWOPDTrainer on CPU with tiny Qwen2 as both student and teacher. Helpers
+    # build configs (JSD objective pinned by default), local/server trainers, and collated batches.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets self.model_id and self.tokenizer (pad = eos). Inputs/Outputs: none.
+        # Exceptions: load errors propagate. Side effects: network/cache.
         self.model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def _make_args(self, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Builds IWOPDConfig with test defaults (batch 2, grad accum 1, 1 step, no saving, CPU, no
+        # bf16, lmbda 0.0, distillation_objective jsd, max_length 128, max_completion_length 32, float32
+        # student and teacher init kwargs with no device_map), overridden by kwargs.
+        # Inputs: kwargs. Outputs: IWOPDConfig. Exceptions: config validation ValueError. Side effects: none.
         args = {
             "output_dir": self.tmp_dir,
             "per_device_train_batch_size": 2,
@@ -464,6 +615,10 @@ class TestIWOPDTrainer(TrlTestCase):
         return IWOPDConfig(**args)
 
     def _make_local_trainer(self, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Returns an IWOPDTrainer with the model id as student and local teacher on zen
+        # conversational LM train split. Inputs: kwargs for _make_args. Outputs: IWOPDTrainer.
+        # Exceptions: propagates. Side effects: downloads.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
         return IWOPDTrainer(
             model=self.model_id,
@@ -474,6 +629,10 @@ class TestIWOPDTrainer(TrlTestCase):
         )
 
     def _make_server_trainer(self, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Like the local trainer but with no teacher model and use_teacher_server True at
+        # localhost:8000. Inputs: kwargs. Outputs: IWOPDTrainer. Exceptions: propagates.
+        # Side effects: constructs whatever VLLMClient is currently bound (patched in tests).
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
         return IWOPDTrainer(
             model=self.model_id,
@@ -484,14 +643,25 @@ class TestIWOPDTrainer(TrlTestCase):
         )
 
     def _make_batch(self, trainer):
+        # [FUNCTION DOC]
+        # HELPER: Collates the first two train examples with the trainer's data collator.
+        # Inputs: trainer. Outputs: dict batch. Exceptions: none expected. Side effects: none.
         examples = [trainer.train_dataset[i] for i in range(2)]
         return trainer.data_collator(examples)
 
     @staticmethod
     def _move_batch_to_device(batch, device):
+        # [FUNCTION DOC]
+        # HELPER: Returns a new dict with every value moved to device. Inputs: batch (dict of tensors),
+        # device. Outputs: dict. Exceptions: AttributeError for non-tensor values. Side effects: none.
         return {key: value.to(device) for key, value in batch.items()}
 
     def test_distillation_trainer_train_runs_with_local_teacher(self):
+        # [FUNCTION DOC]
+        # Trains 4 steps with eval and saves every 2 steps; asserts train_loss and eval_loss logged, overall
+        # train_loss approximately 0 (student equals teacher), and model.safetensors in checkpoint-2.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models/datasets; writes to tmp_dir.
         training_args = self._make_args(
             dataloader_drop_last=True,
             eval_strategy="steps",
@@ -532,6 +702,12 @@ class TestIWOPDTrainer(TrlTestCase):
         ],
     )
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over regular and streaming variants of dataset, dataset dict, and dict of datasets,
+        # plus none. Tests eval datasets are stored as is (no preparation): None stays None; dicts keep keys
+        # data1/data2; single datasets are the same object.
+        # Inputs: eval_dataset_type (str). Outputs: none. Exceptions: AssertionError.
+        # Side effects: downloads; tmp_dir.
         train_dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
 
         if eval_dataset_type == "none":
@@ -569,6 +745,11 @@ class TestIWOPDTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("loss_top_k", [0, 1])
     def test_loss_normalizes_by_num_items_in_batch(self, loss_top_k):
+        # [FUNCTION DOC]
+        # Parametrized over loss_top_k 0 (full-vocab JSD) and 1 (mixed top-1). Perturbs teacher weights,
+        # counts valid labels after _compute_prompt_length, and asserts compute_loss with that count equals
+        # the local mean while double the count halves it.
+        # Inputs: loss_top_k (int). Outputs: none. Exceptions: AssertionError. Side effects: downloads.
         # When `num_items_in_batch` is passed (as under gradient accumulation), the divergence loss must be reduced as
         # sum / num_items_in_batch rather than the local per-microbatch mean. See issue #4719. Both the full-vocabulary
         # JSD path (loss_top_k=0) and the default mixed top-1 path (loss_top_k=1) route through
@@ -599,6 +780,12 @@ class TestIWOPDTrainer(TrlTestCase):
         torch.testing.assert_close(loss_double, loss_mean / 2, rtol=1e-4, atol=1e-6)
 
     def test_sampled_mode_matches_between_local_and_external_teachers(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Patches VLLMClient with a RecordingTeacherClient, builds local (sampled top-1 mode) and server
+        # trainers, computes the local teacher logits, loads the fake server result from them, and asserts
+        # the server request used the expected unpadded sequences, prompt lengths and top_logprobs 1, and the
+        # two losses match.
+        # Inputs: monkeypatch. Outputs: none. Exceptions: AssertionError. Side effects: downloads.
         import trl.generation.vllm_client as vllm_client_module
 
         teacher_client = RecordingTeacherClient()
@@ -638,6 +825,14 @@ class TestIWOPDTrainer(TrlTestCase):
         torch.testing.assert_close(local_loss, server_loss)
 
     def test_iw_opd_prefix_weights_and_loss(self):
+        # [FUNCTION DOC]
+        # Builds a bare trainer via object.__new__ (temperature 1, gamma 0.5, epsilon 1e-8, metrics dict,
+        # training model stand-in) and calls _compute_iw_opd_loss on uniform zero student logits with teacher
+        # logprobs offset from the student's by known advantages (row 1 has only one valid token). Asserts
+        # the loss equals minus student logprob times the sum of weight times advantage over 4 valid
+        # tokens, with prefix weights 1.5, 1.4, 1.25 and 1.5; that max/min weight metrics are 1.5 and 1.25;
+        # that num_items_in_batch 8 rescales the loss by 4/8; and that gradients are finite.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
         trainer = IWOPDTrainer.__new__(IWOPDTrainer)
         trainer.temperature = 1.0
         trainer.iw_opd_gamma = 0.5
@@ -686,6 +881,14 @@ class TestIWOPDTrainer(TrlTestCase):
         assert torch.isfinite(student_logits.grad).all()
 
     def test_iw_opd_uses_cached_rollout_logprobs(self):
+        # [FUNCTION DOC]
+        # Part 1: with gamma 0, asserts _compute_iw_opd_loss uses rollout_logprobs (not current student
+        # logprobs) for the advantage, giving minus the current logprob times the summed teacher minus
+        # rollout difference over 2 tokens. Part 2: on another bare trainer with a fake tokenizer, stores two
+        # completions of different prompt lengths via _store_completions_in_buffer and asserts the buffered
+        # rollout_logprobs have the same full-sequence shape as labels, prompt length is 1, and after slicing
+        # every supervised token maps to its recorded logprob.
+        # Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
         trainer = IWOPDTrainer.__new__(IWOPDTrainer)
         trainer.temperature = 1.0
         trainer.iw_opd_gamma = 0.0
@@ -716,10 +919,15 @@ class TestIWOPDTrainer(TrlTestCase):
         # padded prompt width, so rollout logprobs must be stored at full sequence width to survive the
         # labels-style slice in compute_loss.
         class _Tok:
+            # [CLASS DOC]
+            # HELPER: Minimal tokenizer stand-in with pad_token_id 0 and a batch_decode joining token ids.
             pad_token_id = 0
 
             @staticmethod
             def batch_decode(sequences, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+                # [FUNCTION DOC]
+                # HELPER: Returns each sequence's integer ids joined by spaces. Inputs: sequences, ignored flags.
+                # Outputs: list[str]. Exceptions: none. Side effects: none.
                 return [" ".join(str(int(t)) for t in seq) for seq in sequences]
 
         trainer = IWOPDTrainer.__new__(IWOPDTrainer)
@@ -756,6 +964,11 @@ class TestIWOPDTrainer(TrlTestCase):
             torch.testing.assert_close(sliced_rollout[row, col].item(), expected[(row, token)])
 
     def test_iw_opd_train_runs_with_local_teacher(self):
+        # [FUNCTION DOC]
+        # Trains 1 step with iw_opd objective (lmbda 1.0, 8 completion tokens); asserts a finite train_loss
+        # and an iw_opd/mean_weight metric logged.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models/datasets; writes to tmp_dir.
         trainer = self._make_local_trainer(
             distillation_objective="iw_opd",
             lmbda=1.0,
@@ -769,6 +982,10 @@ class TestIWOPDTrainer(TrlTestCase):
         assert any("iw_opd/mean_weight" in record for record in trainer.state.log_history)
 
     def test_iw_opd_server_path_uses_actual_logprobs(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Patches VLLMClient with a RecordingTeacherClient preloaded with canned logprobs for the batch's
+        # request; asserts compute_loss under iw_opd server mode is finite and requested top_logprobs 1.
+        # Inputs: monkeypatch. Outputs: none. Exceptions: AssertionError. Side effects: downloads.
         import trl.generation.vllm_client as vllm_client_module
 
         teacher_client = RecordingTeacherClient()
@@ -794,6 +1011,11 @@ class TestIWOPDTrainer(TrlTestCase):
         assert teacher_client.calls[0]["top_logprobs"] == 1
 
     def test_pad_token_id_synced_with_model_config(self):
+        # [FUNCTION DOC]
+        # Tests with tiny Mistral (no pad token) that the trainer sets a pad token and the student config
+        # and generation config pad_token_id equal it.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models/datasets; writes to tmp_dir.
         # This model's tokenizer has no pad token, so the trainer falls back to the eos token. The model configs must
         # follow: otherwise `Trainer` realigns them at train time and reports it as a change the user did not make.
         model_id = "trl-internal-testing/tiny-MistralForCausalLM-0.2"
@@ -813,8 +1035,14 @@ class TestIWOPDTrainer(TrlTestCase):
 
 
 class TestIWOPDTrainerServerPath(TrlTestCase):
+    # [CLASS DOC]
+    # End-to-end server-path training with a fake teacher client on ragged batches; setup_class loads the
+    # tokenizer (pad = eos) and picks cuda or cpu.
     @classmethod
     def setup_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Sets cls.device, cls.tokenizer (pad = eos), cls.model_id. Inputs: cls. Outputs: none.
+        # Exceptions: load errors. Side effects: network/cache.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         cls.device = "cuda" if torch.cuda.is_available() else "cpu"
         cls.tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -822,6 +1050,13 @@ class TestIWOPDTrainerServerPath(TrlTestCase):
         cls.model_id = model_id
 
     def _run_one_step(self, bs, ga, monkeypatch):
+        # [FUNCTION DOC]
+        # HELPER: Patches VLLMClient with a MagicMock whose get_sequence_logprobs uses
+        # _canned_teacher_logprobs, trains a server-mode JSD trainer (beta 1.0, top-1 with tail, lmbda 0,
+        # lr 1e-4, logging every step) on the variable-length dataset with the given batch size and grad
+        # accumulation, and returns log records containing grad_norm.
+        # Inputs: bs, ga (int), monkeypatch. Outputs: list[dict]. Exceptions: propagates training errors.
+        # Side effects: monkeypatch; tmp_dir.
         from trl.generation import vllm_client as vllm_client_module
 
         fake_client = MagicMock()
@@ -861,6 +1096,10 @@ class TestIWOPDTrainerServerPath(TrlTestCase):
 
     @pytest.mark.parametrize(("bs", "ga"), [(1, 2), (2, 1)])
     def test_reverse_kl_finite_grad_with_ragged_batch(self, bs, ga, monkeypatch):
+        # [FUNCTION DOC]
+        # Parametrized over (bs, ga) of (1, 2) and (2, 1): asserts at least one grad_norm record and that all
+        # grad_norm and loss values are finite (no -inf padding leaks into backward).
+        # Inputs: bs, ga, monkeypatch. Outputs: none. Exceptions: AssertionError. Side effects: as helper.
         records = self._run_one_step(bs=bs, ga=ga, monkeypatch=monkeypatch)
         assert records, "Expected at least one grad_norm log entry during training"
         for record in records:
@@ -869,17 +1108,32 @@ class TestIWOPDTrainerServerPath(TrlTestCase):
 
 
 def test_repeat_batch_dataloader_delegates_set_epoch_via_getattr():
+    # [FUNCTION DOC]
+    # Tests _RepeatBatchDataLoader forwards set_epoch(7) to the wrapped dataloader (epoch becomes 7).
+    # Inputs: none. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
     class DummyDataLoader:
+        # [CLASS DOC]
+        # HELPER: Minimal dataloader yielding one batch, length 1, recording set_epoch calls.
         def __init__(self):
+            # [FUNCTION DOC]
+            # HELPER: Sets epoch to None. Inputs/Outputs: none. Exceptions: none. Side effects: sets attribute.
             self.epoch = None
 
         def __iter__(self):
+            # [FUNCTION DOC]
+            # HELPER: Generator yielding a single batch with x 1. Inputs: none. Outputs: iterator of dict.
+            # Exceptions: none. Side effects: none.
             yield {"x": 1}
 
         def __len__(self):
+            # [FUNCTION DOC]
+            # HELPER: Returns 1. Inputs: none. Outputs: int. Exceptions: none. Side effects: none.
             return 1
 
         def set_epoch(self, epoch):
+            # [FUNCTION DOC]
+            # HELPER: Stores epoch. Inputs: epoch (int). Outputs: None. Exceptions: none.
+            # Side effects: sets self.epoch.
             self.epoch = epoch
 
     dataloader = DummyDataLoader()

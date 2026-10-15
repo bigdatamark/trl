@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Example script: multi-environment GRPO in a single run (Qwen3-1.7B): Wordle (TextArena) and Catch (OpenSpiel),
+# both on HF Spaces, wrapped in one environment_factory class. A dataset "env" column routes each sample to its game
+# at reset time; per-game reward functions return None for samples of the other game.
+# Main contents: wordle_prompt, catch_prompt, default URLs, grid constants (10 rows, 5 columns), _format_catch_obs,
+# MultiEnv, wordle_reward, catch_reward, main. Import-time side effects: none beyond imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -88,6 +95,13 @@ CATCH_COLS = 5
 
 
 def _format_catch_obs(info_state: list[float]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Describes the flattened 10x5 Catch grid (row-major): cells equal to 1.0 above the last row are the ball
+    # (1-based row/column), cells in the last row are the paddle (1-based column). Emits ball position, paddle column
+    # and the ball's relative horizontal offset (LEFT/RIGHT columns or directly above), newline-joined.
+    # Inputs: info_state floats. Outputs: string (possibly empty).
+    # KNOWN ISSUE: when the ball reaches the last row it is treated as the paddle and the ball line is omitted.
+    # Exceptions: none. Side effects: none.
     """Convert the flat 50-float observation into a readable text description."""
     ball_row = ball_col = paddle_col = None
     for idx, val in enumerate(info_state):
@@ -114,10 +128,18 @@ def _format_catch_obs(info_state: list[float]) -> str:
 
 
 class MultiEnv:
+    # [CLASS DOC]
+    # Per-rollout environment that hosts either a Wordle or a Catch session. Class attributes wordle_url and catch_url
+    # (set by main) choose servers. State: lazily created _wordle_client/_catch_client, active game name, reward, done and
+    # (Wordle) _last_full_feedback for diffing the cumulative transcript. Tools: guess (Wordle only), move and stay
+    # (Catch only), with _catch_action shared by the Catch tools. No base class.
     wordle_url = DEFAULT_WORDLE_URL
     catch_url = DEFAULT_CATCH_URL
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: sets both clients and active to None, reward 0 and done False (no network).
+        # Inputs: none. Outputs: none. Exceptions: none. Side effects: none.
         self._wordle_client = None
         self._catch_client = None
         self.active = None
@@ -125,6 +147,13 @@ class MultiEnv:
         self.done = False
 
     def reset(self, **kwargs) -> str | None:
+        # [FUNCTION DOC]
+        # Behavior: reads the "env" kwarg (default "wordle") into active and clears reward/done. For wordle: closes any
+        # previous client (ignoring errors), creates a new TextArenaEnv, resets it, stores and returns the first message
+        # content as the initial feedback. For catch: closes any previous OpenSpiel client similarly, creates a new one,
+        # resets it, stores done and returns the formatted grid.
+        # Inputs: dataset row kwargs including "env". Outputs: observation string.
+        # Exceptions: ValueError for unknown env names; network errors. Side effects: creates/closes clients, remote resets.
         self.active = kwargs.get("env", "wordle")
         self.reward = 0.0
         self.done = False
@@ -154,6 +183,12 @@ class MultiEnv:
             raise ValueError(f"Unknown environment: {self.active}")
 
     def guess(self, guess: str) -> str:
+        # [FUNCTION DOC]
+        # Tool: Wordle guess. Raises unless active is wordle and the game is not done. Steps with the guess, takes the new
+        # cumulative first-message content, returns only the suffix beyond the previous transcript and updates it. Reward is
+        # 0 if the new feedback reports an invalid move, else the step reward; done is updated.
+        # Inputs: guess string (expected bracketed, e.g. "[crane]"). Outputs: new feedback text.
+        # Exceptions: ValueError for wrong game or finished game; network errors. Side effects: remote step, mutates state.
         """
         Make a guess in the Wordle environment.
 
@@ -179,6 +214,10 @@ class MultiEnv:
         return feedback
 
     def _catch_action(self, action_id: int) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Raises if done; steps the Catch client with the action id for game "catch"; stores reward (None as 0) and
+        # done; returns the formatted grid. Inputs: action_id (0 left, 1 stay, 2 right). Outputs: string.
+        # Exceptions: ValueError("Episode is done."); network errors. Side effects: remote step, mutates reward/done.
         if self.done:
             raise ValueError("Episode is done.")
         result = self._catch_client.step(OpenSpielAction(action_id=action_id, game_name="catch"))
@@ -187,6 +226,10 @@ class MultiEnv:
         return _format_catch_obs(result.observation.info_state)
 
     def move(self, direction: str) -> str:
+        # [FUNCTION DOC]
+        # Tool: Catch only; maps "left" to 0 and "right" to 2 and performs it.
+        # Inputs: direction. Outputs: observation string.
+        # Exceptions: ValueError when not in Catch, for invalid direction, or when done. Side effects: remote step.
         """Move the paddle left or right.
 
         Args:
@@ -206,6 +249,9 @@ class MultiEnv:
         return self._catch_action(action_id)
 
     def stay(self) -> str:
+        # [FUNCTION DOC]
+        # Tool: Catch only; performs action 1. Inputs: none. Outputs: observation string.
+        # Exceptions: ValueError when not in Catch or when done. Side effects: remote step.
         """Do nothing and let the ball fall one step.
 
         Returns:
@@ -217,10 +263,16 @@ class MultiEnv:
 
 
 def wordle_reward(environments, **kwargs) -> list[float | None]:
+    # [FUNCTION DOC]
+    # Behavior: per environment, its reward when active is wordle, else None (excluded from this reward).
+    # Inputs: environments, kwargs ignored. Outputs: list of float or None. Exceptions: none. Side effects: none.
     return [env.reward if env.active == "wordle" else None for env in environments]
 
 
 def catch_reward(environments, **kwargs) -> list[float | None]:
+    # [FUNCTION DOC]
+    # Behavior: per environment, None if not Catch; if done, max(reward, 0) (catch 1, miss 0); otherwise 0.0.
+    # Inputs: environments, kwargs ignored. Outputs: list of float or None. Exceptions: none. Side effects: none.
     rewards = []
     for env in environments:
         if env.active != "catch":
@@ -234,6 +286,13 @@ def catch_reward(environments, **kwargs) -> list[float | None]:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: parses known args --wordle-url and --catch-url (unknown args ignored), sets MultiEnv class URLs, builds a
+    # dataset with 500 Wordle and 500 Catch prompts plus the "env" routing column, and trains GRPOTrainer on
+    # Qwen/Qwen3-1.7B with both reward functions and environment_factory MultiEnv (wandb reporting, completion logging,
+    # log every step, thinking disabled, completion length 1024); calls trainer.end().
+    # Inputs: command line. Outputs: none. Exceptions: propagates network/training errors.
+    # Side effects: mutates class attributes, remote environment traffic, GPU training, wandb logging, output files.
     parser = argparse.ArgumentParser(description="Multi-environment GRPO training")
     parser.add_argument("--wordle-url", default=DEFAULT_WORDLE_URL, help="Wordle environment URL")
     parser.add_argument("--catch-url", default=DEFAULT_CATCH_URL, help="Catch environment URL")

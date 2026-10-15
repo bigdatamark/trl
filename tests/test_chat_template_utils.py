@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Tests for trl.chat_template_utils: clone_chat_template, add_response_schema, supports_tool_calling,
+# is_chat_template_prefix_preserving, is_chat_template_stop_token_trained, get_training_chat_template (training
+# templates with generation markers that must render identically to the originals), has_generation_markers for
+# named template variants, parse_response (content, reasoning, tool calls, argument typing, malformed and truncated
+# output), and a check that every bundled Jinja template is documented.
+# Main contents: three plain tool functions (multiply, addition, get_weather) whose docstrings provide tool schemas,
+# and one test class per utility; heavy use of parametrization over tiny trl-internal-testing models, with
+# version-dependent skip/xfail marks keyed on the installed transformers version.
+# Import-time side effects: none beyond evaluating version checks for marks.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +62,9 @@ from .testing_utils import TrlTestCase, require_response_parsing, require_vision
 
 
 def multiply(a: int, b: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Tool function used as a tool schema in parsing tests; returns a times b.
+    # Inputs: a, b - int. Outputs: int. Exceptions: none. Side effects: none.
     """
     Multiplies two integers.
 
@@ -62,6 +76,9 @@ def multiply(a: int, b: int) -> int:
 
 
 def addition(a: int, b: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Tool function used as a tool schema in parsing tests; returns a plus b.
+    # Inputs: a, b - int. Outputs: int. Exceptions: none. Side effects: none.
     """
     Adds two integers.
 
@@ -73,6 +90,10 @@ def addition(a: int, b: int) -> int:
 
 
 def get_weather(zip_code: str, days: int, threshold: float, metric: bool, fields: list[str]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Tool function with typed parameters (str, int, float, bool, list of str) used to check argument type
+    # coercion in parse_response; always returns "sunny".
+    # Inputs: zip_code, days, threshold, metric, fields (unused). Outputs: str. Exceptions: none. Side effects: none.
     """
     Gets the weather forecast.
 
@@ -87,7 +108,13 @@ def get_weather(zip_code: str, days: int, threshold: float, metric: bool, fields
 
 
 class TestCloneChatTemplate(TrlTestCase):
+    # [CLASS DOC]
+    # Tests clone_chat_template, which copies the chat template and special tokens of a source tokenizer
+    # (tiny Qwen3) onto a model/tokenizer without one (tiny GPT2 or GPTNeoX), optionally resizing embeddings.
+    # Inherits TrlTestCase.
     def test_clone(self):
+        # [FUNCTION DOC]
+        # Checks cloning onto tiny GPT2 sets the tokenizer's eos token to "<|im_end|>". Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         # This tokenizer doesn't have a chat_template by default
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-GPT2LMHeadModel")
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-GPT2LMHeadModel")
@@ -99,6 +126,9 @@ class TestCloneChatTemplate(TrlTestCase):
         assert modified_tokenizer.eos_token == "<|im_end|>"
 
     def test_clone_with_resize(self):
+        # [FUNCTION DOC]
+        # Checks resize_to_multiple_of 123 makes the model vocab size a multiple of 123 and equal to the tokenizer vocab
+        # length (the original model object is resized in place). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         # This tokenizer doesn't have a chat_template by default
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-GPT2LMHeadModel")
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-GPT2LMHeadModel")
@@ -114,6 +144,11 @@ class TestCloneChatTemplate(TrlTestCase):
         assert model.vocab_size == len(modified_tokenizer.vocab)
 
     def test_clone_with_resize_and_extra_tokens_already_in_vocab(self):
+        # [FUNCTION DOC]
+        # Checks cloning twice (first resizing to a multiple of 123, then again to 124 when the added extra tokens already
+        # exist) yields a vocab size multiple of 124 matching the tokenizer vocab length.
+        # KNOWN ISSUE: the inline comment says "multiple of 123" while the assertion checks 124.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         # This tokenizer doesn't have a chat_template by default
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-GPT2LMHeadModel")
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-GPT2LMHeadModel")
@@ -134,6 +169,9 @@ class TestCloneChatTemplate(TrlTestCase):
         assert model.vocab_size == len(modified_tokenizer.vocab)
 
     def test_apply_new_chat_template(self):
+        # [FUNCTION DOC]
+        # Checks the cloned template renders a system/user/assistant conversation to the exact Qwen3 string, including an
+        # empty think block before the assistant content. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         # This tokenizer doesn't have a chat_template by default
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-GPT2LMHeadModel")
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-GPT2LMHeadModel")
@@ -153,6 +191,8 @@ class TestCloneChatTemplate(TrlTestCase):
         )
 
     def test_clone_with_sequence_classification_model(self):
+        # [FUNCTION DOC]
+        # Checks cloning also works for a sequence-classification model (tiny GPTNeoX): eos becomes "<|im_end|>". Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         # This tokenizer doesn't have a chat_template by default
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-GPTNeoXForSequenceClassification")
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -173,6 +213,10 @@ class TestCloneChatTemplate(TrlTestCase):
 )
 @require_response_parsing
 class TestAddResponseSchema:
+    # [CLASS DOC]
+    # Tests add_response_schema, which attaches a response parser (new-style response_template on transformers 5.13+,
+    # else legacy response_schema) to a tokenizer or a processor's inner tokenizer. Strict xfail below transformers
+    # 5.0; requires response-parsing support. Plain pytest class, no state.
     @pytest.mark.parametrize(
         "tokenizer_name",
         [
@@ -234,6 +278,12 @@ class TestAddResponseSchema:
         ],
     )
     def test_add_response_schema(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Parametrized over many tiny text models (GLM4-MoE, GPT-OSS, LFM2.5, Llama 3.1/3.2, Nemotron variants, Qwen2.5,
+        # Qwen3, Qwen3 Instruct 2507) with version-based skip/xfail marks. Adds the schema, renders a user turn plus an
+        # assistant tool call (multiply 3, 4) as text, takes the text after the generation-prompt prefix and calls
+        # tokenizer.parse_response (with prefix only when response templates are supported). Passes if no error.
+        # Inputs: tokenizer_name. Outputs: none. Exceptions: any parsing error fails. Side effects: loads tokenizers.
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         tokenizer = add_response_schema(tokenizer)
         messages = [
@@ -279,6 +329,12 @@ class TestAddResponseSchema:
         ],
     )
     def test_add_response_schema_template_revision(self, tokenizer_name, chat_template):
+        # [FUNCTION DOC]
+        # Parametrized over LFM2/LFM2.5 tokenizers with the chat template of a later Hub revision (lfm2_v2,
+        # lfm2_2_5_v2); skipped without response template support. Sets that template, adds the schema, tokenizes the
+        # prompt and the full conversation with an assistant tool call, and asserts parse_response on the response ids (with
+        # prompt ids as prefix) returns exactly the assistant message.
+        # Inputs: tokenizer_name, chat_template. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         # Same tiny model, with the chat template of a later Hub revision
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         tokenizer.chat_template = chat_template
@@ -316,6 +372,12 @@ class TestAddResponseSchema:
     )
     @require_vision
     def test_add_response_schema_vlm(self, processor_name):
+        # [FUNCTION DOC]
+        # Parametrized over VLM processors (LFM2.5-VL, Qwen3-VL, Qwen3.5 think/no-think, Qwen3.6, Qwen3.8); requires vision.
+        # Asserts add_response_schema set response_template (or response_schema on older transformers) on the processor's
+        # inner tokenizer, then renders a multimodal conversation with an assistant tool call and checks the inner
+        # tokenizer's parse_response does not raise.
+        # Inputs: processor_name. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         # For VLM processors, `add_response_schema` must set the template/schema on the inner tokenizer, since
         # `parse_response` is a tokenizer method that reads `self.response_template` / `self.response_schema` from the
         # tokenizer instance. Which attribute is set depends on the installed transformers version.
@@ -370,6 +432,11 @@ class TestAddResponseSchema:
     )
     @require_vision
     def test_add_response_schema_vlm_template_revision(self, processor_name, chat_template):
+        # [FUNCTION DOC]
+        # Parametrized over the tiny Gemma4 processor with chat template revisions v2 to v5; requires vision and response
+        # templates. Sets the template, adds the schema, renders a converted multimodal conversation with a tool call as
+        # ids and asserts parse_response on the response (prompt ids as prefix) equals the original assistant message.
+        # Inputs: processor_name, chat_template. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         # Same tiny model, with the chat template of another Hub revision
         processor = AutoProcessor.from_pretrained(processor_name)
         processor.chat_template = chat_template
@@ -390,6 +457,9 @@ class TestAddResponseSchema:
 
 
 class TestSupportsToolCalling:
+    # [CLASS DOC]
+    # Tests supports_tool_calling, which probes whether a chat template renders tool calls and tool messages.
+    # Plain pytest class, no state.
     @pytest.mark.parametrize(
         "model_id",
         [
@@ -535,6 +605,10 @@ class TestSupportsToolCalling:
         ],
     )
     def test_supports_tool_calling(self, model_id):
+        # [FUNCTION DOC]
+        # Parametrized over many tool-capable tiny models (DeepSeek-V3, Gemma4, GLM4-MoE, LFM2.5, Nemotron, Qwen VL/3.5,
+        # Muse, etc., some requiring vision/version): asserts supports_tool_calling returns True.
+        # Inputs: model_id. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         assert supports_tool_calling(tokenizer) is True
 
@@ -590,6 +664,11 @@ class TestSupportsToolCalling:
         ],
     )
     def test_does_not_support_tool_calling(self, model_id):
+        # [FUNCTION DOC]
+        # Parametrized over models whose templates lack standard tool support (no template, rejects tool role, drops
+        # tool_calls, bespoke schemas such as Olmo3, early LFM2 revision, DeepSeek-R1-Distill); a parameter may be a
+        # (model id, chat template) pair, in which case the template is overridden. Asserts the result is False.
+        # Inputs: model_id. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         # A (model, chat template) pair stands for the same tiny model with the chat template of another Hub revision
         model_id, chat_template = model_id if isinstance(model_id, tuple) else (model_id, None)
         tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -599,7 +678,13 @@ class TestSupportsToolCalling:
 
 
 class TestIsChatTemplatePrefixPreserving:
+    # [CLASS DOC]
+    # Tests is_chat_template_prefix_preserving (rendering a conversation and then appending a message must keep the
+    # earlier output as a prefix) using hand-written Jinja templates on the tiny Qwen3-MoE tokenizer / Qwen3-VL
+    # processor. Plain pytest class.
     def test_prefix_preserving_template(self):
+        # [FUNCTION DOC]
+        # Sets a simple ChatML-style template (user, assistant with tool_call tags, tool) and asserts the result is True. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen3MoeForCausalLM")
         # docstyle-ignore
         tokenizer.chat_template = textwrap.dedent(r"""
@@ -630,6 +715,9 @@ class TestIsChatTemplatePrefixPreserving:
         assert is_chat_template_prefix_preserving(tokenizer) is True
 
     def test_non_prefix_preserving_template(self):
+        # [FUNCTION DOC]
+        # Sets a Qwen3-style template where think blocks are emitted only for assistant turns after the last user query
+        # (so appending a tool message changes earlier output) and asserts the result is False. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen3MoeForCausalLM")
         # The following template is quite typical of models like Qwen3 and GPT-OSS, where the thinking part (even
         # empty) is only present for last assistant message, which makes it non-prefix-preserving: appending a tool
@@ -693,6 +781,9 @@ class TestIsChatTemplatePrefixPreserving:
 
     @require_vision
     def test_prefix_preserving_template_processor(self):
+        # [FUNCTION DOC]
+        # Sets a prefix-preserving Qwen-VL-style template (list-of-block contents, image blocks rendered as vision pad
+        # tokens) on a processor and asserts the result is True. Requires vision. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         processor = AutoProcessor.from_pretrained("trl-internal-testing/tiny-Qwen3VLForConditionalGeneration")
         # Simple prefix-preserving template that mirrors how Qwen-VL templates emit image tokens: a list-of-blocks
         # content is iterated, and `{"type": "image"}` blocks are rendered as `<|vision_start|><|image_pad|><|vision_end|>`.
@@ -757,7 +848,12 @@ class TestIsChatTemplatePrefixPreserving:
 
 
 class TestIsChatTemplateStopTokenTrained:
+    # [CLASS DOC]
+    # Tests is_chat_template_stop_token_trained, which checks the end-of-turn token falls inside the generation span.
+    # Plain pytest class.
     def test_stop_token_trained(self):
+        # [FUNCTION DOC]
+        # Template whose generation block includes the closing im_end: asserts True. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen3MoeForCausalLM")
         # The assistant turn is closed by <|im_end|> inside the generation span, so the end-of-turn token is masked
         # in and the model is trained to stop.
@@ -778,6 +874,8 @@ class TestIsChatTemplateStopTokenTrained:
         assert is_chat_template_stop_token_trained(tokenizer) is True
 
     def test_stop_token_not_trained(self):
+        # [FUNCTION DOC]
+        # GLM-style template whose generation block holds content only, with im_end emitted outside: asserts False. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen3MoeForCausalLM")
         # GLM-style: the assistant's end-of-turn token is emitted as the prefix of the following message, so the
         # generation span covers content only and the model is never trained to stop.
@@ -798,6 +896,8 @@ class TestIsChatTemplateStopTokenTrained:
         assert is_chat_template_stop_token_trained(tokenizer) is False
 
     def test_template_error_returns_false(self):
+        # [FUNCTION DOC]
+        # Template that raises during rendering: asserts the probe returns False rather than raising. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen3MoeForCausalLM")
         tokenizer.chat_template = "{{ raise_exception('probe rejected') }}"
         assert is_chat_template_stop_token_trained(tokenizer) is False
@@ -975,7 +1075,21 @@ class TestIsChatTemplateStopTokenTrained:
     ],
 )
 class TestGetTrainingChatTemplate:
+    # [CLASS DOC]
+    # Class parametrized over tokenizer_name (many tiny text and VLM models; Cohere entries are (model, named-variant
+    # dict) pairs). Tests that get_training_chat_template returns a template (or None when the original is already
+    # suitable) that is prefix preserving, trains the stop token, yields assistant masks, and renders identically to
+    # the original template for a range of conversations, except documented intentional differences (GLM appends the
+    # next-turn marker after a final assistant turn; R1-Distill keeps reasoning). State: is_vlm set by _load.
     def _load(self, model_name):
+        # [FUNCTION DOC]
+        # HELPER: Loads the processing class for a parameter, which may be a (model id, chat template) pair.
+        # Behavior: ids containing "ForCausalLM" load an AutoTokenizer and set self.is_vlm False; ids containing
+        # "ForConditionalGeneration" or "ForBlockDiffusion" load an AutoProcessor and set is_vlm True; then the chat
+        # template is overridden when the pair provided one.
+        # Inputs: model_name - str or tuple. Outputs: tokenizer or processor.
+        # Exceptions: UnboundLocalError if the id matches neither pattern (does not happen for current params).
+        # Side effects: sets self.is_vlm; loads from the Hub.
         # A (model, chat template) pair stands for the same tiny model with another form of its chat template
         model_name, chat_template = model_name if isinstance(model_name, tuple) else (model_name, None)
         if "ForCausalLM" in model_name:
@@ -990,6 +1104,9 @@ class TestGetTrainingChatTemplate:
         return processing_class
 
     def test_new_chat_template_is_prefix_preserving(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Applies the training template (if not None), skips when the template does not support tool calling, and asserts
+        # is_chat_template_prefix_preserving is True. Inputs: tokenizer_name. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         new_chat_template = get_training_chat_template(tokenizer)
         if new_chat_template is not None:
@@ -1001,6 +1118,9 @@ class TestGetTrainingChatTemplate:
         assert is_chat_template_prefix_preserving(tokenizer) is True
 
     def test_new_chat_template_trains_stop_token(self, tokenizer_name, request):
+        # [FUNCTION DOC]
+        # Asserts is_chat_template_stop_token_trained is True for the training template; marked strict xfail for Llava
+        # (no end-of-turn token). Inputs: tokenizer_name, request (pytest node for adding the marker). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         if tokenizer_name == "trl-internal-testing/tiny-LlavaForConditionalGeneration":
             reason = "Llava's official chat template emits no end-of-turn token after the assistant turn."
             request.node.add_marker(pytest.mark.xfail(strict=True, reason=reason))
@@ -1009,6 +1129,10 @@ class TestGetTrainingChatTemplate:
         assert is_chat_template_stop_token_trained(tokenizer, chat_template=new_chat_template) is True
 
     def test_behavior_unchanged_single_user_no_generation_prompt(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Renders the conversation with the processing class's own chat template and with the template returned by
+        # get_training_chat_template (messages converted to multimodal block form first for VLMs). Single user message, no generation prompt:
+        # asserts both renders are equal. Parametrized via the class over tokenizer_name (a model id, or a (model id, chat template) pair). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         messages = [{"role": "user", "content": "What color is the sky?"}]
         if self.is_vlm:
@@ -1020,6 +1144,10 @@ class TestGetTrainingChatTemplate:
         assert before == after
 
     def test_behavior_unchanged_single_user_with_generation_prompt(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Renders the conversation with the processing class's own chat template and with the template returned by
+        # get_training_chat_template (messages converted to multimodal block form first for VLMs). Single user message with generation prompt:
+        # asserts equality. Parametrized via the class over tokenizer_name (a model id, or a (model id, chat template) pair). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         messages = [{"role": "user", "content": "What color is the sky?"}]
         if self.is_vlm:
@@ -1036,6 +1164,10 @@ class TestGetTrainingChatTemplate:
         assert before == after
 
     def test_behavior_unchanged_single_user_and_final_assistant_plain_content(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Renders the conversation with the processing class's own chat template and with the template returned by
+        # get_training_chat_template (messages converted to multimodal block form first for VLMs). User plus plain assistant reply:
+        # asserts equality, except for GLM4-MoE where the new render equals the old plus "<|user|>". Parametrized via the class over tokenizer_name (a model id, or a (model id, chat template) pair). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         messages = [
             {"role": "user", "content": "What color is the sky?"},
@@ -1056,6 +1188,10 @@ class TestGetTrainingChatTemplate:
             assert before == after
 
     def test_behavior_unchanged_final_assistant_with_reasoning_content(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Renders the conversation with the processing class's own chat template and with the template returned by
+        # get_training_chat_template (messages converted to multimodal block form first for VLMs). Assistant reply with reasoning_content:
+        # asserts equality, except GLM4-MoE appends "<|user|>". Parametrized via the class over tokenizer_name (a model id, or a (model id, chat template) pair). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         messages = [
             {"role": "user", "content": "What color is the sky?"},
@@ -1080,6 +1216,11 @@ class TestGetTrainingChatTemplate:
             assert before == after
 
     def test_behavior_unchanged_final_assistant_with_existing_think_tags(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Renders the conversation with the processing class's own chat template and with the template returned by
+        # get_training_chat_template (messages converted to multimodal block form first for VLMs). Assistant content already containing a think
+        # block: asserts equality, except GLM4-MoE appends "<|user|>" and R1-Distill keeps the think block right after the
+        # assistant marker (the original drops it). Parametrized via the class over tokenizer_name (a model id, or a (model id, chat template) pair). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         messages = [
             {"role": "user", "content": "What color is the sky?"},
@@ -1108,6 +1249,11 @@ class TestGetTrainingChatTemplate:
             assert before == after
 
     def test_behavior_unchanged_assistant_with_tool_calls(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Renders the conversation with the processing class's own chat template and with the template returned by
+        # get_training_chat_template (messages converted to multimodal block form first for VLMs). Assistant message with content and a multiply tool call; for
+        # DeepSeek-V3 the original is rendered with JSON-string arguments (its template rejects dict args), the training
+        # template with dict args. Asserts equality, except GLM4-MoE appends "<|observation|>". Parametrized via the class over tokenizer_name (a model id, or a (model id, chat template) pair). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         tool_calls = [{"type": "function", "function": {"name": "multiply", "arguments": {"a": 3, "b": 4}}}]
         messages = [
@@ -1135,6 +1281,12 @@ class TestGetTrainingChatTemplate:
             assert before == after
 
     def test_behavior_unchanged_with_tools_with_and_without_system_message(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Renders the conversation with the processing class's own chat template and with the template returned by
+        # get_training_chat_template (messages converted to multimodal block form first for VLMs). Single user message with a tools list:
+        # asserts equality.
+        # KNOWN ISSUE: despite the name, only the no-system-message case is exercised (the system case is the next test).
+        # Parametrized via the class over tokenizer_name (a model id, or a (model id, chat template) pair). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         tools = [
             {
@@ -1163,6 +1315,10 @@ class TestGetTrainingChatTemplate:
         assert before == after
 
     def test_behavior_unchanged_with_tools_with_system_message(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Renders the conversation with the processing class's own chat template and with the template returned by
+        # get_training_chat_template (messages converted to multimodal block form first for VLMs). System plus user messages with a tools list; skipped
+        # when tool calling is unsupported. Asserts equality. Parametrized via the class over tokenizer_name (a model id, or a (model id, chat template) pair). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         if not supports_tool_calling(tokenizer):
             pytest.skip("Template does not support tool calling; skipping tool_calls test.")
@@ -1193,6 +1349,10 @@ class TestGetTrainingChatTemplate:
         assert before == after
 
     def test_behavior_unchanged_generation_prompt_with_enable_thinking_false(self, tokenizer_name):
+        # [FUNCTION DOC]
+        # Renders the conversation with the processing class's own chat template and with the template returned by
+        # get_training_chat_template (messages converted to multimodal block form first for VLMs). Single user message with generation prompt
+        # and enable_thinking False: asserts equality. Parametrized via the class over tokenizer_name (a model id, or a (model id, chat template) pair). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = self._load(tokenizer_name)
         messages = [{"role": "user", "content": "What color is the sky?"}]
         if self.is_vlm:
@@ -1212,6 +1372,10 @@ class TestGetTrainingChatTemplate:
         assert before == after
 
     def test_assistant_masks(self, tokenizer_name, request):
+        # [FUNCTION DOC]
+        # Renders user plus assistant with the training template, return_assistant_tokens_mask True (first row for VLMs),
+        # and asserts the first token is unmasked and exactly one 0-to-1 transition exists. Strict xfail for Llava on
+        # transformers below 5.18.0.dev0. Inputs: tokenizer_name, request. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         if tokenizer_name == "trl-internal-testing/tiny-LlavaForConditionalGeneration" and Version(
             transformers.__version__
         ) < Version("5.18.0.dev0"):
@@ -1244,6 +1408,9 @@ class TestGetTrainingChatTemplate:
         assert region_starts == 1
 
     def test_assistant_masks_multi_turn(self, tokenizer_name, request):
+        # [FUNCTION DOC]
+        # Same as test_assistant_masks with two user/assistant exchanges: asserts exactly two masked regions start.
+        # Inputs: tokenizer_name, request. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         if tokenizer_name == "trl-internal-testing/tiny-LlavaForConditionalGeneration" and Version(
             transformers.__version__
         ) < Version("5.18.0.dev0"):
@@ -1277,12 +1444,20 @@ class TestGetTrainingChatTemplate:
 
 
 class TestNamedChatTemplateVariants:
+    # [CLASS DOC]
+    # Tests handling of chat templates shipped as named variants (a dict like default/tool_use/rag). Plain pytest class.
     # A chat template shipped as named variants loads as a dict, e.g. {"default": ..., "tool_use": ..., "rag": ...}
     def test_has_generation_markers(self):
+        # [FUNCTION DOC]
+        # Asserts has_generation_markers is True for a dict whose default is the Cohere training template and False for
+        # the plain Cohere template. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         assert has_generation_markers({"default": cohere_training_chat_template}) is True
         assert has_generation_markers({"default": cohere_chat_template}) is False
 
     def test_unsupported_default_variant(self):
+        # [FUNCTION DOC]
+        # Sets a variant dict whose default template is unknown on the tiny Cohere tokenizer and asserts
+        # get_training_chat_template raises ValueError ("not training-compatible"). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads tiny tokenizers/models from the Hub.
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-CohereForCausalLM")
         tokenizer.chat_template = {"default": "{{ messages[0]['content'] }}", "tool_use": cohere_chat_template}
         with pytest.raises(ValueError, match="not training-compatible"):
@@ -1417,7 +1592,18 @@ class TestNamedChatTemplateVariants:
 )
 @require_response_parsing
 class TestParseResponse:
+    # [CLASS DOC]
+    # Class parametrized over model_name (many tiny text and VLM models, including one that ships its own response
+    # template). Tests parse_response round trips: rendering an assistant message, slicing off the prompt, and parsing
+    # back must reproduce the message. Strict xfail below transformers 5.0; requires response parsing.
+    # State: is_vlm set by _load.
     def _load(self, model_name):
+        # [FUNCTION DOC]
+        # HELPER: Loads an AutoTokenizer ("ForCausalLM" ids, is_vlm False) or AutoProcessor ("ForConditionalGeneration",
+        # is_vlm True, using its inner tokenizer), and calls add_response_schema only when the tokenizer has neither a
+        # response_template nor a response_schema.
+        # Inputs: model_name. Outputs: processing class. Exceptions: UnboundLocalError for unmatched ids; errors from
+        # add_response_schema for unknown templates. Side effects: sets self.is_vlm; loads from the Hub.
         if "ForCausalLM" in model_name:
             self.is_vlm = False
             processing_class = AutoTokenizer.from_pretrained(model_name)
@@ -1437,6 +1623,11 @@ class TestParseResponse:
         return processing_class
 
     def test_parse_response(self, model_name):
+        # [FUNCTION DOC]
+        # Plain assistant content "12". Renders the user prompt with a generation prompt and the full conversation as token ids (taking the first row for
+        # VLM processors), slices off the prompt tokens to get the response, and calls parse_response on the tokenizer
+        # (inner tokenizer for VLMs) with the prompt ids as prefix. Asserts the parsed dict equals the assistant
+        # message. Skips GPT-OSS below transformers 5.5. Inputs: model_name (class parametrization). Outputs: none. Exceptions: assertion failure; skips as noted. Side effects: loads tokenizers/processors.
         if model_name in ("trl-internal-testing/tiny-GptOssForCausalLM",) and Version(
             transformers.__version__
         ) < Version("5.5.0"):
@@ -1461,6 +1652,12 @@ class TestParseResponse:
         assert parsed == expected
 
     def test_parse_response_with_reasoning_content(self, model_name):
+        # [FUNCTION DOC]
+        # Assistant message with reasoning ("Hmmm.") and content; the reasoning field is "thinking" for GPT-OSS and LFM2.5
+        # models and reasoning_content otherwise. Prompt rendered with enable_thinking True. Renders the user prompt with a generation prompt and the full conversation as token ids (taking the first row for
+        # VLM processors), slices off the prompt tokens to get the response, and calls parse_response on the tokenizer
+        # (inner tokenizer for VLMs) with the prompt ids as prefix. Asserts equality.
+        # Skips models without inline reasoning and GPT-OSS without response templates. Inputs: model_name (class parametrization). Outputs: none. Exceptions: assertion failure; skips as noted. Side effects: loads tokenizers/processors.
         if model_name in (
             "trl-internal-testing/tiny-Gemma4ForConditionalGeneration",
             "trl-internal-testing/tiny-LlamaForCausalLM-3.1",
@@ -1509,6 +1706,11 @@ class TestParseResponse:
         assert parsed == expected
 
     def test_parse_response_tool_call(self, model_name):
+        # [FUNCTION DOC]
+        # Assistant message with empty content and one multiply tool call. Renders the user prompt with a generation prompt and the full conversation as token ids (taking the first row for
+        # VLM processors), slices off the prompt tokens to get the response, and calls parse_response on the tokenizer
+        # (inner tokenizer for VLMs) with the prompt ids as prefix. Passes tools multiply and addition;
+        # asserts equality. Skips GPT-OSS/Llama below transformers 5.5. Inputs: model_name (class parametrization). Outputs: none. Exceptions: assertion failure; skips as noted. Side effects: loads tokenizers/processors.
         if model_name in (
             "trl-internal-testing/tiny-GptOssForCausalLM",
             "trl-internal-testing/tiny-LlamaForCausalLM-3.1",
@@ -1542,6 +1744,12 @@ class TestParseResponse:
         assert parsed == expected
 
     def test_parse_response_tool_call_with_content(self, model_name):
+        # [FUNCTION DOC]
+        # Assistant tool call accompanied by text; the text goes in thinking for GPT-OSS, in reasoning_content for Muse
+        # Glimmer, else in content. Renders the user prompt with a generation prompt and the full conversation as token ids (taking the first row for
+        # VLM processors), slices off the prompt tokens to get the response, and calls parse_response on the tokenizer
+        # (inner tokenizer for VLMs) with the prompt ids as prefix. Asserts equality. Skips Llama 3.1/3.2 and GPT-OSS without response
+        # templates. Inputs: model_name (class parametrization). Outputs: none. Exceptions: assertion failure; skips as noted. Side effects: loads tokenizers/processors.
         if model_name in (
             "trl-internal-testing/tiny-LlamaForCausalLM-3.1",
             "trl-internal-testing/tiny-LlamaForCausalLM-3.2",
@@ -1580,6 +1788,10 @@ class TestParseResponse:
         assert parsed == expected
 
     def test_parse_response_tool_call_without_arguments(self, model_name):
+        # [FUNCTION DOC]
+        # Tool call "ping" with empty arguments. Renders the user prompt with a generation prompt and the full conversation as token ids (taking the first row for
+        # VLM processors), slices off the prompt tokens to get the response, and calls parse_response on the tokenizer
+        # (inner tokenizer for VLMs) with the prompt ids as prefix. Asserts equality. Skips GPT-OSS below 5.5. Inputs: model_name (class parametrization). Outputs: none. Exceptions: assertion failure; skips as noted. Side effects: loads tokenizers/processors.
         if model_name in ("trl-internal-testing/tiny-GptOssForCausalLM",) and Version(
             transformers.__version__
         ) < Version("5.5.0"):
@@ -1611,6 +1823,11 @@ class TestParseResponse:
         assert parsed == expected
 
     def test_parse_response_multiple_tool_calls(self, model_name):
+        # [FUNCTION DOC]
+        # Two tool calls (multiply, addition). Renders the user prompt with a generation prompt and the full conversation as token ids (taking the first row for
+        # VLM processors), slices off the prompt tokens to get the response, and calls parse_response on the tokenizer
+        # (inner tokenizer for VLMs) with the prompt ids as prefix. Passes both tools; asserts equality. Skips GPT-OSS and Llama
+        # (single tool call per message). Inputs: model_name (class parametrization). Outputs: none. Exceptions: assertion failure; skips as noted. Side effects: loads tokenizers/processors.
         if model_name in (
             "trl-internal-testing/tiny-GptOssForCausalLM",
             "trl-internal-testing/tiny-LlamaForCausalLM-3.1",
@@ -1651,6 +1868,12 @@ class TestParseResponse:
         reason="Typing tool-call arguments with the tool's JSON schema requires transformers>=5.15",
     )
     def test_parse_response_tool_call_argument_types(self, model_name):
+        # [FUNCTION DOC]
+        # Tool call to get_weather with a numeric-looking string zip code, int, float, bool and list arguments, rendered
+        # with get_weather as a tool. Renders the user prompt with a generation prompt and the full conversation as token ids (taking the first row for
+        # VLM processors), slices off the prompt tokens to get the response, and calls parse_response on the tokenizer
+        # (inner tokenizer for VLMs) with the prompt ids as prefix. Passes the tool so types are coerced by schema; asserts equality (the zip
+        # stays a string). Skipped when tool-aware parsing is unsupported, and for Muse Glimmer / Muse Spark. Inputs: model_name (class parametrization). Outputs: none. Exceptions: assertion failure; skips as noted. Side effects: loads tokenizers/processors.
         if model_name == "trl-internal-testing/tiny-MuseGlimmerForConditionalGeneration":
             pytest.skip("Muse Glimmer ships its own response template, which JSON-parses `75001` as an int.")
         processing_class = self._load(model_name)
@@ -1686,6 +1909,9 @@ class TestParseResponse:
         assert parsed == expected
 
     def test_parse_response_malformed_tool_call(self, model_name):
+        # [FUNCTION DOC]
+        # Only for Qwen3-MoE: tokenizes a tool_call block with invalid JSON followed by im_end and asserts parse_response
+        # returns an assistant message whose content is the raw tool_call text (no tool_calls). Inputs: model_name (class parametrization). Outputs: none. Exceptions: assertion failure; skips as noted. Side effects: loads tokenizers/processors.
         if model_name != "trl-internal-testing/tiny-Qwen3MoeForCausalLM":
             pytest.skip("For simplicity, we only test the malformed tool call case on one tokenizer.")
         processing_class = self._load(model_name)
@@ -1700,6 +1926,9 @@ class TestParseResponse:
         assert parsed == expected
 
     def test_parse_response_truncated(self, model_name):
+        # [FUNCTION DOC]
+        # Renders an assistant message with two tool calls (one for Llama 3.1/3.2), slices off the prompt, and calls
+        # parse_response on every proper prefix of the response; passes if none raises. Inputs: model_name (class parametrization). Outputs: none. Exceptions: assertion failure; skips as noted. Side effects: loads tokenizers/processors.
         processing_class = self._load(model_name)
         # Here we use 2 tool calls as it seems to be a more common source of failure when truncated.
         # Llama 3.1 / 3.2 templates only allow a single tool call per assistant turn, so fall back to one.
@@ -1729,17 +1958,29 @@ class TestParseResponse:
 
 
 class TestChatTemplatesDocumentation:
+    # [CLASS DOC]
+    # Checks bundled Jinja chat templates are documented. Plain pytest class.
     def _documented(self, path):
+        # [FUNCTION DOC]
+        # HELPER: Reads a Markdown file, keeps lines starting with "### ", and returns the set of backticked names ending
+        # in ".jinja" found in those headings.
+        # Inputs: path - Path. Outputs: set of str. Exceptions: OS errors. Side effects: reads the file.
         # Templates documented in a `### ` heading, which may list several of them
         headings = [line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("### ")]
         return set(re.findall(r"`([\w.]+\.jinja)`", "\n".join(headings)))
 
     def test_every_template_in_readme(self):
+        # [FUNCTION DOC]
+        # Asserts every .jinja file in the chat templates directory is named in a heading of its README.md.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: reads files.
         documented = self._documented(_CHAT_TEMPLATES_DIR / "README.md")
         missing = sorted(path.name for path in _CHAT_TEMPLATES_DIR.glob("*.jinja") if path.name not in documented)
         assert missing == []
 
     def test_every_training_template_in_docs(self):
+        # [FUNCTION DOC]
+        # Asserts every *_training.jinja template is named in a heading of docs/source/chat_templates.md.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: reads files.
         documented = self._documented(Path(__file__).parents[1] / "docs" / "source" / "chat_templates.md")
         missing = sorted(
             path.name for path in _CHAT_TEMPLATES_DIR.glob("*_training.jinja") if path.name not in documented
