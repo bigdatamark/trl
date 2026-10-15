@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Tests for the main DistillationTrainer (trl.DistillationTrainer / DistillationConfig) and its memory-efficient
+# chunked divergence loss _chunked_divergence_loss (generalized JSD between student and teacher computed from hidden
+# states and lm_head weights in token/vocab chunks).
+# Main contents: a multiply_tool used for tool-calling tests; _reference_chunked_divergence, a naive full-vocab
+# reference for the loss; TestChunkedDivergenceLoss (numerical parity, scaling/softcap/temperature/bias, masking,
+# gradients, low precision, underflow, fully-masked batches); TestDistillationTrainer (init, training on many
+# dataset formats, tools, eval, iterable datasets, generation kwargs, gradient accumulation, vLLM, PEFT and
+# quantization, fp16, validation errors, loss normalization, pad token sync); TestDistillationTrainerVLM
+# (vision-language student/teacher training, image-token suppression, tools returning images).
+# Import-time side effects: imports peft (LoraConfig, PrefixTuningConfig, get_peft_model) only if available.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +53,9 @@ from .testing_utils import (
 
 
 def multiply_tool(a: int, b: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Tool function exposed to the trainer in tool-calling tests; returns a times b (docstring gives the schema).
+    # Inputs: a, b - int. Outputs: int. Exceptions: none. Side effects: none.
     """
     Multiplies two integers.
 
@@ -74,6 +89,21 @@ def _reference_chunked_divergence(
     t_softcap=None,
     temperature=1.0,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Naive, unchunked reference for _chunked_divergence_loss, written from the divergence definition.
+    # Behavior: project student and teacher hidden states (cast to float32) with their own lm_head weights (cast to
+    # float32) over the full vocabulary; add optional biases; multiply by the per-model scale when it is not 1.0 and
+    # apply softcapping (cap times tanh of logits over cap) when given, student first then teacher; divide both by
+    # temperature; take log-softmax. beta 0.0 gives forward KL (teacher relative to student), beta 1.0 reverse KL
+    # (student relative to teacher), otherwise generalized JSD against the mixture with weights (1 minus beta) on the
+    # student and beta on the teacher, computed in log space with logaddexp, combined as beta times teacher-side KL plus
+    # (1 minus beta) times student-side KL. Sum over the vocabulary, multiply by completion_mask, sum, and divide by the
+    # mask sum or num_items_in_batch when given.
+    # Inputs: student_hidden, teacher_hidden (B, K, H_s/H_t); student_w, teacher_w (V, H); completion_mask (B, K);
+    # beta (float); num_items_in_batch; s_bias/t_bias (V); s_scale/t_scale (default 1.0); s_softcap/t_softcap;
+    # temperature (default 1.0).
+    # Outputs: scalar loss tensor (differentiable through the inputs).
+    # Exceptions: none expected. Side effects: none.
     """Naive full-vocab reference for `_chunked_divergence_loss`: project the whole batch at once (no chunking) and
     build the JSD straight from the definition, so it shares neither the chunking nor `F.kl_div`'s argument order."""
     # Op order mirrors the loss's chunk body: matmul, + bias, * scale, softcap, / temperature.
@@ -115,10 +145,19 @@ def _reference_chunked_divergence(
 
 @require_torch_accelerator
 class TestChunkedDivergenceLoss(TrlTestCase):
+    # [CLASS DOC]
+    # Unit tests for _chunked_divergence_loss against _reference_chunked_divergence. Requires an accelerator.
+    # An autouse fixture patches the kernel's TOKEN_CHUNK_SIZE and VOCAB_CHUNK_SIZE to tiny values (default 4 and 5)
+    # so multiple chunks are exercised; _inputs builds seeded random inputs. Inherits TrlTestCase.
     """Unit tests for the memory-efficient chunked JSD loss (`_chunked_divergence_loss`)."""
 
     @pytest.fixture(autouse=True, params=[(4, 5)])
     def small_chunks(self, request):
+        # [FUNCTION DOC]
+        # HELPER: Autouse pytest fixture (param default (4, 5), overridable indirectly) that patches
+        # trl.kernels.chunked_divergence TOKEN_CHUNK_SIZE and VOCAB_CHUNK_SIZE for the duration of each test.
+        # Inputs: request - fixture request carrying the (token, vocab) chunk sizes. Outputs: yields None.
+        # Exceptions: none. Side effects: temporarily patches module constants.
         with (
             patch("trl.kernels.chunked_divergence.TOKEN_CHUNK_SIZE", request.param[0]),
             patch("trl.kernels.chunked_divergence.VOCAB_CHUNK_SIZE", request.param[1]),
@@ -126,6 +165,11 @@ class TestChunkedDivergenceLoss(TrlTestCase):
             yield
 
     def _inputs(self, B=2, K=6, H=8, V=17, n_masked=3, seed=0, device=torch_device):
+        # [FUNCTION DOC]
+        # HELPER: Builds seeded random test inputs with a generator on the given device: student and teacher hidden states
+        # (B, K, H), lm_head weights (V, H), and a ones completion mask with n_masked random positions zeroed.
+        # Inputs: B 2, K 6, H 8, V 17, n_masked 3, seed 0, device (defaults). Outputs: tuple of the five tensors.
+        # Exceptions: none. Side effects: allocates tensors.
         g = torch.Generator(device).manual_seed(seed)
         student_hidden = torch.randn(B, K, H, generator=g, device=device)
         teacher_hidden = torch.randn(B, K, H, generator=g, device=device)
@@ -139,6 +183,10 @@ class TestChunkedDivergenceLoss(TrlTestCase):
     @pytest.mark.parametrize("device", [torch_device, "cpu"])
     @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
     def test_matches_naive_full_vocab(self, beta, device):
+        # [FUNCTION DOC]
+        # Parametrized over beta (0.0, 0.5, 1.0) and device (accelerator, and CPU standing in for a non-Triton device):
+        # asserts the loss equals the reference and the returned valid-token count equals the mask sum.
+        # Inputs: beta, device. Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         sh, th, sw, tw, mask = self._inputs(device=device)
         loss, _, n_valid = _chunked_divergence_loss(sh, th, sw, tw, mask, beta)
         expected = _reference_chunked_divergence(sh, th, sw, tw, mask, beta)
@@ -146,6 +194,9 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         assert n_valid.item() == int(mask.sum().item())
 
     def test_bf16_hidden_fp32_weight(self):
+        # [FUNCTION DOC]
+        # Asserts bf16 hidden states against fp32 weights project without a dtype error and match the reference computed
+        # on the bf16-rounded hidden states (atol/rtol 2e-2). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         """A bf16 hidden state against an fp32 `lm_head` weight projects without a dtype mismatch."""
         sh, th, sw, tw, mask = self._inputs()
         loss, _, _ = _chunked_divergence_loss(sh.bfloat16(), th.bfloat16(), sw, tw, mask, beta=0.5)
@@ -153,6 +204,9 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         torch.testing.assert_close(loss, expected, atol=2e-2, rtol=2e-2)
 
     def test_different_teacher_student_hidden_sizes(self):
+        # [FUNCTION DOC]
+        # Asserts student hidden size 8 and teacher hidden size 12 (same vocab 13) work and match the reference, with one
+        # masked position. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         # Teacher and student may have different hidden widths; only the vocabulary must match.
         g = torch.Generator(torch_device).manual_seed(2)
         B, K, V = 2, 5, 13
@@ -172,6 +226,9 @@ class TestChunkedDivergenceLoss(TrlTestCase):
 
     @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
     def test_applies_logit_scale_and_softcapping(self, beta):
+        # [FUNCTION DOC]
+        # Parametrized over beta: asserts per-model logit scales (0.7 / 1.3) and final-logit softcaps (50 / 30) are
+        # applied before the softmax, matching the reference. Inputs: beta. Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         # Per-model `logit_scale` (Cohere) / `final_logit_softcapping` (Gemma) must be applied before the softmax.
         sh, th, sw, tw, mask = self._inputs()
         loss, _, _ = _chunked_divergence_loss(
@@ -193,6 +250,8 @@ class TestChunkedDivergenceLoss(TrlTestCase):
 
     @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
     def test_applies_temperature(self, beta):
+        # [FUNCTION DOC]
+        # Parametrized over beta: asserts temperature 2.0 matches the reference. Inputs: beta. Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         # Softmax temperature softens both distributions before the divergence.
         sh, th, sw, tw, mask = self._inputs()
         loss, _, _ = _chunked_divergence_loss(sh, th, sw, tw, mask, beta, temperature=2.0)
@@ -201,6 +260,9 @@ class TestChunkedDivergenceLoss(TrlTestCase):
 
     @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
     def test_applies_lm_head_bias(self, beta):
+        # [FUNCTION DOC]
+        # Parametrized over beta: asserts random student/teacher lm_head biases are added after projection, matching the
+        # reference. Inputs: beta. Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         # An `lm_head` bias must be added to each chunk's logits (after the projection, before the softmax).
         sh, th, sw, tw, mask = self._inputs()
         g = torch.Generator(torch_device).manual_seed(3)
@@ -213,6 +275,9 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         torch.testing.assert_close(loss, expected)
 
     def test_beta_1_is_reverse_kl(self):
+        # [FUNCTION DOC]
+        # Asserts beta 1.0 equals a hand-computed reverse KL of student relative to teacher, masked and averaged over valid
+        # tokens. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         sh, th, sw, tw, mask = self._inputs()
         loss, _, _ = _chunked_divergence_loss(sh, th, sw, tw, mask, beta=1.0)
         # Hand-rolled reverse KL: sum_x p_s * (log p_s - log p_t) over valid positions, normalized by n_valid.
@@ -224,6 +289,10 @@ class TestChunkedDivergenceLoss(TrlTestCase):
 
     @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
     def test_parity_with_gkd(self, beta):
+        # [FUNCTION DOC]
+        # Parametrized over beta: with identity lm_head matrices (hidden states are logits) and num_items_in_batch 1,
+        # asserts the loss equals GKDTrainer.generalized_jsd_loss with sum reduction and labels set to -100 where masked.
+        # Inputs: beta. Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         # Identity lm_head so hidden states are the logits, then compare against GKD's full-vocab JSD (sum reduction).
         B, K, V = 2, 5, 11
         g = torch.Generator(torch_device).manual_seed(1)
@@ -242,6 +311,9 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         torch.testing.assert_close(loss, gkd)
 
     def test_masked_positions_ignored(self):
+        # [FUNCTION DOC]
+        # Asserts adding 5.0 to student and teacher hidden states at masked positions leaves the loss unchanged.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         sh, th, sw, tw, mask = self._inputs()
         loss_a, _, _ = _chunked_divergence_loss(sh, th, sw, tw, mask, beta=0.5)
         # Perturbing the hidden states at masked positions only must not change the loss.
@@ -253,6 +325,9 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         torch.testing.assert_close(loss_a, loss_b)
 
     def test_grads_flow_and_zero_at_masked(self):
+        # [FUNCTION DOC]
+        # Asserts after backward every valid position's student hidden gradient is non-zero and every masked position's
+        # gradient is exactly zero. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         sh, th, sw, tw, mask = self._inputs()
         sh = sh.clone().requires_grad_(True)
         loss, _, _ = _chunked_divergence_loss(sh, th, sw, tw, mask, beta=0.5)
@@ -267,6 +342,10 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         ("temperature", "scale", "softcap"), [(1.0, 1.0, None), (0.7, 1.0, None), (1.0, 0.5, 3.0), (2.0, 1.0, 3.0)]
     )
     def test_backward_matches_reference(self, beta, temperature, scale, softcap):
+        # [FUNCTION DOC]
+        # Parametrized over beta (0, 0.3, 0.5, 1) and (temperature, student scale, student softcap) combos: asserts the
+        # gradients of student hidden states and student lm_head weight match the reference autograd gradients (atol/rtol
+        # 1e-5). Inputs: beta, temperature, scale, softcap. Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         # The chunked backward must match a naive full-vocab autograd backward, not merely be non-null. Only the student
         # carries gradient (the teacher is a fixed target), so compare the student hidden + lm_head.
         sh, th, sw, tw, mask = self._inputs()
@@ -298,6 +377,13 @@ class TestChunkedDivergenceLoss(TrlTestCase):
     @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
     @pytest.mark.parametrize("use_autocast", [False, True])
     def test_low_precision_backward_matches_reference(self, dtype, beta, use_autocast):
+        # [FUNCTION DOC]
+        # Parametrized over dtype (bf16, fp16), beta and use_autocast: uses hidden size 64 and weights scaled to logit std
+        # 10 (beta 0.5) or 30, linspace biases; runs the loss either on low-precision inputs or fp32 inputs under autocast.
+        # Asserts the loss matches the reference on low-precision-rounded inputs (1e-5), the returned entropy equals the
+        # masked sum of student entropy from rounded logits plus bias, student gradients (hidden, weight, bias) are finite
+        # with max relative error below 1 percent, and teacher tensors get no gradient.
+        # Inputs: dtype, beta, use_autocast. Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         # A close scalar loss can hide gradient errors from rounded logits.
         sh, th, sw, tw, mask = self._inputs(H=64)
         logit_std = 10.0 if beta == 0.5 else 30.0
@@ -339,6 +425,10 @@ class TestChunkedDivergenceLoss(TrlTestCase):
 
     @pytest.mark.parametrize("small_chunks", [(4, 2053)], indirect=True)
     def test_jsd_underflow_across_blocks(self):
+        # [FUNCTION DOC]
+        # With chunk sizes overridden to (4, 2053) and a 2053-token vocab whose logits are all -120 except two entries,
+        # asserts the beta 0.5 loss matches the reference, entropy is finite and the student hidden gradient is finite
+        # (no underflow across vocab blocks). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         sh, th, sw, tw, mask = self._inputs(B=1, K=3, H=1, V=2053, n_masked=1)
         sh.fill_(1.0)
         th.fill_(1.0)
@@ -355,6 +445,10 @@ class TestChunkedDivergenceLoss(TrlTestCase):
         assert torch.isfinite(sh.grad).all()
 
     def test_fully_masked_batch_keeps_graph(self):
+        # [FUNCTION DOC]
+        # With an all-zero mask, asserts n_valid is 0, the loss is finite, backward succeeds, and student hidden, weight
+        # and bias all receive all-zero (but existing) gradients, keeping the graph connected for DDP/FSDP.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: allocates tensors on the accelerator.
         # With every position masked the loss is 0, but backward must still touch every trainable student param
         # (hidden states, lm_head weight and bias) — otherwise DDP/FSDP synchronization hangs at the all-reduce.
         sh, th, sw, tw, _ = self._inputs()
@@ -372,7 +466,14 @@ class TestChunkedDivergenceLoss(TrlTestCase):
 
 
 class TestDistillationTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # Integration tests for DistillationTrainer (on-policy generation by the student, divergence against a teacher).
+    # Inherits TrlTestCase (self.tmp_dir). Student tiny Qwen3, teacher small Qwen3, zen standard_prompt_only unless noted; small batch (3) and max_completion_length 8 to save memory.
     def test_init_minimal(self):
+        # [FUNCTION DOC]
+        # Constructs the trainer with only model, teacher_model and train_dataset (default args). Passes if no error.
+        # Inputs/Outputs: none. Exceptions: construction errors fail. Side effects: loads models; default args may create the
+        # default output directory.
         # Instantiate with only model, teacher_model and train_dataset.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         DistillationTrainer(
@@ -382,6 +483,9 @@ class TestDistillationTrainer(TrlTestCase):
         )
 
     def test_train(self):
+        # [FUNCTION DOC]
+        # Trains with learning_rate 0.1. Asserts train_loss is logged and every student parameter changed. Also asserts some log entry contains an "entropy" metric.
+        # Student tiny Qwen3, teacher small Qwen3, zen standard_prompt_only unless noted; small batch (3) and max_completion_length 8 to save memory. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = DistillationConfig(
@@ -414,6 +518,10 @@ class TestDistillationTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     def test_train_dataset_format(self, config_name):
+        # [FUNCTION DOC]
+        # Parametrized over standard and conversational prompt-only configs: trains end to end and asserts train_loss is
+        # logged and all student parameters are finite. Inputs: config_name. Outputs: none. Exceptions: assertion failure.
+        # Side effects: trains.
         # Both the standard (plain-text prompt) and conversational (chat-message prompt) prompt-only formats train end
         # to end: the student generates on-policy completions, the teacher scores them.
         dataset = load_dataset("trl-internal-testing/zen", config_name, split="train")
@@ -445,6 +553,12 @@ class TestDistillationTrainer(TrlTestCase):
     )
     @require_response_parsing
     def test_train_with_tools(self):
+        # [FUNCTION DOC]
+        # Trains tiny Qwen3-MoE (student and teacher) with multiply_tool exposed and max_completion_length 128, patching
+        # model.generate with fake_generate so that of 3 prompts one emits a valid tool call, one an invalid call (wrong
+        # argument name) and one plain text; follow-up generation returns "Done!". Since self-distillation gives a near-zero signal, so only finiteness of the loss is asserted: asserts finite
+        # train_loss, tools/call_frequency 2/3 and tools/failure_frequency 1/2. Strict xfail below transformers 5.0;
+        # requires response parsing. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         # A `multiply_tool` is exposed and generation is mocked to deterministically emit, for the batch of 3 prompts,
         # one valid tool call, one invalid tool call (wrong argument name), and one non-tool completion. This exercises
         # the tool-calling loop (execution + `tool_mask`) without relying on the tiny model to emit valid calls.
@@ -465,6 +579,12 @@ class TestDistillationTrainer(TrlTestCase):
         )
 
         def fake_generate(input_ids, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Replacement for model.generate. For a batch of 3 (first call) appends fixed token ids encoding a valid
+            # multiply_tool call, an invalid one (argument "c"), and "I don't know any tool" plus padding; for any other batch
+            # (the 2 tool-call follow-ups) appends the ids of "Done!" plus im_end. Returns prompt ids concatenated with the
+            # completion ids along the sequence dimension.
+            # Inputs: input_ids (batch, seq); kwargs ignored. Outputs: tensor. Exceptions: none. Side effects: none.
             if input_ids.shape[0] == 3:  # first call
                 # fmt: off
                 completion_ids = torch.tensor(
@@ -507,6 +627,11 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["tools/failure_frequency"] == pytest.approx(1 / 2)
 
     def test_train_stops_on_every_eos_token_id(self):
+        # [FUNCTION DOC]
+        # Uses tiny Phi-3.5 (student and teacher), whose end-of-turn token 32007 is an eos only in the generation config:
+        # asserts 32007 is among trainer.generation_config.eos_token_id, trains with generation patched to always emit
+        # "Blue", 32007, then two more tokens, and asserts completions/mean_length is 2.0 and completions/clipped_ratio 0.0
+        # (completions cut after the end token and counted as terminated). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         # Phi-3.5 ends a turn with `<|end|>`, which only its generation config declares as eos, not its tokenizer
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -525,6 +650,9 @@ class TestDistillationTrainer(TrlTestCase):
         assert 32007 in trainer.generation_config.eos_token_id  # `<|end|>`
 
         def fake_generate(input_ids, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Appends the fixed completion ids (10924, 32007, 322, 7933) to every row of input_ids.
+            # Inputs: input_ids; kwargs ignored. Outputs: concatenated tensor. Exceptions/Side effects: none.
             # 'Blue<|end|>and green': the turn ends on `<|end|>`, and generation goes on after it
             completion_ids = torch.tensor([[10924, 32007, 322, 7933]] * input_ids.shape[0], device=input_ids.device)
             return torch.cat([input_ids, completion_ids], dim=-1)
@@ -537,6 +665,9 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["completions/clipped_ratio"] == 0.0
 
     def test_trust_remote_code(self):
+        # [FUNCTION DOC]
+        # Asserts tiny-RemoteForCausalLM as student and teacher raises ValueError ("custom code") without
+        # trust_remote_code and loads (class RemoteForCausalLM) with it. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         model_id = "trl-internal-testing/tiny-RemoteForCausalLM"
 
@@ -557,6 +688,9 @@ class TestDistillationTrainer(TrlTestCase):
         assert type(trainer.model).__name__ == "RemoteForCausalLM"
 
     def test_train_with_eval(self):
+        # [FUNCTION DOC]
+        # Trains with eval every 2 steps on the test split (eval batch 3); asserts train_loss in the last entry and eval_loss
+        # in the first entry. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
 
         training_args = DistillationConfig(
@@ -582,6 +716,9 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[0]["eval_loss"] is not None
 
     def test_train_with_iterable_dataset(self):
+        # [FUNCTION DOC]
+        # Trains on a streaming train split with max_steps 4; asserts accelerator_config.dispatch_batches was forced to
+        # False and train_loss logged. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         # Iterable (streaming) datasets have no length, so `max_steps` is required.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train", streaming=True)
 
@@ -607,6 +744,9 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
     def test_iterable_dataset_requires_dispatch_batches_false(self):
+        # [FUNCTION DOC]
+        # Asserts a streaming dataset with accelerator_config dispatch_batches True raises ValueError ("Iterable datasets
+        # require dispatch_batches=False"). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # `dispatch_batches=True` is incompatible with iterable datasets (see get_train_dataloader).
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train", streaming=True)
 
@@ -622,6 +762,9 @@ class TestDistillationTrainer(TrlTestCase):
             )
 
     def test_iterable_dataset_forces_num_workers_zero(self):
+        # [FUNCTION DOC]
+        # Asserts a streaming train dataset with dataloader_num_workers 4 (max_steps 1) results in args.dataloader_num_workers
+        # 0. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # Multiple workers would shard and interleave the stream, breaking the generation-batch ordering that
         # `_prepare_inputs` relies on, so `dataloader_num_workers` is forced to 0 for iterable datasets.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train", streaming=True)
@@ -639,6 +782,9 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.args.dataloader_num_workers == 0
 
     def test_iterable_eval_keeps_map_style_train_workers(self):
+        # [FUNCTION DOC]
+        # With a map-style train split, a streaming eval split and dataloader_num_workers 4: asserts args keep 4 workers, the
+        # train dataloader has 4 workers, the eval dataloader 0, and args still say 4 afterwards (override not persisted). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # A map-style train set keeps its workers even when the eval set is iterable; the single-worker restriction is
         # scoped to the iterable eval loader and not persisted.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -666,6 +812,10 @@ class TestDistillationTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("train_dataset_type", ["dataset", "iterable_dataset"])
     def test_init_with_train_dataset(self, train_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over map-style and streaming train sets (max_steps 4 when streaming, else -1): asserts
+        # trainer.train_dataset is the same object passed in (no preprocessing). Inputs: train_dataset_type. Outputs: none.
+        # Exceptions: assertion failure. Side effects: loads models/datasets.
         streaming = "iterable" in train_dataset_type
         train_dataset = load_dataset(
             "trl-internal-testing/zen", "standard_prompt_only", split="train", streaming=streaming
@@ -695,6 +845,11 @@ class TestDistillationTrainer(TrlTestCase):
         ],
     )
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over eval dataset kinds (Dataset, IterableDataset, DatasetDict, IterableDatasetDict, dict of each,
+        # None) built from the test split: asserts None stays None, dict-like sets keep keys data1/data2, and single datasets
+        # are stored as the same object. Inputs: eval_dataset_type. Outputs: none. Exceptions: assertion failure.
+        # Side effects: loads models/datasets.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         if eval_dataset_type == "none":
@@ -740,6 +895,10 @@ class TestDistillationTrainer(TrlTestCase):
         ],
     )
     def test_evaluate_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over the same kinds (without None): passes the eval set directly to evaluate (absent at init) and
+        # asserts eval_loss for single datasets, or eval_data1_loss and eval_data2_loss for dict-like ones.
+        # Inputs: eval_dataset_type. Outputs: none. Exceptions: assertion failure. Side effects: runs evaluation.
         # `evaluate` accepts a dataset passed directly, not only an `eval_dataset` set at init. Iterable datasets passed
         # this way must still be configured for the iterable path, since they are absent at init.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -778,6 +937,8 @@ class TestDistillationTrainer(TrlTestCase):
             assert metrics["eval_data2_loss"] is not None
 
     def test_train_eval_on_start(self):
+        # [FUNCTION DOC]
+        # Trains with eval_on_start True and eval every 2 steps; passes if evaluation before the first step works. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         # Evaluation runs before the first training step; the loss must be computable at that point.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
         training_args = DistillationConfig(
@@ -800,6 +961,8 @@ class TestDistillationTrainer(TrlTestCase):
         trainer.train()
 
     def test_train_beta_non_zero(self):
+        # [FUNCTION DOC]
+        # Trains with beta 0.5 (generalized JSD branch). Asserts the final log entry has a non-None train_loss. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         # `beta` is the JSD interpolation coefficient (0 = forward KL, 1 = reverse KL); an intermediate value exercises
         # the generalized-JSD-against-the-mixture branch of the loss end to end.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -822,6 +985,8 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
     def test_train_with_pad_to_multiple_of(self):
+        # [FUNCTION DOC]
+        # Trains with pad_to_multiple_of 8. Asserts the final log entry has a non-None train_loss. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = DistillationConfig(
@@ -843,6 +1008,8 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
     def test_train_with_additional_generation_kwargs(self):
+        # [FUNCTION DOC]
+        # Trains with top_p 0.9, top_k 10, min_p 0.01 and repetition_penalty 1.1. Asserts the final log entry has a non-None train_loss. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         """Test that training works with additional generation kwargs."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -869,6 +1036,8 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
     def test_train_with_generation_kwargs(self):
+        # [FUNCTION DOC]
+        # Trains with generation_kwargs (sampling, top_k 50, 2 beams, length_penalty -0.1). Asserts the final log entry has a non-None train_loss. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = DistillationConfig(
@@ -891,6 +1060,8 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
     def test_train_with_chat_template_kwargs(self):
+        # [FUNCTION DOC]
+        # Trains on conversational prompts with chat_template_kwargs enable_thinking False. Asserts the final log entry has a non-None train_loss. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
 
         training_args = DistillationConfig(
@@ -912,6 +1083,10 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
     def test_train_multiple_dataloader_workers(self):
+        # [FUNCTION DOC]
+        # Forces the multiprocessing start method to "spawn" (safe under pytest threads) and trains with 2 dataloader
+        # workers. Asserts the final log entry has a non-None train_loss. Side effects: changes the global multiprocessing start method for the process; trains.
+        # Inputs/Outputs: none. Exceptions: assertion failure.
         # Pytest/CI often starts background threads before tests run. With Python 3.12, using the default "fork" start
         # method in a multi-threaded process emits a DeprecationWarning and may deadlock.
         #
@@ -944,6 +1119,9 @@ class TestDistillationTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
     def test_train_with_gradient_accumulation(self):
+        # [FUNCTION DOC]
+        # Trains with learning_rate 0.1 and gradient_accumulation_steps 2 (exercises num_items_in_batch normalization).
+        # Asserts train_loss is logged and every student parameter changed. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         # Gradient accumulation exercises the `num_items_in_batch` global-token normalizer (#4719) end to end: the loss
         # over the accumulated micro-batches must be reduced by the global valid-token count, not the per-microbatch
         # mean, for the update to be correct.
@@ -978,6 +1156,14 @@ class TestDistillationTrainer(TrlTestCase):
     @require_vllm
     @require_torch_accelerator
     def test_train_vllm(self):
+        # [FUNCTION DOC]
+        # Trains Qwen3-0.6B as student and teacher with use_vllm True (colocate), learning_rate 0.1, logging disabled; the
+        # teacher parameters are perturbed with seeded Gaussian noise (scale 0.5) so the gradient is not near zero. Asserts
+        # train_loss logged and every student parameter changed. Exceptions whose message mentions memory/CUDA/device
+        # problems cause a skip; others re-raise. Finally releases memory. Requires vLLM and an accelerator.
+        # KNOWN ISSUE: the skip branches check whether the strings "KeyError" or "ValueError" appear in the exception message;
+        # the message of an exception does not include its class name, so those branches effectively never match.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         """Test that training works with vLLM for on-policy generation (colocate mode)."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -1044,6 +1230,10 @@ class TestDistillationTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_init_is_seeded(self):
+        # [FUNCTION DOC]
+        # Builds two trainers with a default LoraConfig under different global torch seeds and asserts their lora_A weights
+        # exist and are identical (adapter init seeded from the config). Requires PEFT. Side effects: alters global RNG.
+        # Inputs/Outputs: none. Exceptions: assertion failure.
         # Two trainers with the same seed start from the same adapter weights
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         adapters = []
@@ -1064,6 +1254,8 @@ class TestDistillationTrainer(TrlTestCase):
 
     @require_peft
     def test_train_peft_config(self):
+        # [FUNCTION DOC]
+        # Trains a float32 tiny Qwen3 with a LoraConfig passed to the trainer (lr 0.1). Asserts train_loss logged; parameters whose names are base-model names are unchanged (assert_close) while other non-base_layer (adapter) parameters changed. Requires PEFT. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM", dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -1100,6 +1292,10 @@ class TestDistillationTrainer(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_peft_and_quantization(self):
+        # [FUNCTION DOC]
+        # Trains a model id with a 4-bit nf4 double-quant bf16-compute BitsAndBytesConfig and LoRA: asserts the base model is
+        # loaded in 4-bit, train_loss logged, and every "lora" parameter is bfloat16 and changed (base params not checked
+        # because bitsandbytes mutates biases). Requires PEFT and bitsandbytes. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = DistillationConfig(
@@ -1145,6 +1341,9 @@ class TestDistillationTrainer(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_peft_dora_and_quantization(self):
+        # [FUNCTION DOC]
+        # Same as the QLoRA test with use_dora True: DoRA magnitude vectors must stay float32 and change, other lora
+        # parameters must be bfloat16 and change. Requires PEFT and bitsandbytes. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = DistillationConfig(
@@ -1194,6 +1393,8 @@ class TestDistillationTrainer(TrlTestCase):
 
     @require_peft
     def test_train_peft_model(self):
+        # [FUNCTION DOC]
+        # Trains an already PEFT-wrapped model (get_peft_model with LoraConfig, lr 0.1). Asserts train_loss logged; parameters whose names are base-model names are unchanged (assert_close) while other non-base_layer (adapter) parameters changed. Requires PEFT. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM", dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
         model = get_peft_model(model, LoraConfig())
@@ -1232,6 +1433,9 @@ class TestDistillationTrainer(TrlTestCase):
     # explicitly test PEFT + gradient checkpointing, which has caused issues in the past.
     @require_peft
     def test_train_peft_with_gradient_checkpointing(self):
+        # [FUNCTION DOC]
+        # Same as the PEFT-config test with gradient_checkpointing explicitly True (regression guard if the default changes).
+        # Asserts train_loss logged; parameters whose names are base-model names are unchanged (assert_close) while other non-base_layer (adapter) parameters changed. Requires PEFT. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen3ForCausalLM", dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -1268,6 +1472,8 @@ class TestDistillationTrainer(TrlTestCase):
 
     @require_torch_accelerator
     def test_train_with_fp16(self):
+        # [FUNCTION DOC]
+        # Trains with fp16 True and lr 0.1. Asserts train_loss is logged and every student parameter changed. Requires an accelerator. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = DistillationConfig(
@@ -1298,6 +1504,9 @@ class TestDistillationTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_non_lm_head_target_allowed(self):
+        # [FUNCTION DOC]
+        # Asserts constructing with a LoRA config on q_proj/v_proj does not raise (the lm_head guard must not fire).
+        # Requires PEFT. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # The lm_head guard must only fire when the adapter actually wraps lm_head. An adapter targeting other modules
         # (here q_proj/v_proj) leaves lm_head as a plain Linear, so the loss reads the real (frozen) head weight and
         # there is nothing to silently drop. Guards against an over-broad regression of the guard.
@@ -1313,6 +1522,8 @@ class TestDistillationTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_modules_to_save_lm_head_allowed(self):
+        # [FUNCTION DOC]
+        # Asserts modules_to_save lm_head (a fully trained copy, not a tuner layer) does not raise. Requires PEFT. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # `modules_to_save=["lm_head"]` makes the head a fully trained copy (a ModulesToSaveWrapper, not a tuner layer),
         # so `get_output_embeddings().weight` resolves to the trained weight and the loss trains it correctly. The guard
         # keys on the head being a tuner layer, so this must stay unblocked.
@@ -1328,6 +1539,9 @@ class TestDistillationTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_lm_head_adapter_raises(self):
+        # [FUNCTION DOC]
+        # Asserts a LoRA adapter targeting lm_head raises ValueError mentioning "lm_head" (the loss reads lm_head.weight
+        # directly, so the adapter would be ignored). Requires PEFT. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # Both loss paths read `lm_head.weight` directly, so a PEFT adapter on the head is silently ignored. Reject it.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         with pytest.raises(ValueError, match="lm_head"):
@@ -1341,6 +1555,9 @@ class TestDistillationTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_prompt_learning_raises(self):
+        # [FUNCTION DOC]
+        # Asserts a PrefixTuningConfig (4 virtual tokens) raises ValueError ("Prompt-learning"), since the backbone-direct
+        # loss bypasses PeftModel.forward. Requires PEFT. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # Prompt-learning injects virtual tokens via `PeftModel.forward()`, which the backbone-direct loss bypasses.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         with pytest.raises(ValueError, match="Prompt-learning"):
@@ -1353,6 +1570,8 @@ class TestDistillationTrainer(TrlTestCase):
             )
 
     def test_teacher_vocab_size_mismatch_raises(self):
+        # [FUNCTION DOC]
+        # Asserts a teacher with a different vocab size (tiny Llama 3.2) raises ValueError mentioning vocab_size. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # The local-teacher loss compares full next-token distributions, so student and teacher must share a
         # vocabulary. A teacher with a different vocab_size is rejected (use GOLD for cross-tokenizer distillation).
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -1365,6 +1584,9 @@ class TestDistillationTrainer(TrlTestCase):
             )
 
     def test_teacher_model_init_kwargs_with_instantiated_teacher_raises(self):
+        # [FUNCTION DOC]
+        # Asserts passing teacher_model_init_kwargs together with an instantiated teacher model raises ValueError naming
+        # teacher_model_init_kwargs. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # `teacher_model_init_kwargs` only applies when the teacher is a model id; passing it alongside an already
         # instantiated teacher is a mistake worth surfacing.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -1379,6 +1601,10 @@ class TestDistillationTrainer(TrlTestCase):
             )
 
     def test_loss_normalizes_by_num_items_in_batch(self):
+        # [FUNCTION DOC]
+        # With beta 0.5 and a random batch (2 rows, prompt 4, completion 3 tokens, full mask), in eval mode without grads:
+        # asserts compute_loss with num_items_in_batch equal to the valid-token count equals the default local mean, and
+        # with twice that count equals half the mean (rtol 1e-4, atol 1e-6). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # When `num_items_in_batch` is passed (as under gradient accumulation), the divergence loss must be reduced as
         # sum / num_items_in_batch rather than the local per-microbatch mean. See issue #4719. The chunked JSD path
         # must honor `num_items_in_batch`.
@@ -1416,6 +1642,12 @@ class TestDistillationTrainer(TrlTestCase):
         torch.testing.assert_close(loss_double, loss_mean / 2, rtol=1e-4, atol=1e-6)
 
     def test_compute_loss_matches_full_logit_reference(self):
+        # [FUNCTION DOC]
+        # With beta 0.25 and a random batch: asserts compute_loss (chunked path) equals a full-logit reference computed by
+        # running student and teacher forward on prompt plus completion, taking logits at the positions predicting the
+        # completion tokens (from completion length plus one from the end to one from the end), and computing the
+        # generalized JSD against the log-space mixture (0.75 student, 0.25 teacher) as 0.25 times KL(teacher, mixture) plus
+        # 0.75 times KL(student, mixture), summed and divided by the valid-token count. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # The chunked JSD path must produce the same loss as the full-logit JSD it replaced (the handover). This also
         # checks the wiring: the student stays the student, the teacher the teacher, and only completion positions score.
         # A non-symmetric `beta` (0.25, not 0.5) is used deliberately so a student/teacher swap would change the loss.
@@ -1461,6 +1693,9 @@ class TestDistillationTrainer(TrlTestCase):
         torch.testing.assert_close(loss, reference, rtol=1e-4, atol=1e-6)
 
     def test_pad_token_id_synced_with_model_config(self):
+        # [FUNCTION DOC]
+        # With tiny Mistral 0.2 (tokenizer without pad token, eos used) as student and teacher: asserts a pad id is set and
+        # copied to the model config and generation config. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # This model's tokenizer has no pad token, so the trainer falls back to the eos token. The model configs must
         # follow: otherwise `Trainer` realigns them at train time and reports it as a change the user did not make.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -1481,6 +1716,9 @@ class TestDistillationTrainer(TrlTestCase):
 
 @require_vision
 class TestDistillationTrainerVLM(TrlTestCase):
+    # [CLASS DOC]
+    # Vision-language DistillationTrainer tests on the zen-image conversational prompt-only dataset, using
+    # self-distillation (same tiny VLM as student and teacher). Requires vision. Inherits TrlTestCase.
     @pytest.mark.parametrize(
         "model_id",
         [
@@ -1520,6 +1758,10 @@ class TestDistillationTrainerVLM(TrlTestCase):
         ],
     )
     def test_train_vlm(self, model_id):
+        # [FUNCTION DOC]
+        # Parametrized over tiny VLMs (Gemma3, Gemma4, InternVL, LlavaNext, Qwen2/2.5-VL, Qwen3.5, Qwen3.6; version gated):
+        # asserts ddp_find_unused_parameters is enabled (text-only batches leave the vision tower without grads), trains with
+        # batch 2, and asserts a finite train_loss. Inputs: model_id. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         training_args = DistillationConfig(
@@ -1546,6 +1788,9 @@ class TestDistillationTrainerVLM(TrlTestCase):
         assert torch.isfinite(torch.tensor(train_loss))
 
     def test_generation_suppresses_image_token(self):
+        # [FUNCTION DOC]
+        # With tiny Gemma3, asserts generation_config.suppress_tokens is exactly the model config's image_token_id (not the
+        # processor's). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets.
         # Gemma3: its processor's `image_token_id` is not the placeholder token, unlike its config's
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
         training_args = DistillationConfig(output_dir=self.tmp_dir, report_to="none")
@@ -1572,6 +1817,10 @@ class TestDistillationTrainerVLM(TrlTestCase):
         ],
     )
     def test_train_vlm_gradient_accumulation(self, model_id):
+        # [FUNCTION DOC]
+        # Parametrized over Qwen2-VL (image_grid_thw path) and Gemma3 (image_position_ids path): trains with batch 2 and
+        # gradient accumulation 2 (packed pixel_values split via num_images) and asserts a finite train_loss.
+        # Inputs: model_id. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         # With gradient accumulation the packed `pixel_values` are split across micro-batches via `num_images`; train a
         # couple of steps to exercise that path (a missing `num_images` would misalign images and text).
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
@@ -1613,6 +1862,9 @@ class TestDistillationTrainerVLM(TrlTestCase):
     @require_vllm
     @pytest.mark.skip(reason="We should add a mock for the vLLM server.")
     def test_train_vlm_and_vllm(self, model_id) -> None:
+        # [FUNCTION DOC]
+        # Parametrized over Qwen2.5-VL, Gemma3, Gemma4: would train with use_vllm in server mode and assert finite loss;
+        # currently always skipped (needs a vLLM server mock). Requires vLLM. Inputs: model_id. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         training_args = DistillationConfig(
@@ -1645,11 +1897,20 @@ class TestDistillationTrainerVLM(TrlTestCase):
     )
     @require_response_parsing
     def test_train_with_tools_multimodal_response(self):
+        # [FUNCTION DOC]
+        # Trains tiny Qwen3.5 NoThink with screenshot_tool (returns an image plus text) and max_completion_length 512, patching
+        # generate: first call (batch 2) emits one tool call and one plain answer; the second call must receive
+        # image_grid_thw with 2 rows (original image plus tool-returned image) and emits "Done!". Asserts finite train_loss,
+        # tools/call_frequency 1/2 and failure_frequency 0. Strict xfail below transformers 5.2; requires response parsing.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         # Test that tools returning images (multimodal responses) work correctly with a VLM.
         # The tool returns a list of content blocks including an image.
         from PIL import Image as PILImage
 
         def screenshot_tool() -> list:
+            # [FUNCTION DOC]
+            # HELPER: Tool returning a list of content blocks: a red 64x64 PIL image and the text "Here is the screenshot".
+            # Inputs: none. Outputs: list of dict. Exceptions: none. Side effects: none.
             """
             Takes a screenshot and returns it.
 
@@ -1676,6 +1937,12 @@ class TestDistillationTrainerVLM(TrlTestCase):
         )
 
         def fake_generate(input_ids, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Replacement for model.generate. For a batch of 2 appends ids for a screenshot_tool call and for a plain
+            # answer plus padding; otherwise asserts image_grid_thw is in kwargs with 2 rows and appends ids for "Done!".
+            # Returns prompt ids concatenated with completion ids.
+            # Inputs: input_ids; kwargs (generation inputs). Outputs: tensor. Exceptions: AssertionError on missing/wrong
+            # image_grid_thw. Side effects: none.
             if input_ids.shape[0] == 2:  # first call
                 # fmt: off
                 completion_ids = torch.tensor(
@@ -1721,8 +1988,15 @@ class TestDistillationTrainerVLM(TrlTestCase):
     )
     @require_response_parsing
     def test_train_with_tools_text_response_multimodal_prompt(self):
+        # [FUNCTION DOC]
+        # Same setup as the multimodal-response test but screenshot_tool returns text; the follow-up generate call must still
+        # receive the original image's image_grid_thw (1 row). Asserts finite loss, call frequency 1/2, failure frequency 0.
+        # Strict xfail below transformers 5.2; requires response parsing. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads models/datasets, trains in self.tmp_dir.
         # Test that tools returning text (non-multimodal response) work correctly with a VLM prompt having images.
         def screenshot_tool() -> str:
+            # [FUNCTION DOC]
+            # HELPER: Text-returning tool; always returns "The image shows a red square."
+            # Inputs: none. Outputs: str. Exceptions/Side effects: none.
             """Simple text-returning tool."""
             return "The image shows a red square."
 
@@ -1743,6 +2017,10 @@ class TestDistillationTrainerVLM(TrlTestCase):
         )
 
         def fake_generate(input_ids, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Like the multimodal-response fake_generate, but on the follow-up call asserts image_grid_thw has 1 row
+            # (the original prompt image) before appending ids for "Done!".
+            # Inputs: input_ids; kwargs. Outputs: tensor. Exceptions: AssertionError on wrong image_grid_thw. Side effects: none.
             if input_ids.shape[0] == 2:  # first call
                 # fmt: off
                 completion_ids = torch.tensor(
