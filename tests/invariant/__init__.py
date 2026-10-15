@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Package marker for the invariant test suite (tests/invariant), which checks that trainers produce numerically
+# identical results across refactors. Exports nothing; contains only the license header. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

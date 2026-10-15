@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Example script: DPO fine-tuning of a vision-language model (e.g. Qwen2.5-VL-3B) on an RLAIF-V-formatted preference
+# dataset to reduce hallucinations. Under the main guard it parses ScriptArguments/DPOConfig/ModelConfig via
+# TrlParser, loads an AutoModelForImageTextToText (dtype resolved to a torch dtype unless "auto"/None, optional
+# quantization), builds an optional PEFT config, loads the processor with image splitting disabled, optionally marks
+# boolean buffers as ignored by DDP, loads the dataset (optionally streaming), trains DPOTrainer (eval split only
+# when eval_strategy is not "no"), saves, optionally pushes to the Hub and calls trainer.end().
+# No functions or classes. Import-time side effects: none unless run as a script (then downloads, training, files).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

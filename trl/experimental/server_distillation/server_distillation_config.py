@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Module trl.experimental.server_distillation.server_distillation_config: defines ServerDistillationConfig,
+# the training arguments for ServerDistillationTrainer (distillation with a remote vLLM teacher).
+# Extends trl.trainer.distillation_config.DistillationConfig. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +24,11 @@ from ...trainer.distillation_config import DistillationConfig
 
 @dataclass
 class ServerDistillationConfig(DistillationConfig):
+    # [CLASS DOC]
+    # Dataclass of training arguments; inherits all DistillationConfig fields (beta, vLLM settings, etc.).
+    # Adds teacher_model_server_url (required teacher vLLM URL, default None), overrides vllm_server_port default
+    # to 8001, and adds loss_top_k (default 1), loss_add_tail (default True) and reverse_kl_top_1_mode
+    # (default "sampled"). __post_init__ validates the combination since only top-k teacher logprobs are available.
     r"""
     Configuration class for the [`experimental.server_distillation.ServerDistillationTrainer`].
 
@@ -83,6 +93,14 @@ class ServerDistillationConfig(DistillationConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: run the parent __post_init__, then validate in order: reverse_kl_top_1_mode must be "sampled" or
+        # "argmax"; teacher_model_server_url must be non-None and non-blank; with beta equal to 0, loss_top_k must be
+        # at least 1; reverse_kl_top_1_mode "argmax" is rejected (server cannot score student-chosen tokens); with
+        # beta greater than 0, loss_top_k must be exactly 1.
+        # Inputs: self fields. Outputs: none.
+        # Exceptions: ValueError for each failed check (plus any raised by the parent).
+        # Side effects: parent may normalize fields.
         super().__post_init__()
 
         if self.reverse_kl_top_1_mode not in {"sampled", "argmax"}:

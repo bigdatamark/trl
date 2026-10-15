@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Script that builds the "zen-multi-image" conversational test dataset, where user turns interleave zero or more
+# image placeholders with text, in several TRL dataset formats and optionally pushes them to the Hub.
+# Contents: a module-level Message feature schema (list of messages whose content is a list of typed text/image
+# parts), ScriptArguments and main.
+# Inputs: CLI flags --test_size, --push_to_hub, --repo_id.
+# Outputs: none returned.
+# Exceptions: propagates HfArgumentParser and datasets/Hub errors.
+# Side effects: none at import time beyond defining the schema; network uploads when pushing. Images come from
+# the unseeded numpy global RNG.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +35,10 @@ Message = List({"content": List({"text": Value("string"), "type": Value("string"
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of command-line options: test_size (float, default 0.1) test-split fraction; push_to_hub (bool,
+    # default False) whether to upload; repo_id (str, default "trl-internal-testing/zen-multi-image") target repo.
+    # No methods; parsed by HfArgumentParser in the __main__ block.
     r"""
     Arguments for the script.
 
@@ -51,6 +66,20 @@ class ScriptArguments:
 
 
 def main(test_size, push_to_hub, repo_id):
+    # [FUNCTION DOC]
+    # Builds five 19-example multi-image conversational datasets and optionally pushes each as a named config.
+    # Behavior: for each format, counts the image parts in the first message of every example (messages or prompt),
+    # draws that many random (height, width) pairs in [32, 64) and creates random uint8 RGB images, stored as a list
+    # in an images column. Formats, in order: conversational_language_modeling (messages),
+    # conversational_prompt_only (prompt), conversational_prompt_completion (prompt, completion),
+    # conversational_preference (prompt, chosen, rejected) and conversational_unpaired_preference (reuses the
+    # preference prompts with a new completion list and a fixed boolean label list). Datasets are built with explicit
+    # Features (Message plus a list of Image), split train/test without shuffling, and pushed under the format name
+    # as config_name when push_to_hub.
+    # Inputs: test_size (float), push_to_hub (bool), repo_id (str).
+    # Outputs: None.
+    # Exceptions: propagates datasets / Hub errors.
+    # Side effects: consumes numpy global RNG; network uploads when push_to_hub is true.
     # fmt: off
     messages = [
         [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What is better than ugly?"}]}, {"role": "assistant", "content": [{"type": "text", "text": "Beautiful."}]}],

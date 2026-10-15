@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Module trl.experimental.tpo.tpo_config: defines TPOConfig, the training arguments for TPOTrainer
+# (Triple Preference Optimization: chosen / rejected / gold reference responses).
+# Builds on trl.trainer.base_config._BaseConfig (TrainingArguments subclass with TRL defaults).
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +26,14 @@ from ...trainer.base_config import _BaseConfig
 
 @dataclass
 class TPOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass of TPO training arguments. Adds model_init_kwargs (also allowed as a JSON string via
+    # _VALID_DICT_FIELDS), trust_remote_code, disable_dropout, dataset preprocessing fields (dataset_num_proc,
+    # max_length 1024, truncation_mode "keep_start", pad_to_multiple_of) and loss fields (loss_type "sigmoid" /
+    # "hinge" / "ipo" / "tpo-l", beta 0.01, label_smoothing 0.0, tpo_alpha 1.0 weighting the gold-response NLL,
+    # tpo_l_gamma 0.5 margin for TPO-L). Overrides learning_rate default to 5e-7; other overridden defaults
+    # listed in the docstring come from _BaseConfig. No methods of its own; validation happens in the parent
+    # or trainer.
     r"""
     Configuration class for the [`experimental.tpo.TPOTrainer`].
 

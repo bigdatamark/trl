@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Example script: GRPO training of a text-only LLM (default Qwen3-0.6B) on OpenEnv BrowserGym web tasks (default
+# MiniWoB click-test) hosted on a Hugging Face Space, using the accessibility tree as observation and vLLM generation
+# (colocate or server). Main contents: parse_args, sanitize_name, SYSTEM_PROMPT (describes the bid notation and the
+# tools), reward_completion, main (which defines the BrowserGymLLMEnv environment class inline).
+# Import-time side effects: none beyond imports (requires the browsergym_env package).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -77,6 +84,12 @@ from trl import GRPOConfig, GRPOTrainer
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Behavior: argparse parser for model id, Space URL, benchmark, task name, dataset prompt/size, max steps per episode,
+    # completion length, sampling (temperature 0.7, top-k 50, optional top-p), optimizer settings (lr 5e-6, weight decay,
+    # grad accumulation 32, warmup 10), batch size, generations per prompt (4), epochs, checkpoint interval/limit, output
+    # dir, run name, project, vLLM mode/server URL and logging steps.
+    # Inputs: command line. Outputs: argparse.Namespace. Exceptions: SystemExit on bad args. Side effects: may print usage.
     parser = argparse.ArgumentParser(description="Run GRPO training for BrowserGym MiniWoB using OpenEnv environment.")
     parser.add_argument(
         "--model-id",
@@ -231,6 +244,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def sanitize_name(name: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Replaces every "/" with "-" so model ids can be used in paths and run names.
+    # Inputs: name. Outputs: string. Exceptions: none. Side effects: none.
     return name.replace("/", "-")
 
 
@@ -259,6 +275,9 @@ Complete the given task as efficiently as possible."""
 
 
 def reward_completion(environments, **kwargs) -> list[float]:
+    # [FUNCTION DOC]
+    # Behavior: reward function returning each environment's reward attribute (shaped success reward).
+    # Inputs: environments list, other kwargs ignored. Outputs: list of floats. Exceptions: none. Side effects: none.
     """Reward for task completion."""
     return [env.reward for env in environments]
 
@@ -269,6 +288,17 @@ def reward_completion(environments, **kwargs) -> list[float]:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: parses args; builds a dataset of dataset_size identical prompts (system SYSTEM_PROMPT plus user
+    # dataset_prompt); defines BrowserGymLLMEnv capturing space_url, max_steps and args by closure; derives output_dir
+    # (outputs/browsergym-grpo-<model>-<timestamp> by default); builds GRPOConfig (vLLM on, 0.4 GPU memory, server URL
+    # only in server mode, generation batch equal to num_generations, trackio space named after model and timestamp,
+    # step checkpoints, thinking disabled), sets run_name and project defaults, creates GRPOTrainer with
+    # reward_completion and environment_factory BrowserGymLLMEnv, prints a summary banner, trains and calls trainer.end().
+    # Inputs: command line. Outputs: none.
+    # KNOWN ISSUE: the --benchmark option is only printed; it is never passed to the environment.
+    # Exceptions: propagates network/training errors.
+    # Side effects: HTTP/WebSocket traffic to the Space, GPU training, trackio logging, checkpoints, stdout prints.
     args = parse_args()
 
     space_url = args.space_url
@@ -287,13 +317,27 @@ def main() -> None:
     )
 
     class BrowserGymLLMEnv:
+        # [CLASS DOC]
+        # Per-rollout environment wrapping a BrowserGymEnv client connected to the Space. State: client, reward (shaped
+        # episode reward read by reward_completion), _done flag and _step_count. reset starts an episode; click, fill,
+        # send_keys, scroll and noop are tools exposed to the model (via docstrings) that all delegate to _do_action, which
+        # sends a BrowserGym action string and formats the observation. No base class.
         def __init__(self):
+            # [FUNCTION DOC]
+            # Behavior: creates the BrowserGymEnv client for the closed-over space_url and zeroes reward, done and step count.
+            # Inputs: none. Outputs: none. Exceptions: client construction errors. Side effects: creates a client object.
             self.client = BrowserGymEnv(base_url=space_url)
             self.reward = 0.0
             self._done = False
             self._step_count = 0
 
         def _ensure_large_max_size(self):
+            # [FUNCTION DOC]
+            # HELPER: Works around the 1 MB default WebSocket message limit for large accessibility trees.
+            # Behavior: connects the client, takes its private _ws; if it has a protocol object, picks the attribute name
+            # max_size (older websockets) or max_message_size (newer), and if its value is exactly 2**20 bytes raises it to 100 MB.
+            # Inputs: none. Outputs: none. Exceptions: connection errors.
+            # Side effects: opens the WebSocket connection; mutates protocol limits.
             """Raise WebSocket max message size for large observations (e.g. accessibility trees).
 
             openenv-core<=0.2.1 does not pass max_size to ws_connect, so the websockets library
@@ -309,6 +353,10 @@ def main() -> None:
                     setattr(proto, attr, 100 * 1024 * 1024)
 
         def reset(self, **kwargs) -> str:
+            # [FUNCTION DOC]
+            # Behavior: zeroes reward, done and step count, ensures the large message limit, resets the remote env with the
+            # closed-over task name, stores result.done and returns the formatted observation.
+            # Inputs: kwargs ignored. Outputs: observation string. Exceptions: network errors. Side effects: remote reset.
             self.reward = 0.0
             self._done = False
             self._step_count = 0
@@ -318,6 +366,10 @@ def main() -> None:
             return self._format_observation(result.observation)
 
         def click(self, bid: str) -> str:
+            # [FUNCTION DOC]
+            # Tool: clicks the element with the given bid by sending a click action with the repr-quoted bid.
+            # Inputs: bid string. Outputs: observation string. Exceptions: ValueError if the episode is done (from _do_action).
+            # Side effects: remote step.
             """Click an element on the page.
 
             Args:
@@ -329,6 +381,9 @@ def main() -> None:
             return self._do_action(f"click({bid!r})")
 
         def fill(self, bid: str, text: str) -> str:
+            # [FUNCTION DOC]
+            # Tool: fills the input with given bid with text via a fill action with both arguments repr-quoted.
+            # Inputs: bid, text. Outputs: observation string. Exceptions: as _do_action. Side effects: remote step.
             """Fill an input field with text.
 
             Args:
@@ -341,6 +396,9 @@ def main() -> None:
             return self._do_action(f"fill({bid!r}, {text!r})")
 
         def send_keys(self, text: str) -> str:
+            # [FUNCTION DOC]
+            # Tool: sends keyboard input via a send_keys action with the repr-quoted text.
+            # Inputs: text. Outputs: observation string. Exceptions: as _do_action. Side effects: remote step.
             """Send keyboard input to the page.
 
             Args:
@@ -352,6 +410,9 @@ def main() -> None:
             return self._do_action(f"send_keys({text!r})")
 
         def scroll(self, direction: str) -> str:
+            # [FUNCTION DOC]
+            # Tool: scrolls via a scroll action with the repr-quoted direction (expected "up" or "down", not validated).
+            # Inputs: direction. Outputs: observation string. Exceptions: as _do_action. Side effects: remote step.
             """Scroll the page.
 
             Args:
@@ -363,6 +424,9 @@ def main() -> None:
             return self._do_action(f"scroll({direction!r})")
 
         def noop(self) -> str:
+            # [FUNCTION DOC]
+            # Tool: sends a no-op action and returns the current observation.
+            # Inputs: none. Outputs: observation string. Exceptions: as _do_action. Side effects: remote step.
             """Do nothing and observe the current page state.
 
             Returns:
@@ -371,6 +435,14 @@ def main() -> None:
             return self._do_action("noop()")
 
         def _do_action(self, action_str: str) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Executes one action string.
+            # Behavior: raises if done; increments step count; steps the client; reward shaping: if the episode is done, reward
+            # is 1.0 when the step reward is positive else 0.0; otherwise reward equals the step reward (None treated as 0).
+            # Marks done once step count reaches the closed-over max_steps. Returns the formatted observation.
+            # Inputs: action_str. Outputs: observation string.
+            # Exceptions: ValueError("Episode is done.") when already done; network errors.
+            # Side effects: remote step; mutates reward, _done, _step_count.
             if self._done:
                 raise ValueError("Episode is done.")
 
@@ -395,6 +467,11 @@ def main() -> None:
             return self._format_observation(observation)
 
         def _format_observation(self, observation) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Builds the text observation: "Goal: ..." if a goal exists, "Error: ..." if last_action_error and error are
+            # set, and "Page structure:" followed by the accessibility tree truncated to 2000 chars plus "..." if longer; parts
+            # are joined with blank lines, or "No observation available." if empty.
+            # Inputs: BrowserGym observation. Outputs: string. Exceptions: none. Side effects: none.
             parts = []
             if observation.goal:
                 parts.append(f"Goal: {observation.goal}")

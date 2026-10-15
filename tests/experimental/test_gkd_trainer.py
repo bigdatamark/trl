@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for the experimental GKDTrainer / GKDConfig (trl.experimental.gkd), Generalized Knowledge
+# Distillation. Three groups: the static generate_on_policy_outputs helper (shapes, determinism,
+# prompt/pad/eos masking), the static generalized_jsd_loss (beta, temperature, reductions, symmetry),
+# and trainer integration (training, eval datasets, generation config, multimodal models, and
+# num_items_in_batch loss normalization). Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,8 +34,20 @@ from ..testing_utils import TrlTestCase, require_torch_accelerator
 
 
 class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
+    # [CLASS DOC]
+    # Tests GKDTrainer.generate_on_policy_outputs, which generates from prompts and returns new
+    # input_ids, attention_mask, and labels (prompt masked with -100, post-stop padding masked).
+    # setup_class loads a tiny Qwen2 (pad = eos) on cuda if available and a default GenerationConfig.
+    # Some tests use a local DummyModel stand-in to control the generated sequence exactly.
+    # KNOWN ISSUE: DummyModel / SimpleNamespace stand-ins conflict with the repository test guideline
+    # of exercising real objects.
     @classmethod
     def setup_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Class fixture setting cls.device (cuda or cpu), cls.tokenizer (pad = eos), cls.model
+        # (float32 on device), and cls.generation_config (max_new_tokens 20, one sequence, tokenizer pad and
+        # eos ids). Inputs: cls. Outputs: none. Exceptions: load errors propagate.
+        # Side effects: network/cache; device memory.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         cls.device = "cuda" if torch.cuda.is_available() else "cpu"
         cls.tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -42,6 +61,10 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
         )
 
     def test_generate_on_policy_outputs_deterministic(self):
+        # [FUNCTION DOC]
+        # Tests greedy generation (do_sample False, max_new_tokens 30) on two prompts: decoded outputs start
+        # with their prompts, and two calls return identical input_ids, attention masks, and labels.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         prompts = ["Hello, how are you?", "What's the weather like today?"]
         tokenized_prompts = self.tokenizer(prompts, return_tensors="pt", padding=True)
 
@@ -86,6 +109,10 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
         assert torch.all(new_labels.eq(new_labels2)), "Labels for deterministic generations are not identical"
 
     def test_generate_on_policy_outputs(self):
+        # [FUNCTION DOC]
+        # Tests the output is a 3-tuple of tensors with batch dimension 2, and that attention mask and labels
+        # have the same shape as the new input_ids.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         prompts = ["Hello, how are you?", "What's the weather like today?"]
         tokenized_prompts = self.tokenizer(prompts, return_tensors="pt", padding=True)
 
@@ -118,6 +145,11 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
         assert new_labels.shape == new_attention_mask.shape
 
     def test_generate_on_policy_outputs_masks_prompt(self):
+        # [FUNCTION DOC]
+        # Tests with left-padded prompts of different lengths and forced 8 to 16 new greedy tokens that all
+        # label columns within the prompt width are -100 and some completion label is not -100.
+        # Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: sets the shared class tokenizer padding_side to left (persists for later tests).
         # The on-policy / seq-KD labels must mask the prompt with -100, matching the collator
         # convention (labels[:len(prompt)] = -100). Otherwise `compute_loss`, which relies on the
         # -100 mask to skip prompts, would apply the JSD loss to prompt positions too.
@@ -151,6 +183,13 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
         assert (new_labels[:, prompt_width:] != -100).any(), "Completion tokens were unexpectedly all masked"
 
     def test_generate_on_policy_outputs_pad_equals_eos_keeps_eos(self):
+        # [FUNCTION DOC]
+        # With pad id equal to eos id, uses DummyModel to return fixed sequences: row 0 stops on eos then
+        # pads; row 1 runs full length. Asserts prompt attention equals the input prompt mask (pad-id tokens
+        # inside the prompt stay attended), row 0's eos is attended and labeled eos while later positions are
+        # masked (attention 0, label -100), row 1's completion is fully attended and labeled, and prompt
+        # labels are all -100.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         # pad == eos here (the setup ties them): identity-based pad masking used to erase the
         # terminating EOS label on every row and zero attention on pad-id tokens inside the prompt.
         eos_id = self.tokenizer.eos_token_id
@@ -164,7 +203,14 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
         generated_sequence = torch.cat([prompts, completions], dim=1)
 
         class DummyModel:
+            # [CLASS DOC]
+            # HELPER: Stand-in model (avoids real generation so the output sequence is controlled) whose
+            # generate returns an object with sequences set to the precomputed generated_sequence.
             def generate(self, input_ids, attention_mask, generation_config, return_dict_in_generate):
+                # [FUNCTION DOC]
+                # HELPER: Ignores all inputs and returns a SimpleNamespace whose sequences attribute is the
+                # enclosing test's generated_sequence tensor. Inputs: input_ids, attention_mask, generation_config,
+                # return_dict_in_generate. Outputs: SimpleNamespace. Exceptions: none. Side effects: none.
                 return SimpleNamespace(sequences=generated_sequence)
 
         inputs = {"prompts": prompts, "prompt_attention_mask": prompt_mask}
@@ -188,6 +234,10 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
         assert torch.all(new_labels[:, :prompt_width] == -100)
 
     def test_generate_on_policy_outputs_without_eos_id_keeps_full_completion(self):
+        # [FUNCTION DOC]
+        # Tests that with a default GenerationConfig (eos_token_id None) the whole completion region stays
+        # attended and labeled (no stop-token masking, no error).
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         # GenerationConfig defaults eos_token_id to None; torch.tensor(None) would raise, so the
         # None guard must keep the whole completion instead of trying to find a stop token.
         prompts = torch.tensor([[11, 12, 13], [14, 15, 16]], device=self.device)
@@ -196,7 +246,14 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
         generated_sequence = torch.cat([prompts, completions], dim=1)
 
         class DummyModel:
+            # [CLASS DOC]
+            # HELPER: Stand-in model (avoids real generation so the output sequence is controlled) whose
+            # generate returns an object with sequences set to the precomputed generated_sequence.
             def generate(self, input_ids, attention_mask, generation_config, return_dict_in_generate):
+                # [FUNCTION DOC]
+                # HELPER: Ignores all inputs and returns a SimpleNamespace whose sequences attribute is the
+                # enclosing test's generated_sequence tensor. Inputs: input_ids, attention_mask, generation_config,
+                # return_dict_in_generate. Outputs: SimpleNamespace. Exceptions: none. Side effects: none.
                 return SimpleNamespace(sequences=generated_sequence)
 
         generation_config = GenerationConfig()
@@ -211,6 +268,11 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
         assert torch.all(new_labels[:, prompt_width:] != -100)
 
     def test_generate_on_policy_outputs_masks_after_any_stop_token(self):
+        # [FUNCTION DOC]
+        # Tests eos_token_id as a list [7, 9]: each row stops at the first occurrence of any stop id (row 0
+        # at completion index 1, row 1 at index 2); completion mask keeps up to and including the stop token,
+        # the stop token is labeled, and later labels are -100.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         # eos_token_id can be a list of stop tokens; each row must stop on the first occurrence of
         # any of them. A scalar == would only catch one id and miss the other row's terminator.
         prompts = torch.tensor([[11, 12, 13], [14, 15, 16]], device=self.device)
@@ -220,7 +282,14 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
         generated_sequence = torch.cat([prompts, completions], dim=1)
 
         class DummyModel:
+            # [CLASS DOC]
+            # HELPER: Stand-in model (avoids real generation so the output sequence is controlled) whose
+            # generate returns an object with sequences set to the precomputed generated_sequence.
             def generate(self, input_ids, attention_mask, generation_config, return_dict_in_generate):
+                # [FUNCTION DOC]
+                # HELPER: Ignores all inputs and returns a SimpleNamespace whose sequences attribute is the
+                # enclosing test's generated_sequence tensor. Inputs: input_ids, attention_mask, generation_config,
+                # return_dict_in_generate. Outputs: SimpleNamespace. Exceptions: none. Side effects: none.
                 return SimpleNamespace(sequences=generated_sequence)
 
         generation_config = GenerationConfig(eos_token_id=[7, 9])
@@ -241,7 +310,13 @@ class TestGKDTrainerGenerateOnPolicy(TrlTestCase):
 
 
 class TestGeneralizedJSDLoss(TrlTestCase):
+    # [CLASS DOC]
+    # Tests the static GKDTrainer.generalized_jsd_loss on random logits (batch 2, seq 3, vocab 5) built
+    # in setup_method.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets batch_size 2, seq_length 3, vocab_size 5 and random student_logits / teacher_logits
+        # of that shape. Inputs/Outputs: none. Exceptions: none. Side effects: consumes global torch RNG.
         self.batch_size = 2
         self.seq_length = 3
         self.vocab_size = 5
@@ -249,11 +324,19 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         self.teacher_logits = torch.randn(self.batch_size, self.seq_length, self.vocab_size)
 
     def test_uniform_distribution(self):
+        # [FUNCTION DOC]
+        # Tests identical uniform logits give a loss of 0 to 5 decimals.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         logits = torch.ones(1, 1, self.vocab_size)
         loss = GKDTrainer.generalized_jsd_loss(logits, logits)
         assert round(abs(loss.item() - 0), 5) == 0
 
     def test_generalized_jsd_loss_edge_cases(self):
+        # [FUNCTION DOC]
+        # Tests on two-token distributions (0.1/0.9 vs 0.9/0.1) that beta=1 equals the batchmean KL
+        # divergence computed with teacher log-probs as input and student probs as target, and beta=0 equals
+        # the one with student log-probs as input and teacher probs as target (5-decimal tolerance).
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         # Setup
         student_logits = torch.log(torch.tensor([[0.1, 0.9]])).unsqueeze(0)
         teacher_logits = torch.log(torch.tensor([[0.9, 0.1]])).unsqueeze(0)
@@ -273,21 +356,33 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         assert round(abs(loss_beta_0.item() - expected_loss_beta_0.item()), 5) == 0
 
     def test_output_shape(self):
+        # [FUNCTION DOC]
+        # Tests the default reduction returns a scalar tensor.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         loss = GKDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits)
         assert torch.is_tensor(loss)
         assert loss.shape == torch.Size([])
 
     def test_beta_values(self):
+        # [FUNCTION DOC]
+        # Tests beta 0 and beta 1 give different losses.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         loss_beta_0 = GKDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=0)
         loss_beta_1 = GKDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=1)
         assert loss_beta_0 != loss_beta_1
 
     def test_temperature_scaling(self):
+        # [FUNCTION DOC]
+        # Tests temperature 1 and 2 give different losses.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         loss_temp_1 = GKDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, temperature=1)
         loss_temp_2 = GKDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, temperature=2)
         assert loss_temp_1 != loss_temp_2
 
     def test_reduction_methods(self):
+        # [FUNCTION DOC]
+        # Tests batchmean, sum, and mean reductions return scalars and none returns the logits' shape.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         loss_batchmean = GKDTrainer.generalized_jsd_loss(
             self.student_logits, self.teacher_logits, reduction="batchmean"
         )
@@ -301,6 +396,9 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         assert loss_none.shape == self.student_logits.shape
 
     def test_symmetry(self):
+        # [FUNCTION DOC]
+        # Tests swapping student and teacher changes the loss at beta 0.1 but not at beta 0.5 (symmetric JSD).
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         student_teacher = GKDTrainer.generalized_jsd_loss(self.student_logits, self.teacher_logits, beta=0.1)
         teacher_student = GKDTrainer.generalized_jsd_loss(self.teacher_logits, self.student_logits, beta=0.1)
         assert student_teacher != teacher_student
@@ -310,13 +408,22 @@ class TestGeneralizedJSDLoss(TrlTestCase):
         assert student_teacher == teacher_student
 
     def test_zero_loss_for_identical_inputs(self):
+        # [FUNCTION DOC]
+        # Tests identical random logits give a loss of 0 to 6 decimals.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure. Side effects: none beyond model forward passes.
         identical_logits = torch.randn(self.batch_size, self.seq_length, self.vocab_size)
         loss = GKDTrainer.generalized_jsd_loss(identical_logits, identical_logits)
         assert round(abs(loss.item() - 0), 6) == 0
 
 
 class TestGKDTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # Integration tests for GKDTrainer; inherits TrlTestCase. setup_method loads a tiny Qwen2 student,
+    # teacher copy, and tokenizer (pad = eos).
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets self.model_id, self.model (float32), self.teacher_model, self.tokenizer (pad = eos).
+        # Inputs/Outputs: none. Exceptions: load errors propagate. Side effects: network/cache access.
         self.model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         self.model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype="float32")
         self.teacher_model = AutoModelForCausalLM.from_pretrained(self.model_id)
@@ -324,6 +431,11 @@ class TestGKDTrainer(TrlTestCase):
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
     def test_gkd_trainer(self):
+        # [FUNCTION DOC]
+        # Trains 4 steps on conversational LM data with eval and save every 2 steps; asserts train_loss in
+        # the last log, eval_loss in the first log, and model.safetensors in checkpoint-2.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models/datasets; writes to tmp_dir.
         training_args = GKDConfig(
             output_dir=self.tmp_dir,
             dataloader_drop_last=True,
@@ -365,6 +477,12 @@ class TestGKDTrainer(TrlTestCase):
         ],
     )
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over regular and streaming variants of dataset, dataset dict, and dict of datasets,
+        # plus none. Tests eval datasets are stored as is (no preparation): None stays None; dicts keep keys
+        # data1/data2; single datasets are the same object.
+        # Inputs: eval_dataset_type (str). Outputs: none. Exceptions: AssertionError.
+        # Side effects: downloads; tmp_dir.
         train_dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling", split="train")
 
         if eval_dataset_type == "none":
@@ -401,6 +519,11 @@ class TestGKDTrainer(TrlTestCase):
             assert trainer.eval_dataset is eval_dataset
 
     def test_generation_config_init(self):
+        # [FUNCTION DOC]
+        # Tests trainer.generation_config: pad id equals tokenizer eos, eos id equals the model's generation
+        # eos id, max_new_tokens and temperature come from args, top_k 0 and top_p 1.0.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models/datasets; writes to tmp_dir.
         training_args = GKDConfig(output_dir=self.tmp_dir)
         dataset = load_dataset("trl-internal-testing/zen", "conversational_language_modeling")
 
@@ -421,6 +544,11 @@ class TestGKDTrainer(TrlTestCase):
         assert trainer.generation_config.top_p == 1.0
 
     def test_init_multimodal_model(self):
+        # [FUNCTION DOC]
+        # Tests construction with tiny Gemma3 (vocab_size lives in text_config) succeeds and student and
+        # teacher text vocab sizes match.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models/datasets; writes to tmp_dir.
         """Multimodal configs keep vocab_size in their text_config; the vocab check must handle them."""
         model_id = "trl-internal-testing/tiny-Gemma3ForConditionalGeneration"
         tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -439,6 +567,11 @@ class TestGKDTrainer(TrlTestCase):
         assert student_vocab_size == trainer.teacher_model.config.get_text_config().vocab_size
 
     def test_on_policy_with_multimodal_model(self):
+        # [FUNCTION DOC]
+        # Tests fully on-policy (lmbda 1.0) training of tiny Gemma3 for 1 step (batch 2, 8 new tokens,
+        # left padding) succeeds and logs train_loss.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models/datasets; writes to tmp_dir.
         """On-policy generation must work when the chunked-CE patch has replaced the model's forward."""
         model_id = "trl-internal-testing/tiny-Gemma3ForConditionalGeneration"
         tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
@@ -465,6 +598,13 @@ class TestGKDTrainer(TrlTestCase):
 
     @require_torch_accelerator
     def test_loss_normalizes_by_num_items_in_batch(self):
+        # [FUNCTION DOC]
+        # Requires an accelerator. Builds a trainer on 2 rows (max_length 64), perturbs teacher weights with
+        # seeded noise, collates a batch, and counts valid completion labels after the prompt width. In eval
+        # mode, asserts compute_loss with num_items_in_batch equal to that count matches the default local
+        # mean, and that doubling the count halves the loss (rtol 1e-4, atol 1e-6).
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models/datasets; writes to tmp_dir.
         # When `num_items_in_batch` is passed (as under gradient accumulation), the loss must be the JSD summed over
         # valid tokens divided by that global count, rather than the local per-microbatch mean. See issue #4719.
         # GPU-gated: GKD's loss path is accelerator-affine, so the model runs on the device rather than being
@@ -515,6 +655,13 @@ class TestGKDTrainer(TrlTestCase):
 
     @require_torch_accelerator
     def test_loss_covers_all_completion_tokens_with_variable_length_prompts(self):
+        # [FUNCTION DOC]
+        # Requires an accelerator. Uses two conversations with very different prompt lengths, perturbs the
+        # teacher, collates a batch, asserts the batch prompt width exceeds row 0's first supervised
+        # position, then asserts compute_loss with num_items_in_batch equal to all non-masked labels matches
+        # the default local mean, i.e. every completion token is included in the loss.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models/datasets; writes to tmp_dir.
         # The loss must be computed over EVERY valid completion token, even when prompts have different lengths.
         # A previous implementation sliced logits/labels by `inputs["prompts"].shape[1]` (the batch-max prompt
         # width); because `labels` is padded to the full-sequence width independently of `prompts`, that slice

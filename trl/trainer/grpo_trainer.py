@@ -131,7 +131,8 @@ RolloutFunc = Callable[[list[str], "GRPOTrainer"], dict[str, Any]]
 
 
 class _SupportsReset(Protocol):
-    def reset(self, **kwargs) -> str | None: ...
+    def reset(self, **kwargs) -> str | None:
+        ...
 
 
 EnvironmentFactory = Callable[[], _SupportsReset]

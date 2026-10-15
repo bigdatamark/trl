@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Dataset preparation script: converts zwhe99/DeepMath-103K into TRL's conversational prompt-only format with a
+# "solution" column, splits 95/5 train/test (seed 42) and optionally pushes it plus a dataset card to the Hub
+# (default trl-lib/DeepMath-103K). Main contents: ScriptArguments, process_example, module-level model_card.
+# Import-time side effects: builds the ModelCard object (no network).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +27,10 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI options parsed by HfArgumentParser: push_to_hub (default False), repo_id (target Hub
+    # dataset repo), dataset_num_proc (worker count for map/filter, default None). No methods; plain data holder.
+    # Side effects: none.
     r"""
     Arguments for the script.
 
@@ -48,6 +58,11 @@ class ScriptArguments:
 
 
 def process_example(example):
+    # [FUNCTION DOC]
+    # Behavior: takes final_answer as solution; unless it is one of "True", "False", "Yes", "No", wraps it in dollar
+    # signs (LaTeX inline math) for math verification. Prompt is a single user message with the question.
+    # Inputs: example with "final_answer" and "question". Outputs: dict with "prompt" and "solution".
+    # Exceptions: KeyError on missing columns. Side effects: none.
     solution = example["final_answer"]
     if solution not in ["True", "False", "Yes", "No"]:
         solution = f"${solution}$"

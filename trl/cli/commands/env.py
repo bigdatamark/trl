@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Defines the "trl env" CLI subcommand that prints environment/version information. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,15 +21,27 @@ from .base import Command, CommandContext
 
 
 class EnvCommand(Command):
+    # [CLASS DOC]
+    # Command subclass named "env". Registers a plain subparser and, when run, prints environment info via
+    # trl.scripts.env.print_env.
     """CLI command that prints TRL environment information."""
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Initializes the base Command with name "env" and help text "Print the environment information".
+        # Inputs: none. Outputs: none. Exceptions: none. Side effects: none.
         super().__init__(name="env", help_text="Print the environment information")
 
     def register(self, subparsers) -> None:
+        # [FUNCTION DOC]
+        # Adds the "env" subparser with the help text. Inputs: subparsers. Outputs: none. Exceptions: none.
+        # Side effects: mutates the subparsers action.
         subparsers.add_parser(self.name, help=self.help_text)
 
     def run(self, args: Namespace, context: CommandContext) -> int:
+        # [FUNCTION DOC]
+        # Lazily imports print_env and calls it, returning exit code 0. Inputs: args, context (unused).
+        # Outputs: 0. Exceptions: import errors propagate. Side effects: prints to stdout.
         from ...scripts.env import print_env
 
         print_env()

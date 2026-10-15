@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental A2PO trainer (two-stage method: Stage 1 estimates the optimal value V*
+# per prompt from reference-policy samples offline; Stage 2 does on-policy regression toward a target built from V*).
+# Contents: A2POConfig. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +24,15 @@ from trl.trainer.base_config import _BaseConfig
 
 @dataclass
 class A2POConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass extending _BaseConfig (TrainingArguments with TRL defaults) with A2PO-specific fields. No custom
+    # __post_init__; validation is inherited.
+    # Fields (defaults): model_init_kwargs (None; accepted as a JSON string too, via _VALID_DICT_FIELDS),
+    # trust_remote_code (False), remove_unused_columns (False, so extra dataset columns reach reward functions),
+    # max_prompt_length (512, left truncation), max_completion_length (256), temperature (1.0, used in both stages),
+    # top_p (1.0), top_k (None = disabled), num_value_samples (8 reference samples per prompt for V*), beta1 (0.5, Stage 1
+    # KL temperature), filter_all_incorrect (True: drop prompts whose reference samples all fail), beta2 (1e-3, Stage 2
+    # KL temperature), reward_weights (None = all 1.0; must match number of reward functions).
     r"""
     Configuration class for the [`experimental.a2po.A2POTrainer`].
 

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# HELPER: Translates the TRL-specific --accelerate_config CLI option into accelerate's --config_file option.
+# Contents: resolve_accelerate_config_argument. Used by TrainingCommand before launching a script.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +22,15 @@ from pathlib import Path
 
 
 def resolve_accelerate_config_argument(launch_args: list[str]) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Replaces "--accelerate_config VALUE" in a launch argument list with a leading "--config_file PATH".
+    # Behavior: if the flag is absent, return the list unchanged. Otherwise take the token after the first occurrence; if
+    # it is an existing file use it as the path, else look up "<VALUE>.yaml" among the package resources of
+    # trl.accelerate_configs. Remove the flag and its value, then prepend "--config_file" and the path (as a string).
+    # Inputs: launch_args (list of str).
+    # Outputs: new list of str (input list is not mutated).
+    # Exceptions: ValueError if the flag has no following value, or if the value is neither a file nor a bundled config.
+    # Side effects: filesystem existence checks only.
     """
     Resolve `--accelerate_config` from CLI arguments into `accelerate --config_file`.
 

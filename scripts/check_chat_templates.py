@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Maintenance script that verifies each reference Hub repo in REPOS still ships a chat template identical to one of the
+# stored copies in trl/chat_templates (TRL recognizes models by exact template match). Run from the repo root; gated
+# repos require an authorized HF token. Contents: REPOS list, get_chat_template, main. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,6 +81,14 @@ REPOS = [
 
 
 def get_chat_template(api, repo):
+    # [FUNCTION DOC]
+    # HELPER: Fetches the chat template a Hub repo ships, using transformers' precedence.
+    # Behavior: lists repo files; if chat_template.jinja exists, downloads and returns its text. Otherwise checks
+    # chat_template.json then tokenizer_config.json, reading the chat_template field; if that field is a list of named
+    # variants, picks the one named default; returns the first non-None value.
+    # Inputs: api (HfApi), repo (str). Outputs: template string, or None if no source has one.
+    # Exceptions: Hub errors propagate; KeyError if a variant list has no default entry.
+    # Side effects: network calls and Hub cache downloads.
     # Same precedence as transformers: `chat_template.jinja`, then `chat_template.json` (processors), then the
     # `chat_template` field of `tokenizer_config.json`
     files = api.list_repo_files(repo)
@@ -93,6 +106,13 @@ def get_chat_template(api, repo):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Compares every reference repo's template against the stored set and sets the exit status.
+    # Behavior: reads all .jinja files under trl/chat_templates (relative to cwd) into a set, fetches each repo's template,
+    # collects repos whose template is not in the set, prints a line per drifted repo and a summary count, exits 1 if any
+    # drifted else 0.
+    # Inputs: none. Outputs: none. Exceptions: SystemExit; Hub errors propagate.
+    # Side effects: network calls, printing, process exit.
     stored = {path.read_text(encoding="utf-8") for path in Path("trl/chat_templates").glob("*.jinja")}
     api = HfApi()
     drifted = [repo for repo in REPOS if get_chat_template(api, repo) not in stored]

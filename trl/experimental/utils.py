@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Module trl.experimental.utils: shared helpers used by more than one experimental trainer (DPO-style
+# legacy trainers, GKD/GOLD distillation, cross-tokenizer ULD, PPO-style reward code, PEFT setup).
+# Main contents: data collators (DPODataCollatorWithPadding, DataCollatorForChatML,
+# DataCollatorForVisionLanguageChatML); byte-offset utilities for ByteLevel BPE tokenizers
+# (encode_with_byte_offsets and private normalizers); sequence helpers (truncate_right, first_true_indices,
+# pad_to_length, add_bos/eos_token_if_needed); reward computation (get_reward); model preparation
+# (prepare_model_for_kbit_training, enable_gradient_checkpointing, prepare_peft_model,
+# peft_module_casting_to_bf16, create_reference_model); device cache clearing (empty_cache); and
+# truncate_dataset (Arrow-level list truncation).
+# Import-time side effects: imports peft when available; builds the module constant _BYTE_LEVEL_DECODER
+# (GPT-2 byte-to-unicode inverse table) and defines LAYER_PATTERNS.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,6 +68,11 @@ if is_peft_available():
 
 @dataclass
 class DPODataCollatorWithPadding:
+    # [CLASS DOC]
+    # Dataclass collator for legacy DPO-style tokenized features. Fields: pad_token_id (default 0) and
+    # is_encoder_decoder (default False). Pads every key ending in _input_ids, _attention_mask, _labels or
+    # _pixel_values; stacks _logps keys as tensors; passes other keys through as lists.
+    # KNOWN ISSUE: the docstring says is_encoder_decoder defaults to None, but the field default is False.
     r"""
     DPO DataCollator class that pads the tokenized inputs to the maximum length of the batch.
 
@@ -69,6 +87,17 @@ class DPODataCollatorWithPadding:
     is_encoder_decoder: bool | None = False
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: iterate over keys of the first feature.
+        # Encoder-decoder: convert to LongTensors; padding value is pad_token_id for prompt*input_ids keys (error if
+        # None), 0 for attention masks, -100 for keys starting with chosen/rejected/completion or containing
+        # "decoder"; otherwise error. Right-pad with pad_sequence.
+        # Decoder-only: padding value pad_token_id for _input_ids (error if None), -100 for _labels, 0 for masks and
+        # pixel values; left padding only for prompt_input_ids and prompt_attention_mask, right otherwise; dtype
+        # float32 for pixel values, int64 otherwise; pad with trl pad.
+        # Keys ending in _logps become a tensor of per-example values; any other key is collected into a list.
+        # Inputs: features (list of dicts). Outputs: dict of padded tensors / lists.
+        # Exceptions: ValueError for missing pad token or unexpected key. Side effects: none.
         # first, pad everything to the same length
         padded_batch = {}
         for k in features[0].keys():
@@ -135,6 +164,11 @@ class DPODataCollatorWithPadding:
 
 
 def pad_byte_offsets(offsets: list[tuple[int, int]], target_length: int, padding_side: str) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Convert (start, end) byte-offset tuples to a (target_length, 2) long tensor padded with (0, 0)
+    # rows on the left or right; returns unpadded when already at or beyond target_length (no truncation).
+    # Inputs: offsets list, target_length (int), padding_side ("left" or anything else for right).
+    # Outputs: long tensor. Exceptions: none. Side effects: none.
     """Build a ``[target_length, 2]`` long tensor from ``(start, end)`` byte-offset tuples,
     padding with ``(0, 0)`` on the requested side."""
     offs = torch.tensor(offsets, dtype=torch.long).reshape(-1, 2)
@@ -146,12 +180,20 @@ def pad_byte_offsets(offsets: list[tuple[int, int]], target_length: int, padding
 
 
 def is_byte_level_tokenizer(backend) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True when the given tokenizers backend uses ByteLevel pre-tokenization or decoding, detected by
+    # "ByteLevel" appearing in the repr of its pre_tokenizer or decoder.
+    # Inputs: backend (tokenizers.Tokenizer). Outputs: bool. Exceptions: AttributeError for non-backend objects.
+    # Side effects: none.
     """Whether ``backend`` is a ByteLevel BPE tokenizer (Llama-3 family, SmolLM, Qwen, \u2026) \u2014 its pieces are in
     byte\u2192unicode space, one char per source byte. Detected via the pre-tokenizer / decoder repr."""
     return "ByteLevel" in repr(backend.pre_tokenizer) or "ByteLevel" in repr(backend.decoder)
 
 
 def piece_byte_len(piece: str) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Byte length of a ByteLevel BPE token piece, which is simply its character count (each char maps to
+    # one source byte). Inputs: piece (str). Outputs: int. Exceptions: none. Side effects: none.
     """UTF-8 byte length of a ByteLevel BPE token piece \u2014 each char maps 1:1 to one source byte.
 
     Cross-tokenizer ULD targets ByteLevel BPE pairs (Llama-3, Qwen, SmolLM, Phi, Mistral v0.3+, \u2026); SentencePiece
@@ -160,6 +202,10 @@ def piece_byte_len(piece: str) -> int:
 
 
 def _bytes_to_unicode() -> dict[int, str]:
+    # [FUNCTION DOC]
+    # HELPER: Build the GPT-2 byte-to-unicode table: printable bytes (! to ~, inverted exclamation to not sign,
+    # registered sign to y-diaeresis) map to themselves; the remaining bytes map to code points 256 upward in order.
+    # Inputs: none. Outputs: dict of byte value to single-char string. Exceptions: none. Side effects: none.
     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("\u00a1"), ord("\u00ac") + 1))
     bs += list(range(ord("\u00ae"), ord("\u00ff") + 1))
     cs = bs[:]
@@ -176,6 +222,12 @@ _BYTE_LEVEL_DECODER = {ch: b for b, ch in _bytes_to_unicode().items()}
 
 
 def _byte_level_piece_len(piece: str, text_bytes: bytes, start: int) -> int | None:
+    # [FUNCTION DOC]
+    # HELPER: Real byte length of a ByteLevel piece positioned at byte start of the text.
+    # Behavior: decode each char through _BYTE_LEVEL_DECODER (return None if any char is unknown); if the first
+    # decoded byte is a space but the source text has no space at start, drop it (tokenizer-added prefix space).
+    # Inputs: piece (str), text_bytes (bytes), start (int). Outputs: int or None. Exceptions: none.
+    # Side effects: none.
     piece_bytes = []
     for ch in piece:
         if ch not in _BYTE_LEVEL_DECODER:
@@ -187,6 +239,12 @@ def _byte_level_piece_len(piece: str, text_bytes: bytes, start: int) -> int | No
 
 
 def _split_repeated_byte_offsets(byte_offsets: list[tuple[int, int]], tokens: list[str]) -> list[tuple[int, int]]:
+    # [FUNCTION DOC]
+    # HELPER: Spread identical consecutive spans across their tokens.
+    # Behavior: scan runs of equal (start, end) spans; for runs longer than one, if the sum of piece_byte_len over
+    # the run's tokens equals the span width, assign consecutive sub-spans to each token; otherwise leave as is.
+    # Inputs: byte_offsets list, tokens list (same length). Outputs: new list of spans.
+    # Exceptions: none. Side effects: none.
     """Split repeated char-derived spans for byte-fallback or byte-level tokens."""
     normalized = list(byte_offsets)
     i = 0
@@ -211,6 +269,15 @@ def _split_repeated_byte_offsets(byte_offsets: list[tuple[int, int]], tokens: li
 def _normalize_byte_offsets(
     byte_offsets: list[tuple[int, int]], tokens: list[str], text_bytes: bytes
 ) -> list[tuple[int, int]]:
+    # [FUNCTION DOC]
+    # HELPER: Make byte offsets monotonic and non-overlapping.
+    # Behavior: first split repeated spans. Then walk tokens keeping a cursor (end of previous span): empty spans
+    # become (cursor, cursor). If the decoded piece length is known and either the span overlaps the previous
+    # end or the next span's start, or the length equals the span width, move the span to start at max(start,
+    # cursor) with that length when it still fits inside the original end. Validate start >= cursor and end >=
+    # start, append, and advance the cursor.
+    # Inputs: byte_offsets, tokens, text_bytes. Outputs: normalized list of spans.
+    # Exceptions: ValueError when overlap cannot be resolved. Side effects: none.
     byte_offsets = _split_repeated_byte_offsets(byte_offsets, tokens)
     normalized = []
     cursor = 0
@@ -244,6 +311,14 @@ def _normalize_byte_offsets(
 
 
 def encode_with_byte_offsets(backend, texts: list[str], add_special_tokens: bool = False):
+    # [FUNCTION DOC]
+    # Encode texts with a ByteLevel fast-tokenizer backend and return token ids with UTF-8 byte offsets.
+    # Behavior: require is_byte_level_tokenizer. Batch-encode texts; per text build a cumulative char-to-byte
+    # table, convert character offsets to byte offsets, normalize them, and pair with the ids.
+    # Inputs: backend, texts (list of str), add_special_tokens (default False).
+    # Outputs: list of (ids list, byte offsets list) per text.
+    # Exceptions: NotImplementedError for non-ByteLevel tokenizers; ValueError from normalization.
+    # Side effects: none.
     """Encode ``texts`` and return per-text ``(ids, byte_offsets)`` pairs.
 
     Byte offsets are derived from the fast tokenizer's character offsets via an O(N) char-to-byte cumulative table.
@@ -267,6 +342,11 @@ def encode_with_byte_offsets(backend, texts: list[str], add_special_tokens: bool
 
 @dataclass
 class DataCollatorForChatML:
+    # [CLASS DOC]
+    # Dataclass collator for ChatML-style message datasets used by GKD/GOLD; produces left-padded full sequences,
+    # labels masking the prompt, separate left-padded prompt tensors for on-policy generation, and
+    # completion-relative byte offsets for cross-tokenizer ULD. Fields: tokenizer, ignore_index (-100),
+    # max_length (default None, resolved in __post_init__), prompt_key ("prompt"), messages_key ("messages").
     """
     Data collator for ChatML format datasets.
     """
@@ -278,6 +358,10 @@ class DataCollatorForChatML:
     messages_key: str = "messages"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: require tokenizer.pad_token_id; default max_length to the smaller of tokenizer.model_max_length
+        # and 1024. Inputs: none. Outputs: none. Exceptions: ValueError without pad token.
+        # Side effects: sets max_length.
         if self.tokenizer.pad_token_id is None:
             raise ValueError("The tokenizer does not have a pad token. Please set `pad_token_id` in the tokenizer.")
         if self.max_length is None:
@@ -285,6 +369,28 @@ class DataCollatorForChatML:
             self.max_length = min(self.tokenizer.model_max_length, 1024)
 
     def __call__(self, examples: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior per example:
+        # 1. Prompt text is example[prompt_key], else original_prompt_text, else the chat template of all messages
+        # but the last with a generation prompt.
+        # 2. If no input_ids: render all messages with the chat template. With a ByteLevel tokenizer, encode with
+        # byte offsets and take the completion start as the first token whose start byte is at or past the prompt's
+        # byte length; otherwise tokenize plainly, use the tokenized prompt length as boundary and zero offsets.
+        # If longer than max_length keep the last max_length tokens and shrink the prompt length accordingly
+        # (floored at 0). Make offsets completion-relative: zero for prompt tokens, completion offsets shifted by the
+        # prompt byte length (or by the first kept completion offset when no prompt tokens remain).
+        # 3. If input_ids exist: use them and attention_mask (default ones); the prompt boundary is the first 1 in
+        # completion_mask when present, else the tokenized prompt length capped at the sequence length; byte offsets
+        # from the example or zeros.
+        # 4. Raise if no prompt tokens remain. Labels are ignore_index over the prompt and the token ids afterwards.
+        # Then left-pad input_ids and prompts with pad_token_id, masks with 0, labels with ignore_index, and left-pad
+        # byte offsets to the input width. Pass through original_prompt_text / original_completion_text when the
+        # first example has both.
+        # Inputs: examples (list of dicts).
+        # Outputs: dict with input_ids, attention_mask, labels, prompts, prompt_attention_mask, byte_offsets
+        # (B, L, 2), optionally original text lists.
+        # Exceptions: ValueError for empty prompts after truncation; NotImplementedError not raised here (checked
+        # before encoding). Side effects: none.
         input_ids = []
         attention_mask = []
         prompts_input_ids = []
@@ -431,6 +537,10 @@ class DataCollatorForChatML:
 
 @dataclass
 class DataCollatorForVisionLanguageChatML(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator for GOLD vision-language training: processes prompts with images and completions as text,
+    # concatenates them, flushes left, truncates, and adds GOLD-specific prompt tensors, raw text and byte
+    # offsets. Fields: processor, max_length (optional), return_tensors ("pt"). Inherits DataCollatorMixin.
     """
     Data collator for GOLD VLM training.
 
@@ -466,6 +576,22 @@ class DataCollatorForVisionLanguageChatML(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: require prompt and completion keys. Normalize a single "image" key into an "images" list (mutates
+        # examples); images become None if all lists are empty. Capture raw untemplated prompt/completion text. For
+        # conversational data, convert messages with prepare_multimodal_messages (images on the prompt) and apply the
+        # chat template. Run the processor on prompts (with images, left padding) and on completions (text only,
+        # right padding), no special tokens. Concatenate ids and masks along the sequence; completion_mask is zero
+        # over the prompt part; also concatenate token_type_ids / mm_token_type_ids when present (completion side
+        # defaulting to zeros). flush_left all sequence tensors. If max_length is set keep the first max_length
+        # positions of every sequence tensor and of the prompt tensors. Labels are input_ids with padding and prompt
+        # positions set to -100. Byte offsets: for each row, cumulative piece_byte_len of completion tokens (cached per
+        # token id), zero for others. Output contains processor extras (pixel_values etc.), input_ids,
+        # attention_mask, labels, byte_offsets, optional token-type tensors, prompts, prompt_attention_mask and raw
+        # texts.
+        # Inputs: examples (list of dicts). Outputs: dict of tensors/lists.
+        # Exceptions: KeyError when prompt/completion keys are missing. Side effects: mutates the input example
+        # dicts (images, prompt, completion keys).
         if "prompt" not in examples[0] or "completion" not in examples[0]:
             raise KeyError(
                 "DataCollatorForVisionLanguageChatML requires 'prompt' and 'completion' keys in examples. "
@@ -483,6 +609,11 @@ class DataCollatorForVisionLanguageChatML(DataCollatorMixin):
 
         # Capture raw prompt/completion text before `apply_chat_template` mutates the examples.
         def _raw_text_from_messages(messages_or_str: Any) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Flatten a string or message list to plain text: strings are returned as is; for messages, string
+            # contents are kept if non-empty, list contents keep text blocks (dicts with type "text") and bare strings
+            # joined by newlines; turns are joined by newlines.
+            # Inputs: messages_or_str. Outputs: str. Exceptions: none. Side effects: none.
             if isinstance(messages_or_str, str):
                 return messages_or_str
             parts: list[str] = []
@@ -658,6 +789,12 @@ class DataCollatorForVisionLanguageChatML(DataCollatorMixin):
 def truncate_right(
     input_ids: torch.Tensor, stop_token_ids: list[int], pad_token_id: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Truncate each row after its first stop token.
+    # Behavior: find, per row, the first index whose token is in stop_token_ids (row length if none); replace all
+    # later positions with pad_token_id and build a mask that is 1 up to and including that index, 0 after.
+    # Inputs: input_ids (B, L), stop_token_ids (list of int), pad_token_id (int).
+    # Outputs: (output_ids, mask), both (B, L). Exceptions: none. Side effects: none.
     """
     Truncates the input tensor from the right side after the first occurrence of a stop token.
 
@@ -695,6 +832,14 @@ def add_bos_token_if_needed(
     rejected_prompt_len_input_ids: int,
     rejected_tokens: dict[str, list[int]],
 ):
+    # [FUNCTION DOC]
+    # HELPER: Prepend BOS to prompt token dicts when missing.
+    # Behavior: if bos_token_id is not None, for each of prompt_tokens, chosen_tokens and rejected_tokens, if its
+    # corresponding prompt length is 0 or its prompt_input_ids does not start with BOS, prepend BOS to
+    # prompt_input_ids and 1 to prompt_attention_mask.
+    # Inputs: bos_token_id, prompt_len_input_ids, prompt_tokens, chosen_prompt_len_input_ids, chosen_tokens,
+    # rejected_prompt_len_input_ids, rejected_tokens. Outputs: the three dicts.
+    # Exceptions: KeyError for missing keys. Side effects: mutates the dicts in place (replacing lists).
     if bos_token_id is not None:
         if prompt_len_input_ids == 0 or bos_token_id != prompt_tokens["prompt_input_ids"][0]:
             prompt_tokens["prompt_input_ids"] = [bos_token_id] + prompt_tokens["prompt_input_ids"]
@@ -711,6 +856,11 @@ def add_bos_token_if_needed(
 def add_eos_token_if_needed(
     eos_token_id: int, chosen_tokens: dict[str, list[int]], rejected_tokens: dict[str, list[int]]
 ):
+    # [FUNCTION DOC]
+    # HELPER: Append eos_token_id (and a 1 to attention_mask) to chosen and rejected input_ids when empty or not
+    # already ending with EOS.
+    # Inputs: eos_token_id, chosen_tokens, rejected_tokens. Outputs: the two dicts.
+    # Exceptions: KeyError. Side effects: mutates the lists in place.
     if len(chosen_tokens["input_ids"]) == 0 or eos_token_id != chosen_tokens["input_ids"][-1]:
         chosen_tokens["input_ids"].append(eos_token_id)
         chosen_tokens["attention_mask"].append(1)
@@ -721,6 +871,11 @@ def add_eos_token_if_needed(
 
 
 def first_true_indices(bools: torch.Tensor, dtype=torch.long) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Index of the first True along the last dim, or the row length when none.
+    # Behavior: compute row length times not-bools plus the position index, then take the minimum along the last
+    # dim. Inputs: bools (N-d bool tensor), dtype (default long). Outputs: (N-1)-d tensor.
+    # Exceptions: none. Side effects: none.
     """
     Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving the position of the
     first True in each "row".
@@ -746,6 +901,16 @@ def first_true_indices(bools: torch.Tensor, dtype=torch.long) -> torch.Tensor:
 def get_reward(
     model: torch.nn.Module, query_responses: torch.Tensor, pad_token_id: int, context_length: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Score query+response sequences with a sequence-classification reward model.
+    # Behavior: attention mask is tokens not equal to pad_token_id; position ids are the exclusive cumulative sum
+    # of the mask; pad tokens replaced by 0. Run the backbone found at model.base_model_prefix (no cache, return
+    # dict) and apply model.score to the last hidden state. Sequence end index = first pad position after
+    # context_length minus 1, offset by context_length. Return all logits, the logit at that end index per row
+    # (squeezed), and the end indices.
+    # Inputs: model (with base_model_prefix and score), query_responses (B, L), pad_token_id, context_length.
+    # Outputs: (reward_logits (B, L, num_labels), final_rewards (B,), sequence_lengths (B,)).
+    # Exceptions: AttributeError for models lacking backbone or score. Side effects: none.
     """
     Computes the reward logits and the rewards for a given model and query responses.
 
@@ -794,6 +959,15 @@ def get_reward(
 
 
 def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs=None):
+    # [FUNCTION DOC]
+    # Prepare a quantized model for PEFT training (local copy of the PEFT helper).
+    # Behavior: detect bitsandbytes 8/4-bit loading or quantization_method in gptq, aqlm, eetq, torchao, hqq (or
+    # hqq_quantized). Freeze all parameters. If quantized and use_gradient_checkpointing: enable input grads (or
+    # register a forward hook on input embeddings that marks outputs as requiring grad), then enable gradient
+    # checkpointing, passing gradient_checkpointing_kwargs only when the method accepts it.
+    # Inputs: model, use_gradient_checkpointing (default True), gradient_checkpointing_kwargs (default {}).
+    # Outputs: the same model. Exceptions: none explicit.
+    # Side effects: sets requires_grad False on every parameter; may register hooks and enable checkpointing.
     r"""
     Prepare a k-bit quantized transformers model for training (PEFT/QLoRA).
     """
@@ -817,6 +991,9 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
         else:
             # backward-compatible hook
             def make_inputs_require_grad(module, input, output):
+                # [FUNCTION DOC]
+                # HELPER: Forward hook marking the embedding output as requiring grad.
+                # Inputs: module, input, output. Outputs: none. Exceptions: none. Side effects: mutates output.requires_grad.
                 output.requires_grad_(True)
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
@@ -833,6 +1010,13 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
 def enable_gradient_checkpointing(
     model: PreTrainedModel, gradient_checkpointing_kwargs: dict | None
 ) -> PreTrainedModel:
+    # [FUNCTION DOC]
+    # Enable gradient checkpointing (on the base model for PEFT models). When use_reentrant is absent or true in
+    # the kwargs, also enable input grads (or register the embedding forward hook) since reentrant checkpointing
+    # needs inputs that require grad.
+    # Note: gradient_checkpointing_kwargs are only inspected, not passed to gradient_checkpointing_enable.
+    # Inputs: model, gradient_checkpointing_kwargs (dict or None). Outputs: the model.
+    # Exceptions: none. Side effects: mutates the model (checkpointing flag, hooks).
     """Enables gradient checkpointing for the model."""
     # Enable gradient checkpointing on the base model for PEFT
     if is_peft_model(model):
@@ -852,6 +1036,9 @@ def enable_gradient_checkpointing(
         else:
 
             def make_inputs_require_grad(module, input, output):
+                # [FUNCTION DOC]
+                # HELPER: Forward hook marking the embedding output as requiring grad.
+                # Inputs: module, input, output. Outputs: none. Exceptions: none. Side effects: mutates output.requires_grad.
                 output.requires_grad_(True)
 
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
@@ -862,6 +1049,17 @@ def enable_gradient_checkpointing(
 def prepare_peft_model(
     model: PreTrainedModel, peft_config: "PeftConfig | None", args: TrainingArguments
 ) -> PreTrainedModel:
+    # [FUNCTION DOC]
+    # Prepare a model for PEFT training.
+    # Behavior: require peft; reject a PeftModel combined with peft_config. Detect QLoRA (4/8-bit) and sharded
+    # QLoRA (first Params4bit parameter living on cpu or meta, as with FSDP/ZeRO-3). For non-sharded QLoRA on a
+    # non-PEFT model, call prepare_model_for_kbit_training and set args.gradient_checkpointing False; otherwise
+    # enable gradient checkpointing if requested. Wrap with get_peft_model when peft_config is given
+    # (autocast_adapter_dtype False for sharded 4-bit). With bf16 on non-sharded 4-bit models cast remaining
+    # float32 parameters to bfloat16.
+    # Inputs: model, peft_config (optional), args (TrainingArguments). Outputs: the prepared model.
+    # Exceptions: ImportError without peft; ValueError for PeftModel plus peft_config.
+    # Side effects: mutates args.gradient_checkpointing, model parameter dtypes and grad flags.
     """Prepares a model for PEFT training."""
     if not is_peft_available():
         raise ImportError("PEFT is required to use a peft model. Run `pip install peft`.")
@@ -913,6 +1111,10 @@ def prepare_peft_model(
 
 
 def pad_to_length(tensor: torch.Tensor, length: int, pad_value: int | float, dim: int = -1) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Right-pad a tensor along dim to the given length with pad_value; returned unchanged when already
+    # long enough. Inputs: tensor, length, pad_value, dim (default -1). Outputs: tensor.
+    # Exceptions: none. Side effects: none.
     if tensor.size(dim) >= length:
         return tensor
     else:
@@ -928,6 +1130,10 @@ def pad_to_length(tensor: torch.Tensor, length: int, pad_value: int | float, dim
 
 
 def empty_cache() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Empty the accelerator memory cache of the first available device in the order MLU, MPS, NPU, XPU,
+    # falling back to CUDA. Inputs: none. Outputs: none. Exceptions: none.
+    # Side effects: releases cached device memory.
     """Empties the cache of the available torch device.
 
     This function checks for the availability of different torch devices (CUDA, MLU, MPS, NPU, XPU) and empties the
@@ -948,6 +1154,10 @@ def empty_cache() -> None:
 
 
 def peft_module_casting_to_bf16(model):
+    # [FUNCTION DOC]
+    # HELPER: Normalize module dtypes for PEFT: modules that are LayerNorm or have "norm" in their name are cast to
+    # float32; modules named like lm_head, embed_tokens, wte or wpe with float32 weights are cast to bfloat16.
+    # Inputs: model. Outputs: none. Exceptions: none. Side effects: casts module parameters in place.
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.LayerNorm) or "norm" in name:
             module = module.to(torch.float32)
@@ -968,6 +1178,17 @@ LAYER_PATTERNS = [
 def create_reference_model(
     model: nn.Module, num_shared_layers: int | None = None, pattern: str | None = None
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # Create a frozen, eval-mode reference copy of a model, optionally sharing its first layers.
+    # Behavior: raise under DeepSpeed ZeRO-3. Deep-copy the model. Without num_shared_layers, freeze every
+    # parameter of the copy and return it in eval mode. Otherwise resolve the layer name pattern (given pattern
+    # formatted with the layer number, or the first LAYER_PATTERNS entry found in parameter names); raise if none.
+    # Parameters before the first name containing the pattern are shared, the rest unshared. Shared parameters are
+    # frozen in the source model and the copy's parameter data is pointed at the source storage; unshared copy
+    # parameters are frozen. Warn if nothing was unshared.
+    # Inputs: model, num_shared_layers (optional int), pattern (optional str). Outputs: reference model (eval).
+    # Exceptions: ValueError for ZeRO-3 or unmatched pattern.
+    # Side effects: freezes shared layers of the source model; logs a warning.
     """
     Creates a static reference copy of a model. Note that model will be in `.eval()` mode.
 
@@ -1050,6 +1271,12 @@ def truncate_dataset(
     max_length: int,
     map_kwargs: dict[str, Any] | None = None,
 ) -> DatasetType:
+    # [FUNCTION DOC]
+    # Truncate every list-typed column of a dataset to max_length elements.
+    # Behavior: remember the dataset format, switch to arrow format, batched-map a function slicing list and
+    # large_list columns to their first max_length items with pyarrow list_slice, then restore the format.
+    # Inputs: dataset (Dataset or DatasetDict), max_length, map_kwargs (optional). Outputs: truncated dataset.
+    # Exceptions: none explicit. Side effects: dataset map caching.
     r"""
     Truncate sequences in a dataset to a specified `max_length`.
 
@@ -1083,6 +1310,10 @@ def truncate_dataset(
         map_kwargs = {}
 
     def truncate(examples):
+        # [FUNCTION DOC]
+        # HELPER: Batched Arrow map function returning a new table with list columns sliced to max_length and other
+        # columns unchanged. Inputs: examples (pyarrow Table). Outputs: pyarrow Table.
+        # Exceptions: none. Side effects: none.
         truncated_columns = []
         for column in examples.columns:
             if pyarrow.types.is_list(column.type) or pyarrow.types.is_large_list(column.type):

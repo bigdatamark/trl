@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Defines _BaseConfig, the common TrainingArguments subclass all TRL trainer configs derive from, overriding
+# defaults shared by TRL trainers and help strings that break argparse. Import-time side effects: none beyond
+# importing transformers.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +24,12 @@ from transformers import TrainingArguments
 
 @dataclass
 class _BaseConfig(TrainingArguments):
+    # [CLASS DOC]
+    # HELPER: Dataclass base for TRL configs (inherits transformers TrainingArguments).
+    # Overrides: logging_steps default 10; gradient_checkpointing default True; bf16 default None (resolved in
+    # __post_init__); lr_scheduler_kwargs typed dict or str (workaround for an unparsable type in transformers
+    # 4.57.0 to 4.57.4); use_liger_kernel and torch_empty_cache_steps re-declared with "%"-escaped help strings so
+    # argparse --help rendering does not fail on older transformers.
     """
     Base configuration class for all TRL trainer configurations.
 
@@ -105,6 +116,11 @@ class _BaseConfig(TrainingArguments):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: when bf16 is None sets it to the negation of fp16 (so bf16 on unless fp16 requested), then runs
+        # TrainingArguments post-init validation.
+        # Inputs: none. Outputs: none. Exceptions: whatever TrainingArguments validation raises (e.g. bf16 on
+        # unsupported hardware). Side effects: mutates self.bf16 and other fields set by the parent.
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
 
         super().__post_init__()

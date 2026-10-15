@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# HELPER: Launches a bundled TRL training script (in trl/scripts) via accelerate's launch machinery in-process.
+# Contents: launch_training_script. Import-time side effects: imports accelerate.commands.launch.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +31,16 @@ def launch_training_script(
     launch_command_fn: Callable[[Any], None] = launch_command,
     launch_parser_fn: Callable[[], Any] = launch_command_parser,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Builds an accelerate launch invocation for a script in trl.scripts and runs it.
+    # Behavior: resolve the script path from package resources; parse launch_args followed by the script path followed by
+    # training_script_args with the parser from launch_parser_fn; pass the resulting namespace to launch_command_fn.
+    # Inputs: script_name (e.g. "dpo.py"), launch_args (accelerate options), training_script_args (forwarded to the
+    # script); keyword-only launch_command_fn and launch_parser_fn default to accelerate's launch_command and
+    # launch_command_parser (injectable for tests).
+    # Outputs: none.
+    # Exceptions: SystemExit from argparse on bad accelerate options; anything raised by the launch.
+    # Side effects: starts the training run (possibly spawning processes).
     """
     Launch a TRL training script through `accelerate launch`.
 

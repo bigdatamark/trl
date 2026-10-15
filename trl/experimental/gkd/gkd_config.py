@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental GKD (on-policy knowledge distillation) trainer.
+# Main content: GKDConfig, used by gkd_trainer.GKDTrainer. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +24,11 @@ from ...trainer.sft_config import SFTConfig
 
 @dataclass
 class GKDConfig(SFTConfig):
+    # [CLASS DOC]
+    # SFTConfig subclass adding distillation fields: temperature 0.9 (sampling), lmbda 0.5 (probability of using
+    # student-generated on-policy completions per batch), beta 0.5 (generalized JSD interpolation; 0 is forward KL, 1
+    # reverse KL), max_new_tokens 128, teacher_model_name_or_path None, teacher_model_init_kwargs None (also accepted as a
+    # JSON string via _VALID_DICT_FIELDS), disable_dropout True, seq_kd False (train on teacher-generated outputs).
     """
     Configuration class for [`experimental.gkd.GKDTrainer`].
 
@@ -102,6 +111,11 @@ class GKDConfig(SFTConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs the parent post-init, then validates that lmbda and beta both lie in [0, 1].
+        # Inputs: none. Outputs: none.
+        # Exceptions: ValueError if lmbda or beta is outside [0, 1]; parent validation errors.
+        # Side effects: those of the parent.
         super().__post_init__()
         # check lmbda and beta are in the range [0, 1]
         if self.lmbda < 0.0 or self.lmbda > 1.0:

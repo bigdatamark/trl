@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental GMPO trainer.
+# Main content: GMPOConfig, which only overrides the default of epsilon to 0.4 and reinterprets epsilon/epsilon_high
+# as log-space clipping bounds. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +24,10 @@ from ...trainer.grpo_config import GRPOConfig
 
 @dataclass
 class GMPOConfig(GRPOConfig):
+    # [CLASS DOC]
+    # GRPOConfig subclass; every other field and the post-init are inherited unchanged. epsilon defaults to 0.4 and
+    # epsilon_high (inherited, None means same as epsilon) bounds the per-token log importance ratio, giving a ratio
+    # range of exp(-epsilon) to exp(epsilon_high).
     r"""
     Configuration class for the [`experimental.gmpo.GMPOTrainer`].
 

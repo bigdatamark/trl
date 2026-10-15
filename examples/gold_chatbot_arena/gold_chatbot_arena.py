@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Example script: GOLD (cross-tokenizer on-policy distillation) of a small student (e.g. LFM2.5-1.2B or Gemma 4) from
+# a Qwen3-4B teacher on a raw-text or conversational dataset. Under the main guard: parses ScriptArguments/GOLDConfig/
+# ModelConfig, sets student model_init_kwargs (use_cache off with gradient checkpointing, optional quantization),
+# defaults the teacher tokenizer to the teacher model when ULD loss is used, builds unquantized teacher init kwargs
+# merged with user overrides, loads the student tokenizer (pad defaults to eos), splits raw "text" datasets into
+# prompt/completion via split_text_for_gold and drops empty pairs, picks an eval split (test split, then
+# "validation", then "dev"), trains GOLDTrainer with optional PEFT and a LogCompletionsCallback when evaluating,
+# saves, optionally pushes and calls trainer.end().
+# Import-time side effects: creates a module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -80,6 +91,15 @@ logger = logging.getLogger(__name__)
 
 
 def split_text_for_gold(example, tokenizer, max_length):
+    # [FUNCTION DOC]
+    # HELPER: Splits raw text into a prompt (first ~75% of tokens) and completion (rest).
+    # Behavior: tokenizes without special tokens with offset mapping; when max_length is set keeps only the last
+    # max_length tokens; empty token list yields empty prompt and completion. Split index is max(1, floor(0.75 * n));
+    # the prompt is the original text from the first kept token's start to the split token's start, completion from there
+    # to the last token's end (if split index equals n the completion is empty).
+    # Inputs: example with "text", tokenizer (fast, supporting offsets), max_length or None.
+    # Outputs: dict with "prompt" and "completion" strings.
+    # Exceptions: tokenizers without offset mapping support raise. Side effects: none.
     """Split a raw language-modeling example into a 75% prompt and 25% completion."""
     text = example["text"]
     encoding = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)

@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Experimental GOLD (General Online Logit Distillation, cross-tokenizer on-policy distillation) package.
+# Exports GOLDConfig and GOLDTrainer, imported eagerly.
+# No lazy-import behavior; no side effects beyond submodule imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

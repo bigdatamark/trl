@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Dataset preparation script: converts openbmb/RLAIF-V-Dataset into TRL conversational vision preference format
+# (prompt with image placeholder, images list, chosen, rejected), casts images to a decoded Image sequence, splits
+# 1% test and optionally pushes with a dataset card. Main contents: ScriptArguments, to_conversational, model_card.
+# Import-time side effects: builds the ModelCard object.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +27,10 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI options parsed by HfArgumentParser: push_to_hub (default False), repo_id (target Hub
+    # dataset repo), dataset_num_proc (worker count for map/filter, default None). No methods; plain data holder.
+    # Side effects: none.
     r"""
     Arguments for the script.
 
@@ -48,6 +58,12 @@ class ScriptArguments:
 
 
 def to_conversational(example):
+    # [FUNCTION DOC]
+    # Behavior: prompt is one user message whose content is an image placeholder entry followed by a text entry with the
+    # question; chosen/rejected become single assistant messages with one text entry each; the image is wrapped in a list.
+    # Inputs: example with "question", "chosen", "rejected", "image".
+    # Outputs: dict with "prompt", "images", "chosen", "rejected". Exceptions: KeyError on missing columns.
+    # Side effects: none.
     """
     Convert prompt from "xxx" to [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "xxx"}]}]
     and chosen and rejected from "xxx" to [{"role": "assistant", "content": [{"type": "text", "text": "xxx"}]}].

@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Script that builds a tiny BartModel (encoder-decoder base model, no LM head) from facebook/bart-base and pushes it to
+# trl-internal-testing/tiny-BartModel.
+# Behavior (import time): checks the transformers floor, seeds RNGs, loads the reference tokenizer and full config,
+# only reduces d_model to 24 (layer counts and FFN sizes stay at the reference values), instantiates in float32, runs
+# check_dtype_pattern and print_config_diff (no smoke test, no weight re-init), then push_to_hub without a generation
+# config.
+# Inputs: --create-pr / --full-diff. Outputs: none. Exceptions: version mismatch RuntimeError; Hub errors.
+# Side effects: Hub downloads, printing, Hub upload.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

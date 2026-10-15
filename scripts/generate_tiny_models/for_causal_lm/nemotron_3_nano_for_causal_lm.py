@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Script that builds a tiny randomly initialized NemotronHForCausalLM mirroring nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 and pushes it to trl-internal-testing/tiny-NemotronHForCausalLM-nano.
+# Behavior (all at import time, run as a module): checks pinned transformers 5.3.0 is installed exactly, seeds RNGs, loads the reference AutoTokenizer and GenerationConfig,
+# builds a scaled-down config (mostly 2 layers, hidden size 8-16, intermediate size 32), instantiates the model in bfloat16, re-initializes weights via init_weights_tiny_model,
+# runs smoke_test, check_dtype_pattern and print_config_diff against the reference, then calls push_to_hub.
+# Details: Hybrid Mamba/attention/MoE config with one block of each type. Raises RuntimeError if the kernels package is installed. After weight init, A_log and D of every Mamba mixer are cast back to float32 to match the reference checkpoint.
+# Inputs: CLI flags --create-pr / --full-diff (parsed by _common). Outputs: none returned.
+# Exceptions: RuntimeError on transformers version mismatch or failed smoke test; Hub/network errors propagate.
+# Side effects: downloads reference tokenizer/config from the Hub, prints diagnostics, creates/updates a Hub repo (or skips if it exists).
+#
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

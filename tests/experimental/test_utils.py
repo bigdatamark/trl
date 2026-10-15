@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests for the helpers in trl.experimental.utils: DataCollatorForChatML, truncate_dataset, truncate_right,
+# prepare_peft_model (QLoRA dtype handling) and create_reference_model (frozen copies and shared layers).
+# Each helper gets its own TrlTestCase subclass; real tiny models/tokenizers from trl-internal-testing are used.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,7 +35,16 @@ from ..testing_utils import TrlTestCase, require_bitsandbytes, require_peft, req
 
 
 class TestDataCollatorForChatML(TrlTestCase):
+    # [CLASS DOC]
+    # Tests DataCollatorForChatML on the zen conversational_language_modeling dataset with the tiny Qwen2 tokenizer.
+    # State set per test in setup_method: tokenizer, bos/eos ids, ignore_index (-100), max_length (1024),
+    # messages_key ("messages"), examples (dataset rows as list) and the collator. Inherits TrlTestCase.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Per-test fixture: loads the tiny Qwen2 tokenizer (pad falls back to eos), records bos/eos ids (defaults 1
+        # and 2 if missing), ignore_index -100, max_length 1024, messages key, loads the zen dataset rows and builds the
+        # collator with tokenizer, max_length and ignore_index.
+        # Inputs: none. Outputs: none. Exceptions: load errors propagate. Side effects: sets instance attributes.
         # Initialize the tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
         if self.tokenizer.pad_token is None:
@@ -55,6 +70,16 @@ class TestDataCollatorForChatML(TrlTestCase):
         )
 
     def test_data_collator_for_chatml(self):
+        # [FUNCTION DOC]
+        # Checks the collator output for the first example.
+        # Assertions: keys input_ids, attention_mask, labels, prompts, prompt_attention_mask exist; the last message is
+        # from the assistant; decoded input_ids contain the final assistant reply while decoded prompts do not; labels for
+        # the first prompt-length positions equal ignore_index; the non-ignored labels after the prompt, up to and including
+        # the first im_end token, equal the tokenization of the reply plus eos; the decoded input does not end with an
+        # assistant generation prompt.
+        # KNOWN ISSUE: the final labels-equal-reply assertion is duplicated verbatim (harmless); the setup comment about a
+        # "true" token id is stale and unrelated to the code beneath it.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         # Process the data
         data = self.collator(self.examples)
 
@@ -115,7 +140,12 @@ class TestDataCollatorForChatML(TrlTestCase):
 
 
 class TestTruncateExamples(TrlTestCase):
+    # [CLASS DOC]
+    # Tests truncate_dataset, which truncates list columns (input_ids, attention_mask) to max_length. Inherits TrlTestCase.
     def test_with_dataset(self):
+        # [FUNCTION DOC]
+        # Checks a numpy-formatted (float32) Dataset is truncated to length 2 per row (shorter rows untouched) and that
+        # the dataset format is preserved. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         examples = {
             "input_ids": [[1, 2, 3], [4, 5, 6, 7], [8]],
             "attention_mask": [[0, 1, 1], [0, 0, 1, 1], [1]],
@@ -133,6 +163,9 @@ class TestTruncateExamples(TrlTestCase):
         assert format == dataset.format
 
     def test_with_iterable_dataset(self):
+        # [FUNCTION DOC]
+        # Checks truncation of a numpy-formatted IterableDataset: the batched unformatted output equals the truncated
+        # expected dict and the private _formatting attribute is preserved. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         examples = {
             "input_ids": [[1, 2, 3], [4, 5, 6, 7], [8]],
             "attention_mask": [[0, 1, 1], [0, 0, 1, 1], [1]],
@@ -151,6 +184,9 @@ class TestTruncateExamples(TrlTestCase):
         assert formatting == dataset._formatting
 
     def test_with_extra_column(self):
+        # [FUNCTION DOC]
+        # Checks that a non-tokenized extra string column passes through unchanged while token columns are truncated
+        # to length 2. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         examples = {
             "input_ids": [[1, 2, 3], [4, 5, 6, 7], [8]],
             "attention_mask": [[0, 1, 1], [0, 0, 1, 1], [1]],
@@ -168,7 +204,13 @@ class TestTruncateExamples(TrlTestCase):
 
 
 class TestTruncateRight(TrlTestCase):
+    # [CLASS DOC]
+    # Tests truncate_right, which cuts each row after its first stop token, pads the rest and returns a mask.
+    # Inherits TrlTestCase.
     def test_truncates_after_the_first_of_any_stop_token(self):
+        # [FUNCTION DOC]
+        # Checks with stop tokens 2 and 3 and pad 0 that each row is cut after whichever stop token appears first
+        # (row 1 on 2, row 2 on 3), tail filled with 0 and mask 1 up to and including the stop token. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         # The second row stops on 3, a stop token the first row does not use
         input_ids = torch.tensor([[5, 2, 7, 8], [5, 3, 7, 8]])
         output_ids, mask = truncate_right(input_ids, [2, 3], pad_token_id=0)
@@ -176,6 +218,8 @@ class TestTruncateRight(TrlTestCase):
         assert mask.tolist() == [[1, 1, 0, 0], [1, 1, 0, 0]]
 
     def test_keeps_sequences_without_a_stop_token(self):
+        # [FUNCTION DOC]
+        # Checks a row without any stop token is returned unchanged with an all-ones mask. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         input_ids = torch.tensor([[5, 7, 8, 9]])
         output_ids, mask = truncate_right(input_ids, [2, 3], pad_token_id=0)
         assert output_ids.tolist() == [[5, 7, 8, 9]]
@@ -183,10 +227,16 @@ class TestTruncateRight(TrlTestCase):
 
 
 class TestPreparePeftModel(TrlTestCase):
+    # [CLASS DOC]
+    # Tests prepare_peft_model. Inherits TrlTestCase.
     @require_peft
     @require_bitsandbytes
     @require_torch_accelerator
     def test_qlora_bf16_yields_uniform_dtype(self):
+        # [FUNCTION DOC]
+        # Checks that a 4-bit nf4 (bf16 compute) tiny Qwen2 model prepared with a LoRA config (r 8 on q/k/v/o proj) and
+        # bf16 TrainingArguments has no float32 parameters left. Requires PEFT, bitsandbytes and an accelerator.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads a quantized model on the accelerator.
         import torch
         from peft import LoraConfig
         from transformers import AutoModelForCausalLM, BitsAndBytesConfig, TrainingArguments
@@ -207,13 +257,24 @@ class TestPreparePeftModel(TrlTestCase):
 
 
 class TestReferenceModel(TrlTestCase):
+    # [CLASS DOC]
+    # Tests create_reference_model on tiny GPT2 (2 layers). State from setup_method: model, test_input (one
+    # 4-token row), AdamW optimizer with lr 1, layer_format naming the attention c_attn weight of a layer.
+    # Inherits TrlTestCase.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Per-test fixture loading tiny GPT2, a fixed input, an AdamW optimizer (lr 1) and the parameter name template.
+        # Inputs: none. Outputs: none. Exceptions: load errors propagate. Side effects: sets instance attributes.
         self.model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-GPT2LMHeadModel")
         self.test_input = torch.tensor([[0, 1, 2, 3]])
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1)
         self.layer_format = "transformer.h.{layer}.attn.c_attn.weight"
 
     def test_independent_reference_models_are_equal(self):
+        # [FUNCTION DOC]
+        # Checks a fully independent reference model: before one optimizer step on the source model (LM loss on the
+        # test input) both layers match the reference; after the step the reference's layers are unchanged while both
+        # source layers changed. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         layer_0 = self.layer_format.format(layer=0)
         layer_1 = self.layer_format.format(layer=1)
 
@@ -248,6 +309,9 @@ class TestReferenceModel(TrlTestCase):
         assert not (last_layer_before == last_layer_after).all()
 
     def test_shared_layers(self):
+        # [FUNCTION DOC]
+        # Checks num_shared_layers 1: after an optimizer step, the reference stays identical to its initial values, the
+        # source model's first (shared, frozen) layer is unchanged, and its second layer changed. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         layer_0 = self.layer_format.format(layer=0)
         layer_1 = self.layer_format.format(layer=1)
 
@@ -284,6 +348,9 @@ class TestReferenceModel(TrlTestCase):
         assert not (second_layer_before == second_layer_after).all()
 
     def test_shared_layers_share_memory(self):
+        # [FUNCTION DOC]
+        # Checks the shared first layer of the reference has the same data pointer as the source (no deepcopy, issue
+        # 2904) while the unshared second layer has a different pointer. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         # Shared layers must reference the same storage as the source model, not a `deepcopy` duplicate,
         # so they are held in memory only once (see issue #2904).
         layer_0 = self.layer_format.format(layer=0)

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for the experimental OnlineDPOTrainer / OnlineDPOConfig (trl.experimental.online_dpo).
+# Covers remote-code gating, training with reward models or reward functions, eos handling,
+# eval-dataset storage, reference model options, PEFT/LoRA, vLLM server/colocate modes, generation
+# config setup, config defaults, pad-token syncing, and vision-language models.
+# Import-time side effects: conditionally imports peft LoraConfig and vision deps (numpy, PIL,
+# AutoModelForImageTextToText, AutoProcessor) when available.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +42,15 @@ if is_vision_available():
 
 
 class TestOnlineDPOTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # Text-model integration tests; inherits TrlTestCase. setup_method loads a tiny Qwen2 policy (plus a
+    # separate ref copy) and a tiny Llama sequence-classification reward model (num_labels 1), with both
+    # tokenizers' pad tokens set to eos.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Per-test fixture setting self.model_id, self.model (float32), self.ref_model,
+        # self.tokenizer, self.reward_model_id, self.reward_model, self.reward_tokenizer (pads = eos).
+        # Inputs/Outputs: none. Exceptions: load errors propagate. Side effects: network/cache access.
         self.model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         self.model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype="float32")
         self.ref_model = AutoModelForCausalLM.from_pretrained(self.model_id)
@@ -47,6 +63,11 @@ class TestOnlineDPOTrainer(TrlTestCase):
         self.reward_tokenizer.pad_token = self.reward_tokenizer.eos_token
 
     def test_trust_remote_code(self):
+        # [FUNCTION DOC]
+        # Tests that a remote-code model id raises ValueError matching "custom code" without
+        # trust_remote_code, and loads as RemoteForCausalLM with trust_remote_code=True.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         model_id = "trl-internal-testing/tiny-RemoteForCausalLM"
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
@@ -73,6 +94,11 @@ class TestOnlineDPOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     def test_train(self, config_name):
+        # [FUNCTION DOC]
+        # Parametrized over standard / conversational prompt-only configs. Runs 3 steps (batch 2, lr 5e-7)
+        # with the reward model and asserts train_loss appears in the last log entry.
+        # Inputs: config_name (str). Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
             per_device_train_batch_size=2,
@@ -95,6 +121,11 @@ class TestOnlineDPOTrainer(TrlTestCase):
         assert "train_loss" in trainer.state.log_history[-1]
 
     def test_generation_stops_on_every_eos_token_id(self):
+        # [FUNCTION DOC]
+        # Tests with tiny Phi-3.5 that trainer.eos_token_ids is [32007, 32001, 32000] (generation-config eos
+        # ids plus tokenizer eos) and that generation_config.eos_token_id equals that list.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         # Phi-3.5 ends a turn with `<|end|>` (32007), which only its generation config declares as eos, not its
         # tokenizer: generation must stop on it too, and not only on the tokenizer's `<|endoftext|>` (32000)
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -117,6 +148,11 @@ class TestOnlineDPOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("eval_dataset_type", ["dataset", "dataset_dict", "dict_of_dataset", "none"])
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over dataset, dataset_dict, dict_of_dataset, none. Tests None stays None; dict-like
+        # inputs become dicts with keys data1/data2; a single Dataset is stored as the same object.
+        # Inputs: eval_dataset_type (str). Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         # Streaming datasets are not yet supported in OnlineDPO
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
 
@@ -148,6 +184,10 @@ class TestOnlineDPOTrainer(TrlTestCase):
             assert trainer.eval_dataset is eval_dataset
 
     def test_train_model_str(self):
+        # [FUNCTION DOC]
+        # Tests that passing the policy as a hub id string works: 3 training steps (batch 2, lr 5e-7) on standard prompt-only data logs train_loss.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
             per_device_train_batch_size=2,
@@ -170,6 +210,10 @@ class TestOnlineDPOTrainer(TrlTestCase):
         assert "train_loss" in trainer.state.log_history[-1]
 
     def test_train_with_ref_model(self):
+        # [FUNCTION DOC]
+        # Tests training with an explicit ref_model: 3 training steps (batch 2, lr 5e-7) on standard prompt-only data logs train_loss.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
             per_device_train_batch_size=2,
@@ -193,6 +237,10 @@ class TestOnlineDPOTrainer(TrlTestCase):
         assert "train_loss" in trainer.state.log_history[-1]
 
     def test_ref_model_is_model(self):
+        # [FUNCTION DOC]
+        # Tests that passing the same object as model and ref_model raises ValueError.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
             per_device_train_batch_size=2,
@@ -215,6 +263,11 @@ class TestOnlineDPOTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_init_is_seeded(self):
+        # [FUNCTION DOC]
+        # Requires peft. Two trainers with default LoraConfig built after different global torch seeds must
+        # have non-empty, identical lora_A parameters.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         # Two trainers with the same seed start from the same adapter weights
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         adapters = []
@@ -237,6 +290,10 @@ class TestOnlineDPOTrainer(TrlTestCase):
 
     @require_peft
     def test_train_with_peft(self):
+        # [FUNCTION DOC]
+        # Requires peft. LoRA (r 16, alpha 32, dropout 0.05) 3 training steps (batch 2, lr 5e-7) on standard prompt-only data logs train_loss.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         lora_config = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
@@ -263,6 +320,10 @@ class TestOnlineDPOTrainer(TrlTestCase):
 
     @require_peft
     def test_train_with_peft_and_ref_model(self):
+        # [FUNCTION DOC]
+        # Requires peft. Same as LoRA training but with an explicit ref_model; asserts train_loss logged.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         lora_config = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM")
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
@@ -292,7 +353,17 @@ class TestOnlineDPOTrainer(TrlTestCase):
     @require_torch_accelerator
     @require_vllm
     def test_train_with_vllm_server(self, config_name):
+        # [FUNCTION DOC]
+        # Requires an accelerator and vllm (and a running vLLM server). Parametrized over prompt-only
+        # configs; trains a small Qwen2 with vllm_mode server (gpu util 0.2) and asserts train_loss logged;
+        # always closes the vLLM communicator afterwards.
+        # Inputs: config_name (str). Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         def cleanup_vllm_communicator(trainer):
+            # [FUNCTION DOC]
+            # HELPER: Closes trainer.vllm_client's communicator if the attribute exists and is not None,
+            # swallowing any exception. Inputs: trainer. Outputs: None. Exceptions: none (all suppressed).
+            # Side effects: network call to the vLLM server.
             """Clean up vLLM communicator to avoid conflicts between test runs"""
             try:
                 if hasattr(trainer, "vllm_client") and trainer.vllm_client is not None:
@@ -333,6 +404,14 @@ class TestOnlineDPOTrainer(TrlTestCase):
 
     @require_vllm
     def test_train_with_vllm_colocate(self):
+        # [FUNCTION DOC]
+        # Requires vllm. Builds a small-Qwen2 trainer with vllm_mode colocate and generation params
+        # (temperature 0.9, top_p 0.95, top_k 50, repetition_penalty 1.1, max_new_tokens 32). Asserts
+        # use_vllm, vllm_mode colocate, llm created, trainer attributes match, and generation_config
+        # (vLLM sampling params) carries the same values with max_tokens 32; then trains 2 steps and asserts
+        # train_loss logged.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         """Test vLLM colocate mode with our refactored implementation"""
         model_id = "trl-internal-testing/small-Qwen2ForCausalLM-2.5"  # We need a bigger model
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
@@ -391,6 +470,12 @@ class TestOnlineDPOTrainer(TrlTestCase):
         assert "train_loss" in trainer.state.log_history[-1]
 
     def test_vllm_config_validation(self):
+        # [FUNCTION DOC]
+        # Tests OnlineDPOConfig accepts vllm_mode server and colocate, and defaults: vllm_mode colocate,
+        # server base_url None, host 0.0.0.0, port 8000, timeout 240.0, gpu util 0.55, top_p 1.0, top_k 0,
+        # min_p None, repetition_penalty 1.0, cache_implementation None, generation_kwargs None.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none (configs only, default
+        # output_dir).
         """Test vLLM configuration validation"""
         # Test valid vllm_mode values
         config = OnlineDPOConfig(use_vllm=True, vllm_mode="server")
@@ -417,6 +502,12 @@ class TestOnlineDPOTrainer(TrlTestCase):
         assert config.generation_kwargs is None
 
     def test_generation_config_setup(self):
+        # [FUNCTION DOC]
+        # Tests the transformers (non-vLLM) path: no llm or vllm_client set, and generation_config has
+        # temperature 0.8, top_p 0.9, top_k 40, repetition_penalty 1.2, max_new_tokens 64, and do_sample
+        # False taken from generation_kwargs.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         """Test that generation configuration is properly set up for both vLLM and transformers"""
         training_args = OnlineDPOConfig(
             output_dir=self.tmp_dir,
@@ -455,7 +546,16 @@ class TestOnlineDPOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     def test_train_with_reward_funcs(self, config_name):
+        # [FUNCTION DOC]
+        # Parametrized over prompt-only configs. Trains 3 steps with two constant reward functions and
+        # reward_weights [0.7, 0.3]; asserts train_loss logged, two reward funcs stored, and the stored
+        # reward_weights tensor equals 0.7 and 0.3 to 5 decimals.
+        # Inputs: config_name (str). Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         def simple_reward_func(prompts, completions, completion_ids, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns 0.5 for each prompt. Inputs: prompts, completions, completion_ids, kwargs.
+            # Outputs: list[float]. Exceptions: none. Side effects: none.
             return [0.5 for _ in prompts]
 
         training_args = OnlineDPOConfig(
@@ -484,6 +584,11 @@ class TestOnlineDPOTrainer(TrlTestCase):
         assert round(abs(trainer.reward_weights[1].item() - 0.3), 5) == 0
 
     def test_pad_token_id_synced_with_model_config(self):
+        # [FUNCTION DOC]
+        # Tests with tiny Mistral (no pad token) that the trainer assigns a pad token and the model config
+        # and generation config pad_token_id equal it.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         # This model's tokenizer has no pad token, so the trainer falls back to the eos token. The model configs must
         # follow: otherwise `Trainer` realigns them at train time and reports it as a change the user did not make.
         model_id = "trl-internal-testing/tiny-MistralForCausalLM-0.2"
@@ -507,6 +612,8 @@ class TestOnlineDPOTrainer(TrlTestCase):
 
 @require_vision
 class TestOnlineDPOVisionTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # Vision-language integration test for OnlineDPOTrainer; requires vision deps. Inherits TrlTestCase.
     @pytest.mark.parametrize(
         "model_id",
         [
@@ -515,6 +622,12 @@ class TestOnlineDPOVisionTrainer(TrlTestCase):
         ],
     )
     def test_online_dpo_vlm_trainer(self, model_id):
+        # [FUNCTION DOC]
+        # Parametrized over tiny Idefics2 and Llava. Builds a 2-row dataset of conversational prompts with
+        # random 64x64 RGB images (cast to Image feature), a tiny Llama reward model, and the VLM processor;
+        # trains 2 steps (batch 1, lr 0.01) and asserts train_loss logged.
+        # Inputs: model_id (str). Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads models/datasets; writes to tmp_dir.
         dataset_dict = {
             "prompt": [
                 [{"role": "user", "content": "Describe the image."}],

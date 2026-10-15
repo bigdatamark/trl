@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Dataset preparation script: converts theblackcat102/llava-instruct-mix into TRL's conversational vision
+# prompt-completion format (images, prompt, completion), dropping conversations longer than 1000 characters, and
+# optionally pushes it with a dataset card (default trl-lib/llava-instruct-mix).
+# Main contents: ScriptArguments, process_example, filter_long_examples, split_prompt_completion, model_card.
+# Import-time side effects: builds the ModelCard object.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +29,10 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI options parsed by HfArgumentParser: push_to_hub (default False), repo_id (target Hub
+    # dataset repo), dataset_num_proc (worker count for map/filter, default None). No methods; plain data holder.
+    # Side effects: none.
     r"""
     Arguments for the script.
 
@@ -49,6 +60,12 @@ class ScriptArguments:
 
 
 def process_example(example):
+    # [FUNCTION DOC]
+    # Behavior: parses the stringified "conversations" list with a safe literal evaluator; for each turn removes the
+    # "<image>" placeholder and strips whitespace, mapping "human" to user and anything else to assistant.
+    # Inputs: example with "conversations" (string) and "image". Outputs: dict with "messages" and "images" (one-element
+    # list holding the image).
+    # Exceptions: ValueError/SyntaxError on unparsable conversations; KeyError on missing keys. Side effects: none.
     messages = []
     for message in ast.literal_eval(example["conversations"]):
         content = message["value"]
@@ -59,11 +76,19 @@ def process_example(example):
 
 
 def filter_long_examples(example):
+    # [FUNCTION DOC]
+    # HELPER: Filter predicate keeping examples whose summed message content length is at most 1000 characters.
+    # Inputs: example with "messages". Outputs: bool. Exceptions: none expected. Side effects: none.
     total_length = sum(len(msg["content"]) for msg in example["messages"])
     return total_length <= 1000
 
 
 def split_prompt_completion(example):
+    # [FUNCTION DOC]
+    # Behavior: asserts more than one message, sets "prompt" to all but the last message and "completion" to a list
+    # holding the last message.
+    # Inputs: example with "messages". Outputs: the same example dict, mutated.
+    # Exceptions: AssertionError for single-message conversations. Side effects: mutates the input dict.
     """
     Splits the messages into a prompt and a completion. The last message is considered the completion.
     """

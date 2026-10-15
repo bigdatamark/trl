@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Example training script: RLOO with LoRA and colocated vLLM generation on AI-MO/NuminaMath-TIR, training
+# Qwen/Qwen3-0.6B with think_format_reward and accuracy_reward. All hyperparameters are hard-coded (no CLI parsing).
+# Contents: main and its nested make_conversation helper. Importing has no side effects; running calls main.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +46,16 @@ from trl.rewards import accuracy_reward, think_format_reward
 
 
 def main():
+    # [FUNCTION DOC]
+    # Runs the whole example end to end.
+    # Behavior: loads the first 5% of the train and test splits; maps rows to a system+user conversational prompt and
+    # removes the messages/problem columns; builds an RLOOConfig (output_dir Qwen3-0.6B-RLOO, bfloat16 model init,
+    # learning rate 1e-5, completion logging of 2 samples, max completion length 1024, gradient accumulation 2, 8 steps
+    # per generation, vLLM colocate mode at 0.5 GPU memory utilization, a fixed run name); builds RLOOTrainer with a
+    # default LoraConfig; trains, saves to output_dir, always pushes to the Hub with the dataset name, and calls end.
+    # Inputs: none. Outputs: none.
+    # Exceptions: propagated from datasets, vLLM, training or Hub upload (push fails without credentials).
+    # Side effects: downloads, GPU training, file writes, Hub upload, experiment logging.
     # Dataset
     train_dataset, eval_dataset = load_dataset("AI-MO/NuminaMath-TIR", split=["train[:5%]", "test[:5%]"])
 
@@ -52,6 +67,10 @@ def main():
     )
 
     def make_conversation(example):
+        # [FUNCTION DOC]
+        # HELPER: Map function turning a row into a prompt of a system message (SYSTEM_PROMPT) and a user message holding the
+        # problem. Inputs: example (dict with problem). Outputs: dict with key prompt. Exceptions: KeyError if problem is
+        # missing. Side effects: none.
         return {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},

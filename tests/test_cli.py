@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for the trl command-line interface (trl.cli.main and the per-trainer scripts in trl.scripts).
+# Main contents: a --help regression test for every training subcommand; TestCLI with resume-argument wiring
+# tests (trainer class mocked), a real SFT resume-from-checkpoint test, end-to-end smoke runs for each subcommand
+# (distillation, dpo, grpo, kto, reward, rloo, sft), the env subcommand, YAML --config files for sft and
+# vllm-serve; and TestCLIModelInitKwargs checking how model_init_kwargs are assembled from script/model args.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +33,11 @@ from .testing_utils import TrlTestCase
 
 @pytest.mark.parametrize("command", ["distillation", "dpo", "grpo", "kto", "reward", "rloo", "sft"])
 def test_help_no_type_error(command):
+    # [FUNCTION DOC]
+    # Parametrized over training subcommands: regression for issue 5099 (unescaped percent signs in help strings
+    # raising TypeError in argparse). Runs main with "trl <command> --help" and stdout captured.
+    # Assertion: SystemExit is raised with exit code 0.
+    # Inputs: command - subcommand name. Outputs: none. Exceptions: assertion failure. Side effects: none (stdout captured).
     # Regression test for https://github.com/huggingface/trl/issues/5099:
     # TrainingArguments help strings with unescaped "%" caused TypeError in argparse.
     from trl.cli import main
@@ -36,6 +49,8 @@ def test_help_no_type_error(command):
 
 
 class TestCLI(TrlTestCase):
+    # [CLASS DOC]
+    # CLI integration tests. Inherits TrlTestCase (self.tmp_dir).
     @pytest.mark.parametrize(
         "command,trainer_name",
         [
@@ -50,6 +65,15 @@ class TestCLI(TrlTestCase):
     )
     @pytest.mark.parametrize("checkpoint", [None, "checkpoint-2"])
     def test_resume_argument(self, command, trainer_name, checkpoint):
+        # [FUNCTION DOC]
+        # Parametrized over (command, trainer class name) and checkpoint (None or "checkpoint-2"): checks the script
+        # forwards resume_from_checkpoint to trainer.train.
+        # Setup: imports trl.scripts.<command>, parses minimal args (output dir, dummy dataset name, no reporting; plus a
+        # teacher model for distillation; plus --resume_from_checkpoint when given) via make_parser().parse_args_and_config;
+        # patches datasets.load_dataset to return an empty train split and patches trl.<TrainerName> with a mock; runs
+        # script.main with the parsed tuple.
+        # Assertion: the mock trainer's train was called once with resume_from_checkpoint equal to the checkpoint.
+        # Inputs: command, trainer_name, checkpoint. Outputs: none. Exceptions: assertion failure. Side effects: none.
         script = importlib.import_module(f"trl.scripts.{command}")
         argv = ["--output_dir", self.tmp_dir, "--dataset_name", "unused", "--report_to", "none"]
         if command == "distillation":
@@ -64,6 +88,12 @@ class TestCLI(TrlTestCase):
         trainer.return_value.train.assert_called_once_with(resume_from_checkpoint=checkpoint)
 
     def test_sft_resume(self):
+        # [FUNCTION DOC]
+        # Checks real resume with the sft script: trains 2 steps saving at step 2 (batch 2, fp32, nll loss), then
+        # raises max_steps to 3 and resumes from checkpoint-2 while wrapping SFTTrainer.training_step in a spy that still
+        # runs the real implementation.
+        # Assertion: training_step is called exactly once (only step 3 remains).
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: trains and writes checkpoints in self.tmp_dir.
         from trl import SFTTrainer
         from trl.scripts import sft
 
@@ -102,6 +132,11 @@ class TestCLI(TrlTestCase):
         assert step.call_count == 1
 
     def test_distillation(self):
+        # [FUNCTION DOC]
+        # Smoke test: runs the trl CLI entry point with sys.argv patched to "trl distillation" on tiny Qwen2 models and a zen
+        # dataset config, output to self.tmp_dir, reporting disabled (student and teacher both tiny Qwen2, prompt-only data, max_completion_length 32). Passes if main returns without error.
+        # Inputs/Outputs: none. Exceptions: any CLI/training error fails the test.
+        # Side effects: downloads models/datasets, trains and writes to self.tmp_dir.
         from trl.cli import main
 
         command = f"trl distillation --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --teacher_model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_prompt_only --max_completion_length 32 --report_to none"
@@ -109,6 +144,11 @@ class TestCLI(TrlTestCase):
             main()
 
     def test_dpo(self):
+        # [FUNCTION DOC]
+        # Smoke test: runs the trl CLI entry point with sys.argv patched to "trl dpo" on tiny Qwen2 models and a zen
+        # dataset config, output to self.tmp_dir, reporting disabled (standard_preference). Passes if main returns without error.
+        # Inputs/Outputs: none. Exceptions: any CLI/training error fails the test.
+        # Side effects: downloads models/datasets, trains and writes to self.tmp_dir.
         from trl.cli import main
 
         command = f"trl dpo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_preference --report_to none"
@@ -116,6 +156,11 @@ class TestCLI(TrlTestCase):
             main()
 
     def test_dpo_multiple_loss_types(self):
+        # [FUNCTION DOC]
+        # Smoke test: runs the trl CLI entry point with sys.argv patched to "trl dpo" on tiny Qwen2 models and a zen
+        # dataset config, output to self.tmp_dir, reporting disabled with two loss types (sigmoid and bco_pair) weighted 1.0 and 0.5. Passes if main returns without error.
+        # Inputs/Outputs: none. Exceptions: any CLI/training error fails the test.
+        # Side effects: downloads models/datasets, trains and writes to self.tmp_dir.
         from trl.cli import main
 
         command = f"trl dpo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_preference --report_to none --loss_type sigmoid bco_pair --loss_weights 1.0 0.5"
@@ -124,6 +169,10 @@ class TestCLI(TrlTestCase):
 
     @patch("sys.stdout", new_callable=StringIO)
     def test_env(self, mock_stdout):
+        # [FUNCTION DOC]
+        # Runs "trl env" with stdout patched and asserts the output contains "TRL version: ".
+        # Inputs: mock_stdout - StringIO injected by the patch decorator. Outputs: none. Exceptions: assertion failure.
+        # Side effects: none.
         from trl.cli import main
 
         command = "trl env"
@@ -132,6 +181,11 @@ class TestCLI(TrlTestCase):
         assert "TRL version: " in mock_stdout.getvalue().strip()
 
     def test_grpo(self):
+        # [FUNCTION DOC]
+        # Smoke test: runs the trl CLI entry point with sys.argv patched to "trl grpo" on tiny Qwen2 models and a zen
+        # dataset config, output to self.tmp_dir, reporting disabled with a tiny sequence-classification reward model, 4 generations and 32-token completions. Passes if main returns without error.
+        # Inputs/Outputs: none. Exceptions: any CLI/training error fails the test.
+        # Side effects: downloads models/datasets, trains and writes to self.tmp_dir.
         from trl.cli import main
 
         command = f"trl grpo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --reward_model_name_or_path trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_prompt_only --num_generations 4 --max_completion_length 32 --report_to none"
@@ -139,6 +193,11 @@ class TestCLI(TrlTestCase):
             main()
 
     def test_kto(self):
+        # [FUNCTION DOC]
+        # Smoke test: runs the trl CLI entry point with sys.argv patched to "trl kto" on tiny Qwen2 models and a zen
+        # dataset config, output to self.tmp_dir, reporting disabled (standard_unpaired_preference). Passes if main returns without error.
+        # Inputs/Outputs: none. Exceptions: any CLI/training error fails the test.
+        # Side effects: downloads models/datasets, trains and writes to self.tmp_dir.
         from trl.cli import main
 
         command = f"trl kto --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_unpaired_preference --report_to none"
@@ -146,6 +205,11 @@ class TestCLI(TrlTestCase):
             main()
 
     def test_reward(self):
+        # [FUNCTION DOC]
+        # Smoke test: runs the trl CLI entry point with sys.argv patched to "trl reward" on tiny Qwen2 models and a zen
+        # dataset config, output to self.tmp_dir, reporting disabled (standard_implicit_prompt_preference). Passes if main returns without error.
+        # Inputs/Outputs: none. Exceptions: any CLI/training error fails the test.
+        # Side effects: downloads models/datasets, trains and writes to self.tmp_dir.
         from trl.cli import main
 
         command = f"trl reward --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_implicit_prompt_preference --report_to none"
@@ -153,6 +217,11 @@ class TestCLI(TrlTestCase):
             main()
 
     def test_rloo(self):
+        # [FUNCTION DOC]
+        # Smoke test: runs the trl CLI entry point with sys.argv patched to "trl rloo" on tiny Qwen2 models and a zen
+        # dataset config, output to self.tmp_dir, reporting disabled with a tiny sequence-classification reward model, 2 generations and 32-token completions. Passes if main returns without error.
+        # Inputs/Outputs: none. Exceptions: any CLI/training error fails the test.
+        # Side effects: downloads models/datasets, trains and writes to self.tmp_dir.
         from trl.cli import main
 
         command = f"trl rloo --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --reward_model_name_or_path trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_prompt_only --num_generations 2 --max_completion_length 32 --report_to none"
@@ -160,6 +229,11 @@ class TestCLI(TrlTestCase):
             main()
 
     def test_sft(self):
+        # [FUNCTION DOC]
+        # Smoke test: runs the trl CLI entry point with sys.argv patched to "trl sft" on tiny Qwen2 models and a zen
+        # dataset config, output to self.tmp_dir, reporting disabled (standard_language_modeling). Passes if main returns without error.
+        # Inputs/Outputs: none. Exceptions: any CLI/training error fails the test.
+        # Side effects: downloads models/datasets, trains and writes to self.tmp_dir.
         from trl.cli import main
 
         command = f"trl sft --output_dir {self.tmp_dir} --model_name_or_path trl-internal-testing/tiny-Qwen2ForCausalLM-2.5 --dataset_name trl-internal-testing/zen --dataset_config standard_language_modeling --report_to none"
@@ -167,6 +241,11 @@ class TestCLI(TrlTestCase):
             main()
 
     def test_sft_config_file(self):
+        # [FUNCTION DOC]
+        # Writes a YAML config (model, zen language-modeling dataset, no reporting, output_dir under tmp, cosine with
+        # restarts scheduler) and runs "trl sft --config <path>".
+        # Assertion: the configured output directory exists afterwards.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: writes config, trains, writes outputs.
         from trl.cli import main
 
         output_dir = os.path.join(self.tmp_dir, "output")
@@ -193,6 +272,11 @@ class TestCLI(TrlTestCase):
         assert os.path.exists(output_dir)
 
     def test_vllm_serve_config_file(self):
+        # [FUNCTION DOC]
+        # Checks "trl vllm-serve --config <yaml>" accepts the required model field from the config file rather than
+        # failing argument validation. trl.scripts.vllm_serve.main is patched with a mock.
+        # Assertions: the mock is called once and its first positional argument has model equal to the tiny Qwen2 id.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: writes a YAML file in self.tmp_dir.
         """
         Test `trl vllm-serve --config config.yaml` must not raise "the following arguments are required: --model" when
         the required field is satisfied by the config file rather than the command line.
@@ -214,6 +298,8 @@ class TestCLI(TrlTestCase):
 
 
 class TestCLIModelInitKwargs(TrlTestCase):
+    # [CLASS DOC]
+    # Tests that training scripts build model_init_kwargs for the trainer config. Inherits TrlTestCase.
     @pytest.mark.parametrize(
         "command,trainer_name",
         [
@@ -231,6 +317,13 @@ class TestCLIModelInitKwargs(TrlTestCase):
         [None, {}, {"revision": "custom", "attn_implementation": "eager", "attention_dropout": 0.0}],
     )
     def test_model_init_kwargs(self, command, trainer_name, model_init_kwargs):
+        # [FUNCTION DOC]
+        # Parametrized over (command, trainer name) and user model_init_kwargs (None, empty, or a dict with revision,
+        # attn_implementation, attention_dropout): parses minimal args, sets the training config's model_init_kwargs, and runs
+        # the script with load_dataset and the trainer class mocked.
+        # Assertion: the args passed to the trainer have model_init_kwargs equal to revision (from model_revision),
+        # trust_remote_code, attn_implementation and dtype from the model/training args, overridden by the user dict.
+        # Inputs: command, trainer_name, model_init_kwargs. Outputs: none. Exceptions: assertion failure. Side effects: none.
         script = importlib.import_module(f"trl.scripts.{command}")
         argv = ["--output_dir", self.tmp_dir, "--dataset_name", "unused", "--report_to", "none"]
         if command == "distillation":
@@ -251,6 +344,11 @@ class TestCLIModelInitKwargs(TrlTestCase):
         assert trainer.call_args.kwargs["args"].model_init_kwargs == expected
 
     def test_sft_model_init_kwargs(self):
+        # [FUNCTION DOC]
+        # Runs the real sft script for 1 step with --model_init_kwargs as a JSON string (eager attention, attention_dropout
+        # 0.25), spying on SFTTrainer.train to capture the trainer.
+        # Assertions: global_step is 1, the loaded model uses eager attention and attention_dropout 0.25.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: trains in self.tmp_dir.
         from trl import SFTTrainer
         from trl.scripts import sft
 

@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Script that builds a tiny randomly initialized Gemma3ForConditionalGeneration mirroring google/gemma-3-4b-it and pushes it to trl-internal-testing/tiny-Gemma3ForConditionalGeneration.
+# Behavior (all at import time, run as a module): checks the transformers floor from pyproject.toml is installed exactly, seeds RNGs, loads the reference AutoProcessor and GenerationConfig,
+# builds a scaled-down config (mostly 2 layers, hidden size 8-16, intermediate size 32), instantiates the model in bfloat16,
+# runs smoke_test, check_dtype_pattern and print_config_diff against the reference, then calls push_to_hub.
+# Details: Text: 2 layers (one sliding, one full attention), hidden 16. Vision: 2 layers, hidden 16, image_size 224 so 256 patches match mm_tokens_per_image (projector pooling becomes identity); the image processor size is also set to 224x224.
+# Inputs: CLI flags --create-pr / --full-diff (parsed by _common). Outputs: none returned.
+# Exceptions: RuntimeError on transformers version mismatch or failed smoke test; Hub/network errors propagate.
+# Side effects: downloads reference tokenizer/config from the Hub, prints diagnostics, creates/updates a Hub repo (or skips if it exists).
+#
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

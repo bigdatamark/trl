@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Rollout generation for AsyncGRPOTrainer, run in a spawned child process so generation never blocks training.
+# Contents: turn/row data types (TurnRecord, TrainingSequence, RolloutGroup, RolloutSample), the multi-turn token
+# reconciler (_common_prefix_len, DriftKind, _SampleBuilder, _chain_to_sequences), child-process bootstrap helpers
+# (_scrub_child_env, _spawn_stop_watcher, _child_main), the asyncio generate/score loop (_AsyncRolloutLoop) and the
+# parent-side controller (AsyncRolloutWorker). The child talks to vLLM over HTTP /v1/completions with aiohttp, scores
+# groups with reward functions/environments, computes group-normalized advantages and pushes RolloutSamples onto a
+# multiprocessing queue read by the trainer; metrics travel on a second queue.
+# Import-time side effects: imports aiohttp and defines _RETRYABLE_HTTP_ERRORS only when aiohttp is installed; module
+# logger; type aliases Messages and RolloutId.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,6 +76,9 @@ RolloutId: TypeAlias = str
 
 @dataclass(frozen=True)
 class TurnRecord:
+    # [CLASS DOC]
+    # Frozen dataclass for one generation call: prompt_ids (full re-tokenized prompt), output_ids (sampled tokens),
+    # output_log_probs (per sampled token, default empty), output_mask (per-token train eligibility; None means train all).
     """One generation call: the whole prompt this turn, the tokens the model produced, their logprobs."""
 
     prompt_ids: list[int]
@@ -76,6 +90,9 @@ class TurnRecord:
 
 @dataclass
 class TrainingSequence:
+    # [CLASS DOC]
+    # Dataclass for one training row: input_ids (prompt and completions), completion_mask (1 train, 0 context),
+    # old_log_probs (sampling logprobs, 0.0 for context), rollout_id (source conversation).
     """One training row. Maps 1:1 onto the array fields of `RolloutSample`."""
 
     input_ids: list[int]  # full tokens (prompt included)
@@ -85,6 +102,10 @@ class TrainingSequence:
 
 
 def _common_prefix_len(a: list[int], b: list[int], chunk: int = 4096) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Length of the longest common prefix of two int lists.
+    # Behavior: compares chunk-sized slices (default 4096) for speed; on the first mismatching chunk scans element-wise.
+    # Inputs: a, b (lists), chunk (int). Outputs: int. Exceptions: none. Side effects: none.
     """How many tokens at the start are identical in `a` and `b`."""
     limit = min(len(a), len(b))
     matched = 0
@@ -100,13 +121,23 @@ def _common_prefix_len(a: list[int], b: list[int], chunk: int = 4096) -> int:
 
 
 class DriftKind(enum.Enum):
+    # [CLASS DOC]
+    # Enum of reconciliation outcomes for a new turn's prompt versus held tokens: CLEAN (held tokens are a prefix; append),
+    # REALIGN (small drift inside the last answer; overwrite as context), FORK (start a new row).
     CLEAN = "clean"  # new prompt starts exactly with held tokens -> append the new part
     REALIGN = "realign"  # small change in the last answer -> overwrite it as context
     FORK = "fork"  # bigger change -> start a new row
 
 
 class _SampleBuilder:
+    # [CLASS DOC]
+    # HELPER: Accumulates one training row across turns: tokens, loss_mask, logprobs (parallel lists) and
+    # last_response_start_idx (where the latest assistant output begins). _fork_threshold (tokens) decides REALIGN vs FORK.
+    # Used only by _chain_to_sequences.
     def __init__(self, fork_threshold: int):
+        # [FUNCTION DOC]
+        # HELPER: Stores fork_threshold and initializes empty token/mask/logprob lists and last_response_start_idx None.
+        # Inputs: fork_threshold (int). Outputs: none. Exceptions: none. Side effects: attributes.
         self._fork_threshold = fork_threshold
         self.tokens: list[int] = []
         self.loss_mask: list[int] = []
@@ -114,6 +145,11 @@ class _SampleBuilder:
         self.last_response_start_idx: int | None = None
 
     def classify_token_drift(self, turn: TurnRecord) -> tuple[DriftKind, int]:
+        # [FUNCTION DOC]
+        # HELPER: Compares held tokens with turn.prompt_ids. drift = held length minus common prefix length.
+        # Returns (CLEAN, 0) if drift is 0; (REALIGN, drift) if a last response exists, the match reaches at least its start and
+        # drift is below the threshold; otherwise (FORK, drift).
+        # Inputs: turn. Outputs: (DriftKind, int). Exceptions: none. Side effects: none.
         """Classify this turn's re-tokenization against the held tokens, and report by how many tokens it drifted."""
         matched = _common_prefix_len(self.tokens, turn.prompt_ids)
         drift = len(self.tokens) - matched
@@ -125,6 +161,12 @@ class _SampleBuilder:
         return DriftKind.FORK, drift
 
     def append_turn(self, turn: TurnRecord, kind: DriftKind) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Adds a turn. REALIGN: replaces the tail after the common prefix with the new prompt's tail as context (mask 0,
+        # logprob 0). CLEAN: appends prompt tokens beyond the held length as context. Then records last_response_start_idx and
+        # appends output_ids with output_mask (or all 1) and output logprobs.
+        # Inputs: turn, kind (must not be FORK). Outputs: none.
+        # Exceptions: AssertionError for FORK; ValueError from _append on length mismatches. Side effects: mutates lists.
         assert kind is not DriftKind.FORK
         if kind is DriftKind.REALIGN:
             self._align_to_prompt(turn.prompt_ids)  # overwrite drifted tail as context
@@ -138,6 +180,10 @@ class _SampleBuilder:
         )
 
     def _align_to_prompt(self, prompt_ids: list[int]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Truncates held tokens at the common prefix with prompt_ids and writes the remaining prompt tokens there with
+        # mask 0 and logprob 0.0.
+        # Inputs: prompt_ids. Outputs: none. Exceptions: none. Side effects: mutates tokens, loss_mask, logprobs.
         matched = _common_prefix_len(self.tokens, prompt_ids)
         tail = prompt_ids[matched:]
         self.tokens[matched:] = tail
@@ -145,6 +191,11 @@ class _SampleBuilder:
         self.logprobs[matched:] = [0.0] * len(tail)
 
     def _append(self, ids: list[int], *, mask: int | list[int], logprobs: list[float] | None = None) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Appends ids with an int mask broadcast to all tokens or a per-token mask list, and logprobs (zeros if None).
+        # Inputs: ids, mask (int or list), logprobs (optional list). Outputs: none.
+        # Exceptions: ValueError if mask length differs, if any token is trainable but logprobs is None, or if logprobs length
+        # differs. Side effects: extends the three lists.
         """Append tokens with a uniform or per-token supervision mask."""
         masks = [mask] * len(ids) if isinstance(mask, int) else mask
         if len(masks) != len(ids):
@@ -158,15 +209,27 @@ class _SampleBuilder:
         self.logprobs.extend(logprobs if logprobs is not None else [0.0] * len(ids))
 
     def has_trained_token(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if any loss_mask entry is nonzero. Inputs: none. Outputs: bool. Exceptions/side effects: none.
         return any(self.loss_mask)
 
     def to_training_sequence(self, rollout_id: RolloutId) -> TrainingSequence:
+        # [FUNCTION DOC]
+        # HELPER: Returns a TrainingSequence with copies of tokens, loss_mask and logprobs and the given rollout_id.
+        # Inputs: rollout_id. Outputs: TrainingSequence. Exceptions/side effects: none.
         return TrainingSequence(list(self.tokens), list(self.loss_mask), list(self.logprobs), rollout_id)
 
 
 def _chain_to_sequences(
     turns: list[TurnRecord], rollout_id: RolloutId, fork_threshold: int
 ) -> tuple[list[TrainingSequence], dict[str, float]]:
+    # [FUNCTION DOC]
+    # HELPER: Reconciles one conversation's ordered turns into training rows.
+    # Behavior: first turn starts a builder (CLEAN). Each later turn is classified against the latest builder; the tally
+    # counts clean/realign/fork, transitions, total drift tokens and max drift. FORK starts a new builder with the turn
+    # appended CLEAN; otherwise the turn is appended to the latest builder. Builders without any trained token are dropped.
+    # Inputs: turns, rollout_id, fork_threshold (int). Outputs: (list of TrainingSequence, tally dict of floats).
+    # Exceptions: ValueError/AssertionError from the builder. Side effects: none.
     """Reconcile one conversation's turns (in order) into training rows; fork when re-tokenization drifts.
 
     Also returns the drift tally over the T-1 turn *transitions*: how many appended cleanly, realigned or forked, and
@@ -196,6 +259,11 @@ def _chain_to_sequences(
 
 @dataclass(slots=True)
 class RolloutGroup:
+    # [CLASS DOC]
+    # Slotted dataclass collecting the num_generations rollouts of one prompt before scoring: per-rollout lists (prompts,
+    # completions, completions_ids, completions_sequences, tool_call_counts, tool_failure_counts, env_rewards as
+    # (env class, reward) or None, rollout_rewards), reward_kwargs (extra dataset columns repeated per generation),
+    # model_version at group creation, group_id, queued_at (monotonic time put on the score queue).
     prompts: list[Messages]
     reward_kwargs: dict[str, list[Any]]
     completions: list[Messages]
@@ -212,6 +280,10 @@ class RolloutGroup:
 
 @dataclass(slots=True)
 class RolloutSample:
+    # [CLASS DOC]
+    # Slotted dataclass for one training row sent to the trainer: prompt and completion messages, input_ids and
+    # completion_mask (int64 arrays), old_log_probs (float32 array), advantage (float), model_version, group_id, metrics
+    # (reward, reward_std, per-function rewards, tool metrics) and enqueued_at (wall-clock time when queued).
     prompt: Messages
     completion: Messages
     input_ids: np.ndarray
@@ -245,6 +317,10 @@ _CHILD_ENV_TO_STRIP = (
 
 
 def _scrub_child_env() -> None:
+    # [FUNCTION DOC]
+    # HELPER: In the child, hides GPUs (CUDA_VISIBLE_DEVICES and HIP_VISIBLE_DEVICES set to empty) and removes the
+    # distributed/torchelastic environment variables in _CHILD_ENV_TO_STRIP.
+    # Inputs/Outputs: none. Exceptions: none. Side effects: mutates os.environ.
     # The child has no business touching CUDA; any library that imports torch
     # and lazily probes devices would race the parent's allocator.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -255,9 +331,16 @@ def _scrub_child_env() -> None:
 
 
 def _spawn_stop_watcher(rollout_loop: "_AsyncRolloutLoop", stop_event: MPEvent) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Starts a daemon thread ("grpo-mp-stop-watcher") that waits on the multiprocessing stop event and then sets the
+    # loop's asyncio stop event thread-safely on its event loop (RuntimeError from a closed loop ignored).
+    # Inputs: rollout_loop, stop_event. Outputs: none. Exceptions: none. Side effects: thread creation.
     # Daemon thread that translates the parent's mp.Event into the child's
     # asyncio.Event so _run_loops breaks out of its gather.
     def _watch():
+        # [FUNCTION DOC]
+        # HELPER: Thread body: blocks on stop_event, then schedules rollout_loop._stop_event.set on the loop; ignores
+        # RuntimeError. Inputs/Outputs: none. Side effects: sets asyncio event.
         stop_event.wait()
         try:
             rollout_loop._loop.call_soon_threadsafe(rollout_loop._stop_event.set)
@@ -280,6 +363,14 @@ def _child_main(
     exception_info_queue: MPQueue,
     metrics_queue: MPQueue,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Entry point of the spawned child process.
+    # Behavior: scrubs env, initializes accelerate PartialState (needed by its logger), constructs loop_cls with loop_kwargs
+    # plus the shared queues/values/events, sets child_ready_event, starts the stop watcher and runs the loop. Exceptions
+    # from run are printed to stderr and re-raised.
+    # Inputs: loop class, loop kwargs, samples queue, model version value, stop/ready/failed events, heartbeat value,
+    # exception info queue, metrics queue. Outputs: none.
+    # Exceptions: re-raises loop errors (process exits non-zero). Side effects: env mutation, process-level state.
     _scrub_child_env()
     # `accelerate.logging.get_logger` requires `PartialState()` to have been called.
     from accelerate.state import PartialState
@@ -305,6 +396,14 @@ def _child_main(
 
 
 class _AsyncRolloutLoop:
+    # [CLASS DOC]
+    # Asyncio generate and score loops living in the child process (see docstring). Two coroutines run concurrently: the
+    # generate loop keeps up to max_inflight_tasks rollouts in flight and assembles complete groups onto an asyncio queue
+    # (_groups_to_score, maxsize score_queue_maxsize); the score loop scores groups and puts RolloutSamples onto
+    # rollout_buffer. Key state: tokenizer (with response schema), reward funcs and names, standalone tools, environment
+    # factories/pools/tool lists, env reward types, metric accumulators (_counters, _rates as [numerator, denominator]),
+    # chat_template override, aiohttp session, private event loop and stop event. Class attribute _provides_rollout_reward
+    # (False) lets subclasses supply a per-rollout reward column. Subclassed by _HarnessRolloutLoop.
     """Asyncio generate and score loops. Lives entirely inside the spawned child process.
 
     Owns the tokenizer, dataset iterator, reward funcs, environments, and the asyncio event loop. Talks to vLLM via
@@ -351,6 +450,22 @@ class _AsyncRolloutLoop:
         fork_threshold_tokens: int = 1024,
         dataset_start_index: int = 0,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores configuration; starts the dataset iterator at dataset_start_index modulo dataset length (via select)
+        # when positive. Adds a response schema to the tokenizer when neither response_template nor response_schema is set;
+        # warns FutureWarning when only a legacy schema exists and response templates are supported. Normalizes
+        # environment_factory to a name->factory dict (single callable keyed None; dict means multi-environment). For each
+        # environment: instantiates one probe, scans public functions of its class: requires reset, records classes defining
+        # get_reward as env reward types, other public methods become tools; the probe seeds the instance pool; self.tools is
+        # the union of all tools. Appends env reward class names to reward_func_names. Creates the tool thread pool
+        # (max(1, max_inflight_tasks) workers); uses a training chat template when tools exist and the template is not prefix
+        # preserving. Creates the score queue, counters, a new event loop and stop event.
+        # Inputs: keyword args listed in the signature (model_name, dataset, reward_funcs, processing_class, eos_token_ids,
+        # shared IPC objects, tools, environment_factory, sampling params, timeouts, logging, fork_threshold_tokens,
+        # dataset_start_index, lora_name, vllm_server_url, queue sizes).
+        # Outputs: none.
+        # Exceptions: ValueError if an environment lacks reset, or if there is no reward source (no reward funcs, no env reward,
+        # no rollout reward). Side effects: environment construction, thread pool and event loop creation, may warn.
         self.model_name = model_name
         self.lora_name = lora_name
         self.dataset = dataset
@@ -489,10 +604,17 @@ class _AsyncRolloutLoop:
 
     @property
     def model_version(self) -> int:
+        # [FUNCTION DOC]
+        # Current policy version read from the shared multiprocessing value, as int.
+        # Inputs: none. Outputs: int. Exceptions/side effects: none.
         return int(self._model_version_value.value)
 
     @property
     def _request_model(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Model name to send to vLLM: model_name when no LoRA, else "<lora_name>-v<model_version>" so the request
+        # targets the adapter of the current published version.
+        # Inputs: none. Outputs: str. Exceptions/side effects: none.
         # In vLLM's API an adapter *is* a model name: naming the base model while an adapter is loaded silently
         # serves the base model, so the published version has to be part of the request. `model_version` reads the
         # shared `mp.Value`, so a sync is picked up without extra IPC.
@@ -501,6 +623,11 @@ class _AsyncRolloutLoop:
         return f"{self.lora_name}-v{self.model_version}"
 
     def run(self) -> None:
+        # [FUNCTION DOC]
+        # Runs _run_loops to completion on the private event loop.
+        # On any BaseException: best-effort puts (type name, message, traceback) on the exception info queue, then sets the
+        # failed event, logs and re-raises. Always shuts down the tool pool (cancel pending) and closes the loop.
+        # Inputs/Outputs: none. Exceptions: re-raises. Side effects: IPC signalling, resource cleanup.
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_until_complete(self._run_loops(stop_event=self._stop_event))
@@ -520,6 +647,10 @@ class _AsyncRolloutLoop:
             self._loop.close()
 
     async def _run_loops(self, stop_event: asyncio.Event) -> None:
+        # [FUNCTION DOC]
+        # Opens an aiohttp ClientSession (connection limit max_inflight_tasks), stores it in self.session, logs the sampling
+        # config and gathers the generate and score loops.
+        # Inputs: stop_event. Outputs: none. Exceptions: propagates loop errors. Side effects: network session.
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=self.max_inflight_tasks)) as session:
             self.session = session
             logger.info(
@@ -534,6 +665,25 @@ class _AsyncRolloutLoop:
             )
 
     async def _generate_loop(self, stop_event: asyncio.Event) -> None:
+        # [FUNCTION DOC]
+        # Producer loop keeping rollouts in flight and assembling groups.
+        # Behavior per iteration: writes wall-clock heartbeat. While free slots exist and not stopping: draw (group_id, row)
+        # from _repeat_iterator; pick the environment name from the row's "environment" field in multi-env mode (unknown name
+        # raises ValueError); choose tools (that env's list, else self.tools); if environments exist, take a pooled instance
+        # (or create one), run reset with the row (minus "environment" in multi-env) on the tool pool, timing env/reset_s.
+        # Prompt is the row's prompt (a single empty user message when absent and envs exist); a non-None observation is
+        # concatenated onto the last message's content (str/list normalized) in a new list, not in place. Builds tool_dict
+        # from standalone tools plus the env's public methods (excluding reset/get_reward). Creates the RolloutGroup on first
+        # use of a group_id (reward_kwargs = other row columns repeated num_generations times; version stamped now). Starts a
+        # _generate_one task.
+        # Then records the inflight gauge; with no tasks sleeps 10 ms (returns if stopping); otherwise waits up to 0.1 s for
+        # the first completed task. For each done task: frees slot, re-raises its exception, appends its results to the group,
+        # scores env reward via get_reward (async awaited or sync on the pool, timed env/reward_s) when the env class owns a
+        # reward (else None), returns env to pool, counts tokens. When a group has num_generations results, puts it on the
+        # score queue, retrying every 0.1 s while full (returns if stopping) and pushes rollout/score_block_s if it blocked.
+        # Finally cancels and awaits in-flight tasks and tries to enqueue a None sentinel for the score loop.
+        # Inputs: stop_event. Outputs: none. Exceptions: task errors and ValueError propagate.
+        # Side effects: heartbeat, metrics, environment state, network.
         pending_groups: dict[int, RolloutGroup] = {}
         pending_completed: dict[int, int] = {}
         inflight_tasks: dict[asyncio.Task, tuple[int, int, Any, object, Messages]] = {}
@@ -722,6 +872,13 @@ class _AsyncRolloutLoop:
                 pass
 
     async def _score_loop(self, stop_event: asyncio.Event) -> None:
+        # [FUNCTION DOC]
+        # Consumer loop: until stop, writes heartbeat, waits up to 0.5 s for a group (None sentinel ends the loop), scores it
+        # with _score_group and logs idle and scoring times. Pushes metrics: rollout/score_s, score_wait_s, score_queue_size,
+        # inflight, and generated_tok_s as a (tokens since last push, seconds since last push) pair. Optionally prints a
+        # completions sample. Then puts each sample onto rollout_buffer (stamping enqueued_at), polling every 0.1 s while full
+        # (returns if stopping, logs once) and pushing rollout/backpressure_s if it blocked.
+        # Inputs: stop_event. Outputs: none. Exceptions: scoring errors propagate. Side effects: IPC queue writes, logging.
         t_idle_start = time.monotonic()
         while not stop_event.is_set():
             self._heartbeat_value.value = time.time()
@@ -796,6 +953,11 @@ class _AsyncRolloutLoop:
             t_idle_start = time.monotonic()
 
     async def _retry(self, coro_factory: Callable[[], Awaitable], *, label: str, max_attempts: int = 1):
+        # [FUNCTION DOC]
+        # HELPER: Awaits coro_factory up to max_attempts times (default 1), retrying only _RETRYABLE_HTTP_ERRORS. Before each
+        # retry increments rollout/vllm_retry_total, logs a warning and sleeps min(2 ** min(attempt, 4), 16) seconds.
+        # Inputs: coro_factory (zero-arg callable returning awaitable), label, max_attempts. Outputs: the coroutine result.
+        # Exceptions: the last retryable error, or any non-retryable error immediately. Side effects: sleep, metrics, logging.
         """Retry an aiohttp coroutine on transport errors with bounded exponential backoff, counting the retries.
 
         Every retried call in this loop targets vLLM, so the counter is named for the dependency rather than for the
@@ -815,6 +977,10 @@ class _AsyncRolloutLoop:
                 await asyncio.sleep(sleep)
 
     def _push_metrics(self, values: dict[str, float | tuple[float, float]]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Builds a payload of the given values plus all accumulated counters and rates (as (num, den) tuples), clears
+        # the accumulators and put_nowait's it onto the metrics queue, silently dropping it if full.
+        # Inputs: values dict. Outputs: none. Exceptions: none. Side effects: clears accumulators, IPC write.
         """Send metrics to the trainer, along with the counters and rates accumulated since the last push."""
         payload = dict(values)
         payload.update(self._counters)
@@ -836,6 +1002,13 @@ class _AsyncRolloutLoop:
         loop_exhausted: bool,
         duration_s: float,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Accumulates per-rollout rates: completions/mean_length, rollout/samples_per_rollout, rollout/turns_mean;
+        # completions/clipped_ratio (last completion token not in EOS ids or pad id) when non-empty; tools/loop_exhausted_frac
+        # when tools exist; fork_frac, realign_frac, drift_tokens_mean (per transition) when transitions exist. Then pushes
+        # rollout/duration_s, turns_max, drift_tokens_max, completions/max_length and min_length (aggregated by the trainer).
+        # Inputs: keyword turns, sequences, completion_ids, tally, loop_exhausted, duration_s. Outputs: none.
+        # Exceptions: KeyError if tally lacks keys. Side effects: metric state, IPC write.
         """One conversation's structure and its completion, aggregated per rollout."""
         transitions = tally["transitions"]
         completion_tokens = len(completion_ids)
@@ -876,6 +1049,11 @@ class _AsyncRolloutLoop:
         )
 
     def _repeat_iterator(self) -> Iterator[tuple[int, dict[str, Any]]]:
+        # [FUNCTION DOC]
+        # HELPER: Infinite generator yielding (group_id, row) num_generations times per dataset row, restarting the dataset
+        # iterator from the beginning when exhausted (no shuffle). group_id increases by one per row.
+        # Inputs: none. Outputs: iterator. Exceptions: StopIteration only for an empty dataset (becomes RuntimeError in a
+        # generator). Side effects: replaces _dataset_iter.
         group_id = 0
         while True:
             try:
@@ -890,6 +1068,15 @@ class _AsyncRolloutLoop:
     async def _generate_one(
         self, prompt: Messages, tool_dict: dict[str, Callable], tools: list[Callable], group_id: int = 0
     ) -> tuple[list[dict[str, str]], list[int], list[TrainingSequence], int, int, float | None]:
+        # [FUNCTION DOC]
+        # Rolls out one conversation (see docstring). Loop: tokenize the whole message list with the chat template (generation
+        # prompt, tools or None, chat_template override, kwargs); sample one turn; parse to an assistant message; record it in
+        # completion, completion_ids, messages and turns. Stop when there are no tool calls, or set loop_exhausted and stop
+        # when max_tool_calling_iterations is set and reached. Otherwise execute tool calls, add counts and append tool
+        # messages. Finally reconcile turns with _chain_to_sequences and push rollout metrics.
+        # Inputs: prompt (messages), tool_dict, tools, group_id (unused here). Outputs: (completion messages, completion ids,
+        # sequences, tool call count, tool failure count, None).
+        # Exceptions: HTTP/parse/reconcile errors propagate. Side effects: network, tool execution, metrics.
         """Roll out one conversation, re-tokenizing the whole message list each turn and reconciling drift.
 
         Every turn renders the full conversation through the chat template, generates, records the turn, and feeds the
@@ -957,6 +1144,14 @@ class _AsyncRolloutLoop:
     async def _execute_tool_calls(
         self, tool_calls: list[dict[str, Any]], tool_dict: dict[str, Callable]
     ) -> tuple[list[dict[str, str]], int, int]:
+        # [FUNCTION DOC]
+        # HELPER: Executes a turn's tool calls sequentially.
+        # Behavior: per call increments tools/<name>/call_total; unknown names count as failures (also tools/unknown_name_total)
+        # and produce an error tool message. Known tools are awaited if coroutine functions, else run on the tool pool, with
+        # arguments from the call (default empty); exceptions become an error dict result and a failure count. Latency is added
+        # to overall and per-tool rates. Each result is stringified into a tool message. Records tools/parallel_calls_mean.
+        # Inputs: tool_calls (parsed dicts with function name/arguments), tool_dict. Outputs: (tool messages, calls, failures).
+        # Exceptions: KeyError on malformed calls. Side effects: runs tools, metrics.
         loop = asyncio.get_running_loop()
         tool_messages = []
         n_calls = 0
@@ -997,6 +1192,12 @@ class _AsyncRolloutLoop:
         return tool_messages, n_calls, n_failures
 
     async def _generate_one_turn(self, prompt_ids: list[int]) -> tuple[list[int], list[float]]:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /v1/completions with token prompt, max_tokens, temperature, top_p, top_k, repetition_penalty, n=1,
+        # return_token_ids, logprobs 0 (sampled token only), a random 63-bit seed, and min_p if set; model is _request_model.
+        # Wrapped in _retry with 30 attempts and request_timeout.
+        # Inputs: prompt_ids. Outputs: (token ids, token logprobs) of the first choice.
+        # Exceptions: HTTP errors after retries; KeyError on malformed responses. Side effects: network, retry metrics.
         payload = {
             "model": self._request_model,
             "prompt": prompt_ids,
@@ -1024,6 +1225,17 @@ class _AsyncRolloutLoop:
         return choice["token_ids"], choice["logprobs"]["token_logprobs"]
 
     async def _score_group(self, group: RolloutGroup) -> list[RolloutSample]:
+        # [FUNCTION DOC]
+        # Scores a complete group and expands it to RolloutSamples.
+        # Behavior: calls all reward funcs concurrently (async directly, sync via asyncio.to_thread) with completions, prompts,
+        # completion_ids and reward_kwargs. Appends one column per env reward class (value only for rollouts of that class)
+        # and, if _provides_rollout_reward, the rollout rewards column. None becomes NaN; per-rollout reward = NaN-sum across
+        # columns, NaN if all columns are NaN. Advantages = (reward - mean) / (std + 1e-8) over scored rollouts only; unscored
+        # rollouts get advantage 0. Logs mean/std. Tool metrics (call_frequency, failure_frequency) only when any calls occurred.
+        # Every training sequence of a conversation becomes a RolloutSample with the conversation's advantage and its own copy
+        # of metrics (reward, reward_std, rewards/<name>).
+        # Inputs: group. Outputs: list of RolloutSample.
+        # Exceptions: reward function errors propagate. Side effects: logging; reward funcs may have their own.
         kwargs = dict(
             completions=group.completions,
             prompts=group.prompts,
@@ -1124,9 +1336,19 @@ class _AsyncRolloutLoop:
         return samples
 
     async def _post(self, path: str, payload: dict, timeout: float, max_retries: int = 3) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: POSTs JSON to vllm_server_url + path with a total timeout, raising for HTTP error status, and returns the JSON
+        # body (empty dict for an empty body); retried via _retry up to max_retries (default 3) attempts.
+        # KNOWN ISSUE: _generate_one_turn wraps this already-retrying call in another _retry with 30 attempts, so a request may
+        # be attempted up to 90 times and rollout/vllm_retry_total counts both layers.
+        # Inputs: path, payload, timeout, max_retries. Outputs: dict.
+        # Exceptions: aiohttp errors after retries. Side effects: network.
         client_timeout = aiohttp.ClientTimeout(total=timeout)
 
         async def _do_post():
+            # [FUNCTION DOC]
+            # HELPER: Single POST attempt using the shared session; raise_for_status, parse JSON, return it or an empty dict.
+            # Inputs: none (closure). Outputs: dict. Exceptions: aiohttp errors. Side effects: network.
             async with self.session.post(
                 f"{self.vllm_server_url}{path}", json=payload, timeout=client_timeout
             ) as response:
@@ -1138,6 +1360,12 @@ class _AsyncRolloutLoop:
 
 
 class AsyncRolloutWorker:
+    # [CLASS DOC]
+    # Parent-side controller of the rollout child process (see docstring). Uses the "spawn" multiprocessing context.
+    # State: rollout_buffer (Queue, maxsize queue_maxsize), _model_version_value (int Value), stop/ready/failed events,
+    # heartbeat (double Value, wall-clock), exception info queue (maxsize 1), metrics_queue (maxsize 4096), _loop_kwargs,
+    # _child_ready_timeout, _process. Class attribute _loop_cls selects the loop implementation (overridden by
+    # HarnessRolloutWorker). Lifecycle: start, check_health periodically, update_model_version on weight sync, stop.
     """Parent-side controller: spawns a child process running `_AsyncRolloutLoop`.
 
     The trainer holds this object on rank 0. The child does the actual rollout work; this class only manages lifecycle
@@ -1161,6 +1389,10 @@ class AsyncRolloutWorker:
         child_ready_timeout: int = 300,
         **loop_kwargs: Any,
     ):
+        # [FUNCTION DOC]
+        # Creates all IPC primitives and stores the loop kwargs, adding queue_maxsize and defaulting dataset_start_index to 0.
+        # Inputs: queue_maxsize (default 0, unbounded), child_ready_timeout (seconds, default 300), loop kwargs.
+        # Outputs: none. Exceptions: ImportError if vLLM or aiohttp is missing. Side effects: creates IPC objects (no process).
         if not is_vllm_available():
             raise ImportError("vLLM is required to use AsyncRolloutWorker. Install it with: pip install vllm")
         if not is_aiohttp_available():
@@ -1188,18 +1420,32 @@ class AsyncRolloutWorker:
 
     @property
     def model_version(self) -> int:
+        # [FUNCTION DOC]
+        # Reads the shared model version value as int. Inputs: none. Outputs: int. Side effects: none.
         return int(self._model_version_value.value)
 
     @model_version.setter
     def model_version(self, value: int) -> None:
+        # [FUNCTION DOC]
+        # Setter: writes int(value) to the shared value under its lock.
+        # Inputs: value. Outputs: none. Exceptions: none. Side effects: visible to the child.
         # NOTE(@aminediro) Read/write ops like += are not atomic with mp.Value
         with self._model_version_value.get_lock():
             self._model_version_value.value = int(value)
 
     def update_model_version(self, model_version: int) -> None:
+        # [FUNCTION DOC]
+        # Sets model_version through the property setter. Inputs: model_version (int). Outputs: none. Side effects: shared value.
         self.model_version = model_version
 
     def start(self) -> None:
+        # [FUNCTION DOC]
+        # Spawns the child. No-op with a warning if a process exists. Resets heartbeat to now, verifies loop kwargs pickle,
+        # starts a daemon process ("grpo-rollout-worker-child") running _child_main, then polls the ready event each second
+        # until set, failing if the child dies or the timeout passes.
+        # Inputs: none. Outputs: none.
+        # Exceptions: TypeError if kwargs are not picklable; RuntimeError if the child exits during init or is not ready in time.
+        # Side effects: process creation, logging.
         if self._process is not None:
             logger.warning("AsyncRolloutWorker.start() called but child process is already running; ignoring.")
             return
@@ -1255,6 +1501,10 @@ class AsyncRolloutWorker:
         logger.info("AsyncRolloutWorker child is ready")
 
     def check_health(self, stale_after_s: float) -> None:
+        # [FUNCTION DOC]
+        # Raises RuntimeError if the failed event is set (chaining a RuntimeError built from queued exception info when
+        # available), or if the heartbeat is older than stale_after_s seconds.
+        # Inputs: stale_after_s (float). Outputs: none. Side effects: consumes the exception info entry.
         """Raise if the child crashed or hasn't ticked the heartbeat within `stale_after_s`."""
         if self._failed_event.is_set():
             try:
@@ -1268,6 +1518,10 @@ class AsyncRolloutWorker:
             raise RuntimeError(f"Rollout worker heartbeat stale: {age:.0f}s > {stale_after_s:.0f}s; child is hung.")
 
     def stop(self) -> None:
+        # [FUNCTION DOC]
+        # No-op without a process. Sets the stop event; if the process was started, joins 15 s, then terminates and joins 5 s,
+        # then kills if still alive. Clears _process.
+        # Inputs/Outputs: none. Exceptions: none expected. Side effects: process termination, logging.
         if self._process is None:
             return
         logger.info("Stopping AsyncRolloutWorker child process...")

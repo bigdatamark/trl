@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Shared utilities for TRL CLI scripts: dataset mixture configs (DatasetConfig, DatasetMixtureConfig) and
+# get_dataset, common ScriptArguments, TrlParser (YAML-config-aware argument parser built on the vendored
+# HfArgumentParser), init_zero_verbose (quiet logging setup) and get_git_commit_hash.
+# Import-time side effects: creates a module logger; imports the local _hf_argparser (not transformers') to
+# avoid an upstream import-latency issue.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +45,10 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DatasetConfig:
+    # [CLASS DOC]
+    # Dataclass describing one dataset to load with datasets.load_dataset: path (required), name, data_dir,
+    # data_files, split (default "train"), columns (optional column subset) and fraction (optional target share of
+    # the mixture; must be set for all datasets or none; not for streaming). Consumed by get_dataset.
     """
     Configuration for a dataset.
 
@@ -79,6 +90,10 @@ class DatasetConfig:
 
 @dataclass
 class DatasetMixtureConfig:
+    # [CLASS DOC]
+    # Dataclass for a mixture of datasets parsed from CLI/YAML: datasets (list of DatasetConfig, default empty),
+    # streaming (default False), test_split_size (optional float/int passed as test_size to train_test_split).
+    # __post_init__ converts dict entries (as produced by YAML parsing) into DatasetConfig objects.
     """
     Configuration class for a mixture of datasets.
 
@@ -135,6 +150,11 @@ class DatasetMixtureConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: replaces, in place, every dict in self.datasets with DatasetConfig built from its keys.
+        # Inputs: none. Outputs: none.
+        # Exceptions: TypeError for unknown or missing DatasetConfig keys.
+        # Side effects: mutates self.datasets.
         # Convert any dataset dicts (from CLI/config parsing) into DatasetConfig objects
         for idx, dataset in enumerate(self.datasets):
             if isinstance(dataset, dict):
@@ -144,6 +164,11 @@ class DatasetMixtureConfig:
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of arguments common to all TRL scripts: dataset_name, dataset_config (both optional),
+    # dataset_train_split ("train"), dataset_test_split ("test"), dataset_streaming (False), and
+    # ignore_bias_buffers (False; DPO script DDP workaround). The dataset fields are ignored when a
+    # DatasetMixtureConfig.datasets list is provided. No methods.
     """
     Arguments common to all scripts.
 
@@ -203,6 +228,12 @@ class ScriptArguments:
 
 
 def init_zero_verbose():
+    # [FUNCTION DOC]
+    # Behavior: configures root logging at ERROR level with "%(message)s" format and "[%X]" date format, using a
+    # Rich handler when rich is installed else a StreamHandler, and replaces warnings.showwarning so warnings are
+    # emitted through logging.warning as "file:line: Category: message".
+    # Inputs: none. Outputs: none. Exceptions: none expected.
+    # Side effects: global logging configuration and global warnings hook.
     """
     Perform zero verbose init - use this method on top of the CLI modules to make logging and warning output cleaner.
     Uses Rich if available, falls back otherwise.
@@ -225,6 +256,10 @@ def init_zero_verbose():
 
     # Custom warning handler to redirect warnings to the logging system
     def warning_handler(message, category, filename, lineno, file=None, line=None):
+        # [FUNCTION DOC]
+        # HELPER: Replacement for warnings.showwarning that logs the warning at WARNING level (file and line args are
+        # accepted but unused). Inputs: standard showwarning args. Outputs: none. Exceptions: none.
+        # Side effects: writes a log record.
         logging.warning(f"{filename}:{lineno}: {category.__name__}: {message}")
 
     # Add the custom warning handler - we need to do that before importing anything to make sure the loggers work well
@@ -232,6 +267,11 @@ def init_zero_verbose():
 
 
 class TrlParser(HfArgumentParser):
+    # [CLASS DOC]
+    # HfArgumentParser subclass adding YAML config file support (via "--config") with an optional "env" section
+    # that sets environment variables, and the ability to set argument defaults (including in subparsers) from a
+    # config. Construction forbids dataclasses with a field named "config". Main entry: parse_args_and_config;
+    # set_defaults_with_config is its helper (also used by the trl CLI).
     """
     A subclass of [`transformers.HfArgumentParser`] designed for parsing command-line arguments with dataclass-backed
     configurations, while also supporting configuration file loading and environment variable management.
@@ -284,6 +324,13 @@ class TrlParser(HfArgumentParser):
         dataclass_types: DataClassType | Iterable[DataClassType] | None = None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: normalizes dataclass_types to a list, rejects any dataclass that declares a "config" field, then
+        # initializes HfArgumentParser.
+        # Inputs: dataclass_types (type, iterable or None); kwargs forwarded.
+        # Outputs: none.
+        # Exceptions: ValueError for a reserved "config" field.
+        # Side effects: registers arguments.
         # Make sure dataclass_types is an iterable
         if dataclass_types is None:
             dataclass_types = []
@@ -307,6 +354,22 @@ class TrlParser(HfArgumentParser):
         fail_with_unknown_args: bool = True,
         separate_remaining_strings: bool = False,
     ) -> tuple[DataClass, ...]:
+        # [FUNCTION DOC]
+        # Behavior: copies args (default sys.argv without program name). If "--config" is present, removes the flag
+        # and its following path, safe-loads the YAML (must be a mapping), pops "env" (must be a dict) and sets each
+        # entry in os.environ as a string, then applies remaining keys as parser defaults via
+        # set_defaults_with_config, collecting unconsumed keys as "--key value" strings. Then parses the CLI with
+        # parse_args_into_dataclasses (CLI overrides config). When return_remaining_strings, returns the dataclasses
+        # plus either one merged list (config leftovers then CLI leftovers) or, with separate_remaining_strings, two
+        # lists. Otherwise raises if config leftovers exist and fail_with_unknown_args, else returns the dataclasses.
+        # Inputs: args, return_remaining_strings (False), fail_with_unknown_args (True), separate_remaining_strings
+        # (False).
+        # Outputs: tuple of dataclass instances (plus remaining-string lists as described).
+        # Exceptions: ValueError for non-mapping config, non-dict env, or unknown config keys; ImportError without
+        # PyYAML; ValueError from the base parser for unknown CLI args.
+        # Side effects: reads the config file, sets environment variables, mutates parser action defaults.
+        # KNOWN ISSUE: "--config" given as the last argument with no path raises an uncaught IndexError; the
+        # "--config=path" form is not recognized.
         """
         Parse command-line args and config file into instances of the specified dataclass types.
 
@@ -359,6 +422,12 @@ class TrlParser(HfArgumentParser):
             return output
 
     def set_defaults_with_config(self, **kwargs) -> list[str]:
+        # [FUNCTION DOC]
+        # Behavior: walks the parser actions recursively (descending into every subparser); for each action whose
+        # dest is a key in kwargs, sets its default to that value and marks it not required. Keys not consumed by any
+        # action are returned as flattened "--key", "str(value)" pairs.
+        # Inputs: kwargs (config values). Outputs: list of str leftovers.
+        # Exceptions: none expected. Side effects: mutates argparse actions of this parser and its subparsers.
         """
         Overrides the parser's default values with those provided via keyword arguments, including for subparsers.
 
@@ -368,6 +437,9 @@ class TrlParser(HfArgumentParser):
         """
 
         def apply_defaults(parser, kw):
+            # [FUNCTION DOC]
+            # HELPER: Recursive worker: applies defaults on one parser and its subparsers; returns the set of used keys.
+            # Inputs: parser, kw dict. Outputs: set of str. Exceptions: none. Side effects: mutates actions.
             used_keys = set()
             for action in parser._actions:
                 # Handle subparsers recursively
@@ -389,6 +461,15 @@ class TrlParser(HfArgumentParser):
 
 
 def get_git_commit_hash(package_name):
+    # [FUNCTION DOC]
+    # HELPER: Returns the git HEAD hash of the repository containing an installed package.
+    # Behavior: imports the package, takes the parent of its directory as the repo root; if it contains a ".git"
+    # directory, runs git rev-parse HEAD there and returns the decoded hash, else None.
+    # Inputs: package_name (str). Outputs: hash str, None, or an "Error: ..." string on any exception.
+    # Exceptions: none raised (all caught and returned as a string).
+    # Side effects: imports the package; spawns a git subprocess.
+    # KNOWN ISSUE: on failure it returns an "Error: ..." string, which callers such as print_env treat as a commit
+    # hash (slicing its first 7 characters into the version string).
     try:
         # Import the package to locate its path
         package = importlib.import_module(package_name)
@@ -412,6 +493,18 @@ def get_git_commit_hash(package_name):
 
 
 def get_dataset(mixture_config: DatasetMixtureConfig) -> "DatasetDict":
+    # [FUNCTION DOC]
+    # Behavior: loads each DatasetConfig with datasets.load_dataset (path, name, data_dir, data_files, split,
+    # mixture streaming flag), selecting columns when given. If fractions are used: requires all set and
+    # non-streaming, normalizes them to weights, computes total as the minimum over positive-weight datasets of
+    # length / weight, and keeps the first round(weight times total) rows of each. Concatenates all datasets
+    # (logging the size for non-iterable datasets); with test_split_size returns train_test_split's DatasetDict,
+    # else a DatasetDict with only "train".
+    # Inputs: mixture_config (DatasetMixtureConfig).
+    # Outputs: datasets.DatasetDict.
+    # Exceptions: ValueError for partial fractions, fractions with streaming, or an empty mixture; dataset loading
+    # errors; ZeroDivisionError if all fractions sum to zero.
+    # Side effects: downloads/caches datasets; logs info messages.
     """
     Load a mixture of datasets based on the configuration.
 

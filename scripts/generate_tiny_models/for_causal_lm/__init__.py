@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Subpackage of tiny-model generation scripts for causal language models (one script per reference checkpoint,
+# plus PEFT adapters, a remote-code model and a response-template fixture).
+# Exports nothing; importing it has no side effects. Each module inside must be run individually.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests for the TRL Trainer callbacks LogCompletionsCallback (logs generated completions for eval prompts to
+# Weights & Biases or Comet) and BEMACallback (bias-corrected EMA of weights, saved under output_dir/bema).
+# Each test runs a plain transformers Trainer on tiny Qwen2 and zen datasets with the callback attached.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +31,15 @@ from .testing_utils import TrlTestCase, require_comet, require_wandb
 
 
 class TestLogCompletionsCallback(TrlTestCase):
+    # [CLASS DOC]
+    # Tests LogCompletionsCallback with real tracking backends. State from setup_method: model, tokenizer, tokenized
+    # prompt-only dataset (8 train rows) and a GenerationConfig with max_length 32. Inherits TrlTestCase.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Per-test fixture: loads tiny Qwen2 model and tokenizer, copies the tokenizer pad id into the model config,
+        # loads zen standard_prompt_only, keeps 8 train rows, tokenizes prompts (pad/truncate to 16, labels equal input
+        # ids) and creates the generation config.
+        # Inputs: none. Outputs: none. Exceptions: load errors propagate. Side effects: sets instance attributes.
         self.model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
         self.tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
         # `Trainer` realigns the configs at train time, so mirror the pad token as the TRL trainers do at init.
@@ -34,6 +48,10 @@ class TestLogCompletionsCallback(TrlTestCase):
         dataset["train"] = dataset["train"].select(range(8))
 
         def tokenize_function(examples):
+            # [FUNCTION DOC]
+            # HELPER: Batched map function tokenizing the "prompt" column to max_length 16 with padding and truncation and
+            # adding labels as a copy of input_ids. Inputs: examples - batch dict. Outputs: tokenizer BatchEncoding with labels.
+            # Exceptions: none. Side effects: none.
             out = self.tokenizer(examples["prompt"], padding="max_length", max_length=16, truncation=True)
             out["labels"] = out["input_ids"].copy()
             return out
@@ -44,6 +62,12 @@ class TestLogCompletionsCallback(TrlTestCase):
 
     @require_wandb
     def test_basic_wandb(self):
+        # [FUNCTION DOC]
+        # Trains with eval every 2 steps (batch size 2) reporting to wandb and the callback logging 2 prompts, then reads
+        # the completions table JSON from the wandb run directory.
+        # Assertions: columns include step, prompt and completion; the first test prompt appears in the first data row.
+        # Requires wandb. Inputs/Outputs: none. Exceptions: assertion failure.
+        # Side effects: creates a wandb run and local files.
         import wandb
 
         training_args = TrainingArguments(
@@ -81,6 +105,12 @@ class TestLogCompletionsCallback(TrlTestCase):
 
     @require_comet
     def test_basic_comet(self):
+        # [FUNCTION DOC]
+        # Trains with eval every 2 steps reporting to comet_ml with the callback (2 prompts), ends the running experiment to
+        # flush, then queries the Comet API for dataframe assets.
+        # Assertions: the experiment exists; number of logged tables equals half of (train plus test rows) plus one; every
+        # table file is named completions.csv. Requires comet_ml.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: network calls to Comet.
         import comet_ml
 
         training_args = TrainingArguments(
@@ -119,7 +149,14 @@ class TestLogCompletionsCallback(TrlTestCase):
 
 
 class TestBEMACallback(TrlTestCase):
+    # [CLASS DOC]
+    # Tests BEMACallback. State from setup_method: tiny Qwen2 model and tokenizer, zen standard_language_modeling
+    # dataset tokenized to max length 17 with labels. Inherits TrlTestCase.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Per-test fixture: loads model/tokenizer, mirrors pad token id into the model config, tokenizes the text
+        # column (padding to 17, labels copy input ids, text column removed).
+        # Inputs: none. Outputs: none. Exceptions: load errors propagate. Side effects: sets instance attributes.
         self.model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
         self.tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
         # `Trainer` realigns the configs at train time, so mirror the pad token as the TRL trainers do at init.
@@ -127,6 +164,9 @@ class TestBEMACallback(TrlTestCase):
         dataset = load_dataset("trl-internal-testing/zen", "standard_language_modeling")
 
         def tokenize_function(examples, tokenizer):
+            # [FUNCTION DOC]
+            # HELPER: Batched map function tokenizing "text" with padding to max_length 17 and adding labels as a copy of
+            # input_ids. Inputs: examples - batch dict; tokenizer. Outputs: BatchEncoding. Exceptions/Side effects: none.
             out = tokenizer(examples["text"], padding="max_length", max_length=17)
             out["labels"] = out["input_ids"].copy()
             return out
@@ -136,6 +176,12 @@ class TestBEMACallback(TrlTestCase):
         )
 
     def test_model_saved(self):
+        # [FUNCTION DOC]
+        # Checks BEMACallback(update_freq 2) writes a loadable model to output_dir/bema after training.
+        # Setup: TrainingArguments with report_to none (default 3 epochs, batch size 8) and the callback attached to a
+        # plain Trainer on the language-modeling train split.
+        # Assertions: the bema directory exists and AutoModelForCausalLM loads from it.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: trains and writes checkpoints.
         """Test that BEMACallback saves the BEMA model."""
         training_args = TrainingArguments(output_dir=self.tmp_dir, report_to="none")
         bema_callback = BEMACallback(update_freq=2)
@@ -154,6 +200,12 @@ class TestBEMACallback(TrlTestCase):
         AutoModelForCausalLM.from_pretrained(bema_path)
 
     def test_update_frequency_0(self):
+        # [FUNCTION DOC]
+        # Checks update_freq 2 calls _update_bema_weights at steps 2, 4, 6, 8.
+        # KNOWN ISSUE: the inline comment lists the updates as 2, 4, 5, 8, which disagrees with the asserted 2, 4, 6, 8.
+        # Setup: _update_bema_weights is patched with a mock on the callback instance; a plain Trainer with default args
+        # (3 epochs, batch size 8, 17 samples, 9 optimizer steps) trains with the callback attached.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: trains in self.tmp_dir.
         """Test that BEMA callback respects the update frequency."""
         training_args = TrainingArguments(output_dir=self.tmp_dir, report_to="none")
         bema_callback = BEMACallback(update_freq=2)
@@ -174,6 +226,11 @@ class TestBEMACallback(TrlTestCase):
             assert mock_update.call_args_list == [call(2), call(4), call(6), call(8)]
 
     def test_update_frequency_1(self):
+        # [FUNCTION DOC]
+        # Checks update_freq 3 calls _update_bema_weights at steps 3, 6, 9.
+        # Setup: _update_bema_weights is patched with a mock on the callback instance; a plain Trainer with default args
+        # (3 epochs, batch size 8, 17 samples, 9 optimizer steps) trains with the callback attached.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: trains in self.tmp_dir.
         """Test that BEMA callback respects the update frequency."""
         training_args = TrainingArguments(output_dir=self.tmp_dir, report_to="none")
         bema_callback = BEMACallback(update_freq=3)
@@ -194,6 +251,11 @@ class TestBEMACallback(TrlTestCase):
             assert mock_update.call_args_list == [call(3), call(6), call(9)]
 
     def test_update_frequency_2(self):
+        # [FUNCTION DOC]
+        # Checks update_freq 2 with update_after 3 calls _update_bema_weights at steps 5, 7, 9.
+        # Setup: _update_bema_weights is patched with a mock on the callback instance; a plain Trainer with default args
+        # (3 epochs, batch size 8, 17 samples, 9 optimizer steps) trains with the callback attached.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: trains in self.tmp_dir.
         """Test that BEMA callback respects the update frequency."""
         training_args = TrainingArguments(output_dir=self.tmp_dir, report_to="none")
         bema_callback = BEMACallback(update_freq=2, update_after=3)
@@ -214,6 +276,11 @@ class TestBEMACallback(TrlTestCase):
             assert mock_update.call_args_list == [call(5), call(7), call(9)]
 
     def test_bias_power_zero(self):
+        # [FUNCTION DOC]
+        # Smoke test: training completes with BEMACallback(update_freq 2, bias_power 0.0).
+        # Setup: TrainingArguments with report_to none (default 3 epochs, batch size 8) and the callback attached to a
+        # plain Trainer on the language-modeling train split.
+        # Inputs/Outputs: none. Exceptions: any error fails. Side effects: trains in self.tmp_dir.
         """Test that BEMACallback works with bias_power=0.0 (maximum, undecayed bias-correction)."""
         training_args = TrainingArguments(output_dir=self.tmp_dir, report_to="none")
         bema_callback = BEMACallback(update_freq=2, bias_power=0.0)
@@ -227,6 +294,11 @@ class TestBEMACallback(TrlTestCase):
         trainer.train()
 
     def test_no_ema(self):
+        # [FUNCTION DOC]
+        # Smoke test: training completes with BEMACallback(update_freq 2, ema_power 0.0), i.e. no EMA component.
+        # Setup: TrainingArguments with report_to none (default 3 epochs, batch size 8) and the callback attached to a
+        # plain Trainer on the language-modeling train split.
+        # Inputs/Outputs: none. Exceptions: any error fails. Side effects: trains in self.tmp_dir.
         """Test that BEMACallback works without EMA updates."""
         training_args = TrainingArguments(output_dir=self.tmp_dir, report_to="none")
         bema_callback = BEMACallback(update_freq=2, ema_power=0.0)

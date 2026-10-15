@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Example training script: full SFT (continued pretraining on raw text) of Qwen/Qwen3-8B at 1,048,576-token sequence
+# length on one 8-GPU node using context parallelism (configured by the accompanying accelerate yaml), offloaded
+# gradient checkpointing and yarn RoPE scaling.
+# Contents: MODEL and SEQ_LEN constants, build_dataset and main.
+# Import-time side effects: raises RuntimeError if the installed transformers is older than 5.17.0.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,6 +65,13 @@ if Version(transformers.__version__) < Version("5.17.0"):
 
 
 def build_dataset(rows=4, chars_per_row=6_000_000):
+    # [FUNCTION DOC]
+    # HELPER: Builds a small text dataset of very long rows from streamed PG-19 books.
+    # Behavior: streams the emozilla/pg19 train split, appends each book's text to an accumulator, and whenever the
+    # accumulator reaches chars_per_row characters, emits it as a row and resets; stops after rows rows. Rows are later
+    # truncated by the trainer to max_length (no packing). A trailing partial accumulator is discarded.
+    # Inputs: rows (int, default 4), chars_per_row (int, default 6,000,000). Outputs: Dataset with a single text column.
+    # Exceptions: dataset streaming errors propagate. Side effects: network streaming.
     """Join PG-19 books into rows long enough to fill a million-token sequence.
 
     Books are far shorter than that, so they are concatenated and the trainer truncates to
@@ -79,6 +93,13 @@ def build_dataset(rows=4, chars_per_row=6_000_000):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Runs the example.
+    # Behavior: builds SFTConfig (output Qwen3-8B-1M, max_length SEQ_LEN, batch 1, log every step, no intermediate
+    # saves, pad to multiple of 16 for the context-parallel split, gradient checkpointing with offload, bf16, model init
+    # in bfloat16 with yarn rope parameters theta 1e6, factor 32, original max positions 32768); builds SFTTrainer with
+    # build_dataset output; trains, saves to output_dir, calls end. Nothing is pushed.
+    # Inputs: none. Outputs: none. Exceptions: propagated. Side effects: downloads, multi-GPU training, file writes.
     training_args = SFTConfig(
         output_dir="Qwen3-8B-1M",
         max_length=SEQ_LEN,

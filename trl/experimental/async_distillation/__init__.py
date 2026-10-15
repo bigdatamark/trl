@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Experimental asynchronous distillation package. Exports AsyncDistillationConfig and AsyncDistillationTrainer (eager
+# imports). Side effects on import: those of importing the trainer module (and trl.experimental's warning).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

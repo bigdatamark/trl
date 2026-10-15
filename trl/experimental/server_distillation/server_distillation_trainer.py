@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Module trl.experimental.server_distillation.server_distillation_trainer: on-policy distillation where the
+# teacher's per-token logprobs are fetched from an external vLLM server (VLLMClient.get_sequence_logprobs)
+# rather than computed by a local teacher model.
+# Main contents: module-level loss helpers _jsd_divergence and _add_tail_bucket (self-contained copies kept
+# until the path is migrated onto the base chunked loss), build_teacher_request_inputs (padded batch to
+# per-sample token lists), and ServerDistillationTrainer (subclass of DistillationTrainer overriding
+# compute_loss with sparse top-k / top-1 divergences).
+# Import-time side effects: none (VLLMClient and numpy are imported lazily).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,6 +36,18 @@ from .server_distillation_config import ServerDistillationConfig
 # `_reduce_divergence_loss` methods below). The base deletes these while migrating to the chunked loss, but this
 # quarantined server path still depends on them; it is re-pointed at the stable base wholesale later (issue #6449).
 def _jsd_divergence(student_log_probs, teacher_log_probs, beta, support_mask=None):
+    # [FUNCTION DOC]
+    # HELPER: Per-element generalized Jensen-Shannon divergence between two log-prob tensors (same shape).
+    # Behavior: beta 0 gives forward KL (teacher relative to student), beta 1 gives reverse KL (student relative to
+    # teacher), otherwise beta times KL(teacher, mixture) plus (1 - beta) times KL(student, mixture) where
+    # mixture = (1 - beta) student + beta teacher probabilities.
+    # With support_mask: masked-out positions have log-probs and probs replaced by zero, terms are computed
+    # manually as p times (log p - log q) and NaNs replaced by 0; mixture log is clamped at the dtype's tiny value.
+    # Without support_mask: uses F.kl_div with log_target, and the mixture log-probs are formed via logsumexp of
+    # student plus log(1 - beta) and teacher plus log(beta).
+    # Inputs: student_log_probs, teacher_log_probs (tensors), beta (float in [0, 1]), support_mask (optional bool
+    # tensor of same shape). Outputs: unreduced element-wise divergence tensor of the input shape.
+    # Exceptions: none explicit. Side effects: none.
     """Compute JSD (or forward/reverse KL) from log-probability tensors.
 
     When *support_mask* is not None, uses manual computation with masked positions zeroed. When None, uses
@@ -70,6 +92,13 @@ def _jsd_divergence(student_log_probs, teacher_log_probs, beta, support_mask=Non
 
 
 def _add_tail_bucket(log_probs, valid_mask):
+    # [FUNCTION DOC]
+    # HELPER: Append a tail bucket holding the remaining probability mass outside a top-k support.
+    # Behavior: logsumexp of log_probs over the last dim, clamped to at most -1e-7 so the sum is below 1; the
+    # tail log-prob is log(1 - exp(that)), computed stably via expm1. Concatenate the tail as a K+1-th element
+    # and extend valid_mask with an always-True column.
+    # Inputs: log_probs (..., K), valid_mask (..., K) bool. Outputs: tuple (log_probs (..., K+1), mask (..., K+1)).
+    # Exceptions: none. Side effects: none.
     """Append a (K+1)-th tail element: log(1 - sum(exp(top_k_logps))).
 
     This creates a proper probability distribution over K+1 elements, preventing trivial zero loss when top_k is small
@@ -88,6 +117,18 @@ def build_teacher_request_inputs(
     prompt_attention_mask: torch.Tensor | None = None,
     labels: torch.Tensor | None = None,
 ) -> tuple[list[list[int]], list[int], list[int]]:
+    # [FUNCTION DOC]
+    # Convert a padded batch into unpadded per-sample token lists for teacher-server requests.
+    # Behavior: require input_ids and attention_mask shapes to match. Move to CPU. Prompt lengths come from the
+    # sum of prompt_attention_mask per row if given; otherwise labels are required (same shape as input_ids) and
+    # prompt length = attended tokens minus label positions not equal to -100. For each row keep only tokens
+    # where attention_mask is set, validate 0 <= prompt length <= trimmed length, and record completion length as
+    # trimmed length minus prompt length.
+    # Inputs: input_ids (B, L), attention_mask (B, L), prompt_attention_mask (optional (B, P)), labels (optional
+    # (B, L) with -100 for ignored).
+    # Outputs: tuple (list of token-id lists, list of prompt lengths, list of completion lengths).
+    # Exceptions: ValueError on shape mismatches, missing labels when no prompt mask, or invalid prompt length.
+    # Side effects: none (device-to-host copies only).
     """Trim padded batch tensors into per-sample sequences for teacher-server requests."""
 
     if input_ids.shape != attention_mask.shape:
@@ -128,6 +169,13 @@ def build_teacher_request_inputs(
 
 
 class ServerDistillationTrainer(DistillationTrainer):
+    # [CLASS DOC]
+    # Distillation trainer whose teacher is a remote vLLM server. Inherits generation, student forward, buffering
+    # and metrics from DistillationTrainer; overrides compute_loss to rebuild an input_ids/attention_mask/labels
+    # layout, query the server for teacher top-k and actual-token logprobs, and compute either a sparse top-1
+    # generalized JSD (beta > 0) or a sparse top-k forward KL (beta 0), optionally with a tail bucket.
+    # State: teacher_client (VLLMClient), loss_top_k, loss_add_tail, reverse_kl_top_1_mode (copied from args);
+    # teacher_model is None. Class attributes _tag_names and _name feed the model card.
     """Distillation from a teacher hosted on an external vLLM server.
 
     Instead of running a local teacher forward pass, per-token teacher logprobs are fetched from a vLLM server via
@@ -151,6 +199,17 @@ class ServerDistillationTrainer(DistillationTrainer):
         quantization_config=None,
         peft_config=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: default args to ServerDistillationConfig with output_dir "tmp_server_distillation"; call the base
+        # constructor with teacher_model None and all other arguments forwarded; copy reverse_kl_top_1_mode,
+        # loss_top_k and loss_add_tail from args; create a VLLMClient for args.teacher_model_server_url with a 60
+        # second connection timeout.
+        # Inputs: model, args, train_dataset, eval_dataset, processing_class, callbacks, optimizers,
+        # quantization_config, peft_config (as for DistillationTrainer).
+        # Outputs: none.
+        # Exceptions: config validation errors; connection errors/timeouts from VLLMClient when the server is
+        # unreachable.
+        # Side effects: network health-check to the teacher server (performed by VLLMClient construction).
         if args is None:
             args = ServerDistillationConfig(output_dir="tmp_server_distillation")
 
@@ -179,6 +238,12 @@ class ServerDistillationTrainer(DistillationTrainer):
     def _get_reverse_kl_top_1_tokens(
         self, student_scores: torch.Tensor, completion_tokens: torch.Tensor
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Pick the token used as the reverse-KL top-1 support.
+        # Behavior: argmax of student_scores over the vocab when reverse_kl_top_1_mode is "argmax", else return
+        # completion_tokens unchanged.
+        # Inputs: student_scores (B, T, V), completion_tokens (B, T). Outputs: (B, T) token ids.
+        # Exceptions: none. Side effects: none.
         """Return the reverse-KL top-1 token IDs for the mixed top-1 loss path.
 
         Args:
@@ -200,6 +265,17 @@ class ServerDistillationTrainer(DistillationTrainer):
         labels: torch.Tensor,
         num_items_in_batch=None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Exact generalized JSD on a top-1 support (beta > 0 path).
+        # Behavior: if beta is 1 the support is just the reverse token with its teacher logprob. Otherwise the support
+        # has two slots: the teacher top-1 token and the reverse token; the second slot is masked when it equals the
+        # first (masked ids replaced by 0 for gathering). Gather student log-probs at the support, set masked slots to
+        # negative infinity for both distributions. With loss_add_tail append the tail bucket to both (mask extended);
+        # otherwise renormalize each over the support with logsumexp. Compute _jsd_divergence with self.beta and the
+        # mask, then reduce with _reduce_divergence_loss using batchmean over positions where labels are not -100.
+        # Inputs: student_log_probs (B, T, V), teacher_top1_token_ids (B, T), teacher_top1_logprobs (B, T),
+        # reverse_token_ids (B, T), reverse_teacher_logprobs (B, T), labels (B, T), num_items_in_batch (optional).
+        # Outputs: scalar loss tensor. Exceptions: none explicit. Side effects: none.
         """Compute exact generalized JSD/KL on top-1 support for the mixed beta>0 path."""
         neg_inf = torch.full((), float("-inf"), dtype=student_log_probs.dtype, device=student_log_probs.device)
 
@@ -238,6 +314,12 @@ class ServerDistillationTrainer(DistillationTrainer):
         )
 
     def _compute_prompt_length(self, inputs: dict[str, torch.Tensor | Any]) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Shared prompt boundary for the batch.
+        # Behavior: when labels exist return the minimum over rows of (attended length minus number of non -100
+        # labels), so every completion token lies after the boundary; otherwise return the width of inputs["prompts"].
+        # Inputs: inputs dict (attention_mask, labels or prompts). Outputs: int.
+        # Exceptions: KeyError if required keys are missing. Side effects: none.
         """Compute the earliest prompt boundary that still includes every completion token in the batch."""
         if inputs.get("labels") is not None:
             attention_mask = inputs["attention_mask"]
@@ -249,6 +331,15 @@ class ServerDistillationTrainer(DistillationTrainer):
 
     @staticmethod
     def _reduce_divergence_loss(jsd, completion_mask=None, reduction="batchmean", num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # HELPER (staticmethod): Reduce a per-token divergence tensor.
+        # Behavior: if completion_mask is given, select only masked-in elements (flattening). If num_items_in_batch is
+        # given, return sum divided by it (moved to the sum's device if a tensor). Else by reduction: "batchmean"
+        # divides the sum by the mask count clamped to at least 1 (or by the first-dim size, at least 1, without a
+        # mask); "sum" returns the sum; "mean" the mean; anything else returns the tensor unreduced.
+        # Inputs: jsd tensor, completion_mask (optional), reduction (default "batchmean"), num_items_in_batch
+        # (optional int or tensor). Outputs: scalar tensor (or the tensor for unknown reductions).
+        # Exceptions: none. Side effects: none.
         """Reduce a per-token divergence tensor over the valid completion tokens.
 
         When `num_items_in_batch` is provided (as under gradient accumulation), the divergence is reduced as `sum /
@@ -281,6 +372,20 @@ class ServerDistillationTrainer(DistillationTrainer):
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Behavior: build input_ids and attention_mask by concatenating prompt and completion along the sequence
+        # dim; build labels as -100 over the prompt and completion ids where completion_mask is set (else -100); add
+        # these plus prompt_attention_mask to a copy of inputs. Run the student forward. Compute the prompt boundary
+        # with _compute_prompt_length and slice labels/completion tokens after it. Fetch teacher logprobs from the
+        # server; take student logits from position prompt_length - 1 up to the second-to-last, divide by
+        # self.temperature and log-softmax. Trim completion tokens, labels and student log-probs to the teacher
+        # window width. Use the sparse top-1 loss when beta > 0, else the sparse forward-KL loss. In training mode
+        # divide by current_gradient_accumulation_steps (the base expects GA-scaled loss). num_items_in_batch is
+        # ignored.
+        # Inputs: model, inputs (prompt_ids, prompt_mask, completion_ids, completion_mask, ...), return_outputs,
+        # num_items_in_batch. Outputs: loss, or (loss, student_outputs) when return_outputs.
+        # Exceptions: ValueError from teacher alignment / missing teacher logprobs; network errors from the server.
+        # Side effects: HTTP request to the teacher server; profiling timing recorded via profiling_decorator.
         # Reconstruct the old `input_ids` / `attention_mask` / `labels` layout this server path is built on from GRPO's
         # keys, so it rides on the base's (evolving) generation. The teacher-server loss is migrated onto the stable
         # base wholesale later (issue #6449, item 58). The first four lines mirror `DistillationTrainer.compute_loss`.
@@ -349,6 +454,19 @@ class ServerDistillationTrainer(DistillationTrainer):
         inputs: dict[str, torch.Tensor | Any],
         aligned_prompt_length: int,
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Query the teacher server and align its logprobs to the student's completion coordinates.
+        # Behavior: build per-sample sequences with build_teacher_request_inputs; call
+        # teacher_client.get_sequence_logprobs with top_logprobs = loss_top_k and self.temperature. Require labels.
+        # For each sample, the offset is the index of the first non -100 label minus aligned_prompt_length (0 for empty
+        # completions). The output width is the max over samples of offset plus number of returned positions (0 if
+        # none). Fill numpy arrays with defaults (negative infinity for logprobs, 0 for token ids), write each sample's
+        # values starting at its offset, and convert to tensors on the input device.
+        # Inputs: inputs (input_ids, attention_mask, prompt_attention_mask, labels), aligned_prompt_length (int).
+        # Outputs: dict with actual_logprobs (B, T) float32, topk_logprobs (B, T, K) float32, topk_token_ids
+        # (B, T, K) int64, K = loss_top_k.
+        # Exceptions: ValueError when labels are missing or from request building; server/HTTP errors.
+        # Side effects: network request to the teacher server.
         """Fetch per-token teacher logprobs from an external vLLM server.
 
         Returns a dict with:
@@ -412,6 +530,10 @@ class ServerDistillationTrainer(DistillationTrainer):
 
         # actual_logprobs: (B, T) - teacher logprob for the actual token
         def _actual_to_tensor(key):
+            # [FUNCTION DOC]
+            # HELPER: Build the (B, T) actual-token teacher logprob tensor from result[key], whose per-sample entries are
+            # lists of single-element lists; uses the first column. Missing positions stay negative infinity.
+            # Inputs: key (str). Outputs: float32 tensor on the input device. Exceptions: none. Side effects: none.
             arr = np.full((batch_size, completion_length), float("-inf"), dtype=np.float32)
             for i, (offset, seq_lps) in enumerate(zip(completion_offsets, result[key], strict=True)):
                 if seq_lps:
@@ -421,6 +543,11 @@ class ServerDistillationTrainer(DistillationTrainer):
 
         # topk: (B, T, K)
         def _topk_to_tensor(key, k, np_dtype, fill):
+            # [FUNCTION DOC]
+            # HELPER: Build a (B, T, k) tensor from per-sample (len, k) lists in result[key], placed at each sample's
+            # offset, other positions set to fill.
+            # Inputs: key (str), k (int), np_dtype, fill value. Outputs: tensor on the input device.
+            # Exceptions: numpy shape errors if a sample has a width other than k. Side effects: none.
             arr = np.full((batch_size, completion_length, k), fill, dtype=np_dtype)
             for i, (offset, seq_vals) in enumerate(zip(completion_offsets, result[key], strict=True)):
                 if seq_vals:
@@ -441,6 +568,17 @@ class ServerDistillationTrainer(DistillationTrainer):
         completion_tokens: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Server-backed top-1 loss for beta > 0.
+        # Behavior: required positions are those with labels not -100. Raise if any required position lacks a finite
+        # actual-token teacher logprob; when beta < 1 also raise if any lacks a finite teacher top-1 logprob. Replace
+        # teacher logprobs at non-required positions with 0 to avoid infinities in backward. Choose reverse tokens
+        # via _get_reverse_kl_top_1_tokens, then delegate to _compute_sparse_top_1_divergence_loss with the squeezed
+        # top-1 ids/logprobs (num_items_in_batch not passed, so batchmean normalization).
+        # KNOWN ISSUE: the inline comment says the code guards explicitly against non-"sampled" modes, but no guard
+        # exists; it relies solely on config validation, and "argmax" would be honored if validation were relaxed.
+        # Inputs: teacher_result dict, student_log_probs (B, T, V), completion_tokens (B, T), labels (B, T).
+        # Outputs: scalar loss. Exceptions: ValueError for missing teacher logprobs. Side effects: none.
         """Compute exact sparse top-1 generalized JSD/KL from server-provided teacher logprobs.
 
         Args:
@@ -503,6 +641,14 @@ class ServerDistillationTrainer(DistillationTrainer):
         student_log_probs: torch.Tensor,
         labels: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Sparse forward KL over the teacher's top-k support (beta 0 path).
+        # Behavior: valid slots are those with teacher logprob greater than negative infinity; gather student
+        # log-probs at teacher top-k ids; set invalid slots to negative infinity in both. With loss_add_tail append
+        # the tail bucket (mask extended), else renormalize both over the support. Compute _jsd_divergence with beta
+        # 0 and the mask, and reduce with batchmean over non -100 labels.
+        # Inputs: teacher_result (topk_logprobs, topk_token_ids), student_log_probs (B, T, V), labels (B, T).
+        # Outputs: scalar loss. Exceptions: none explicit. Side effects: none.
         """Compute sparse forward KL from server-provided teacher top-k logprobs (beta==0 path).
 
         Args:

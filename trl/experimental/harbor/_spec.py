@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# User-facing spec object wiring a Harbor task suite into GRPOTrainer (dataset, environment factory, reward).
+# Main contents: HarborSpec plus private helpers _outcome_reward_func (default reward), _resolve_agent (harness
+# selector resolution) and _read_task_meta (task.toml metadata extraction).
+# Import-time side effects: none (datasets, huggingface_hub and importlib are imported lazily).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +58,14 @@ from ._env import AGENTS, HarborEnv
 
 
 def _outcome_reward_func(environments=None, environment_reward=None, **_) -> list[float]:
+    # [FUNCTION DOC]
+    # HELPER: Default reward function returning one float per rollout.
+    # Behavior: if environment_reward is given (AsyncGRPOTrainer path), converts each value to float; otherwise reads the
+    # reward property of each live env in environments (GRPOTrainer path), triggering verification.
+    # Inputs: environments (list of HarborEnv or None), environment_reward (list or None), other kwargs ignored.
+    # Outputs: list of float.
+    # Exceptions: TypeError if both are None.
+    # Side effects: may run verifiers.
     """Default reward: the Harbor verifier's scalar per rollout.
 
     `GRPOTrainer` passes the live env instances as `environments=` (read `env.reward`); `AsyncGRPOTrainer` runs envs in
@@ -64,6 +78,16 @@ def _outcome_reward_func(environments=None, environment_reward=None, **_) -> lis
 
 
 def _resolve_agent(agent: str | type[HarborEnv]) -> type[HarborEnv]:
+    # [FUNCTION DOC]
+    # HELPER: Resolves the agent selector to a HarborEnv subclass.
+    # Behavior: a class is used directly; a key of AGENTS maps to the registered class; a string containing ":" is split
+    # at the last colon into target and class name: targets ending in ".py" or containing the OS path separator are loaded
+    # as a module from file, otherwise imported as a dotted module; the class is then fetched by attribute. The result must
+    # be a HarborEnv subclass.
+    # Inputs: agent (str or class). Outputs: HarborEnv subclass.
+    # Exceptions: ValueError for unknown strings without ":"; TypeError if the result is not a HarborEnv subclass;
+    # import/attribute errors from loading.
+    # Side effects: may import or execute a user module.
     """Resolve the `agent=` selector to a `HarborEnv` subclass.
 
     Accepts a `HarborEnv` subclass, a built-in name (`"bash"`), a module import path (`"pkg.module:Class"`), or a file
@@ -96,6 +120,11 @@ def _resolve_agent(agent: str | type[HarborEnv]) -> type[HarborEnv]:
 
 
 def _read_task_meta(task_dir: Path) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Reads the metadata table of a task's task.toml.
+    # Behavior: parses task.toml (any failure returns an empty dict) and returns gold_answer, reward_mode (from
+    # reward_mode_initial), difficulty_level and kaggle_dataset (from kaggle_dataset_name), None for missing keys.
+    # Inputs: task_dir (Path). Outputs: dict. Exceptions: none. Side effects: file read.
     """Pull a few useful fields out of ``task.toml`` for the dataset rows / reward funcs."""
     try:
         cfg = tomllib.loads((task_dir / "task.toml").read_text())
@@ -111,6 +140,10 @@ def _read_task_meta(task_dir: Path) -> dict[str, Any]:
 
 
 class HarborSpec:
+    # [CLASS DOC]
+    # Single object exposing train_dataset, environment_factory and reward_funcs for GRPOTrainer.
+    # State: _dataset (HF repo id or local path), _environment_type, _num_tasks, _indices, _include_metadata, _env_cls
+    # (resolved harness class). Task directories are resolved lazily and cached.
     """Single spec object that wires a Harbor task suite into a TRL trainer.
 
     Args:
@@ -144,6 +177,14 @@ class HarborSpec:
         indices: list[int] | None = None,
         include_metadata: bool = True,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: validates that num_tasks and indices are not both set, stores options, and resolves the agent class
+        # eagerly.
+        # Inputs: dataset (str), keyword-only agent (default "bash"), environment_type (default "docker"), num_tasks,
+        # indices, include_metadata (default True).
+        # Outputs: none.
+        # Exceptions: ValueError on conflicting selectors; errors from _resolve_agent.
+        # Side effects: may import user modules.
         if num_tasks is not None and indices is not None:
             raise ValueError("Provide num_tasks or indices, not both.")
         self._dataset = dataset
@@ -157,6 +198,14 @@ class HarborSpec:
 
     @cached_property
     def _task_dirs(self) -> list[Path]:
+        # [FUNCTION DOC]
+        # HELPER: Cached property resolving the suite to a sorted list of task directories.
+        # Behavior: root is dataset/tasks if it is a directory, else the dataset path itself if it has child dirs containing
+        # task.toml, else a snapshot download of the HF dataset repo restricted to tasks/** with root at its tasks folder.
+        # Collects sorted parents of every child task.toml, then selects by indices or truncates to num_tasks.
+        # Inputs: none. Outputs: list of Path.
+        # Exceptions: ValueError if no tasks are found; IndexError for out-of-range indices; download errors.
+        # Side effects: may download from the Hub (cached).
         """Resolve the dataset to a sorted list of local task directories (downloading if needed)."""
         local = Path(self._dataset)
         if (local / "tasks").is_dir():
@@ -180,6 +229,12 @@ class HarborSpec:
 
     @cached_property
     def train_dataset(self):
+        # [FUNCTION DOC]
+        # Behavior: cached property building a datasets Dataset with columns prompt (one empty user message per task),
+        # task_dir (string path), task_index (the given indices or 0..n-1), and, if include_metadata, gold_answer,
+        # reward_mode, difficulty_level and kaggle_dataset from task.toml.
+        # Inputs: none. Outputs: Dataset.
+        # Exceptions: those of _task_dirs. Side effects: file reads, possible download.
         """A `datasets.Dataset` of tasks. Plugs into TRL's `train_dataset=`.
 
         Columns: `prompt` (empty user message — TRL appends the env's instruction from `reset`), `task_dir` (passed to
@@ -202,6 +257,11 @@ class HarborSpec:
 
     @cached_property
     def environment_factory(self) -> Callable[[], HarborEnv]:
+        # [FUNCTION DOC]
+        # Behavior: cached property returning a picklable partial of the harness class bound to environment_type, so each
+        # call creates a fresh env.
+        # Inputs: none. Outputs: zero-argument callable returning a HarborEnv.
+        # Exceptions: none. Side effects: none.
         """Zero-arg callable returning a fresh harness env. Plugs into TRL's `environment_factory=`.
 
         Returns a `functools.partial` (not a closure) so it stays picklable — `AsyncGRPOTrainer` runs its rollout
@@ -211,5 +271,8 @@ class HarborSpec:
 
     @property
     def reward_funcs(self) -> Callable[..., list[float]]:
+        # [FUNCTION DOC]
+        # Behavior: property returning _outcome_reward_func.
+        # Inputs: none. Outputs: callable. Exceptions: none. Side effects: none.
         """Default outcome reward (Harbor verifier scalar). Plugs into TRL's `reward_funcs=`."""
         return _outcome_reward_func

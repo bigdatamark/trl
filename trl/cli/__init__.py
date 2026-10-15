@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# The trl command-line interface package. Exports main (the entry point behind the "trl" console script).
+# Submodules: main (parser + dispatch), commands (subcommand classes), accelerate_config and accelerate_launcher
+# (helpers for launching training scripts through accelerate).
+# Side effects on import: imports trl.cli.main and the command classes; heavy script modules are imported only when a
+# command runs.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

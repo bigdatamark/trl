@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental ORPO trainer. Defines ORPOConfig, a _BaseConfig (TrainingArguments
+# subclass) with ORPO-specific fields. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +24,13 @@ from ...trainer.base_config import _BaseConfig
 
 @dataclass
 class ORPOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass of ORPO hyperparameters consumed by ORPOTrainer.
+    # Fields: max_length (1024), max_completion_length (None), beta (0.1, weight of the odds-ratio term, lambda in the
+    # paper), disable_dropout (True), padding_value (None means tokenizer pad id), generate_during_eval (False),
+    # is_encoder_decoder (needed with model_init), model_init_kwargs (also accepted as JSON string via _VALID_DICT_FIELDS),
+    # trust_remote_code (False), dataset_num_proc. Overrides learning_rate to 1e-6; other overridden defaults come from
+    # _BaseConfig. No custom __post_init__.
     r"""
     Configuration class for the [`experimental.orpo.ORPOTrainer`].
 

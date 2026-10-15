@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Example training script: full SFT of google/gemma-3-12b-it on open-r1/codeforces-cots with hard-coded settings.
+# Contents: main. Importing has no side effects; running the file calls main.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,6 +38,14 @@ from trl import SFTConfig, SFTTrainer
 
 
 def main():
+    # [FUNCTION DOC]
+    # Runs the example end to end.
+    # Behavior: loads the train split and removes the prompt column (training uses the messages column); loads the model
+    # with AutoModelForImageTextToText using eager attention and hub kernels; builds SFTConfig (output dir derived from
+    # the model id, bf16, max length 8192, batch size 1, gradient accumulation 8, 32 dataset processes, 1 epoch);
+    # trains with SFTTrainer, pushes to the Hub (always) and calls end. The model is not explicitly saved to disk.
+    # Inputs: none. Outputs: none. Exceptions: propagated from loading, training and Hub upload.
+    # Side effects: downloads, GPU training, checkpoint writes, Hub upload.
     # Load dataset
     train_dataset = load_dataset("open-r1/codeforces-cots", split="train")
     train_dataset = train_dataset.remove_columns("prompt")

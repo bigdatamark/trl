@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Script that builds a tiny randomly initialized DeepseekV3ForCausalLM mirroring deepseek-ai/DeepSeek-R1 and pushes it to trl-internal-testing/tiny-DeepseekV3ForCausalLM.
+# Behavior (all at import time, run as a module): checks the transformers floor from pyproject.toml is installed exactly, seeds RNGs, loads the reference AutoTokenizer and GenerationConfig,
+# builds a scaled-down config (mostly 2 layers, hidden size 8-16, intermediate size 32), instantiates the model in bfloat16, re-initializes weights via init_weights_tiny_model,
+# runs smoke_test, check_dtype_pattern and print_config_diff against the reference, then calls push_to_hub.
+# Details: Config uses 2 attention heads and 2 key/value heads (MLA requires them equal), a yarn rope_scaling block copied from the reference, sigmoid scoring with noaux_tc top-k routing and one next-token-prediction layer.
+# Inputs: CLI flags --create-pr / --full-diff (parsed by _common). Outputs: none returned.
+# Exceptions: RuntimeError on transformers version mismatch or failed smoke test; Hub/network errors propagate.
+# Side effects: downloads reference tokenizer/config from the Hub, prints diagnostics, creates/updates a Hub repo (or skips if it exists).
+#
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

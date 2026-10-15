@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Experimental Online DPO trainer (paper 2402.04792, "Direct Language Model Alignment from Online AI Feedback").
+# Contents: the RewardFunc type alias (model id string, PreTrainedModel, or callable returning a list of floats/None)
+# and OnlineDPOTrainer, which for each batch samples two completions per prompt from the current policy (transformers
+# generate or vLLM in server/colocate mode), scores them with reward functions, picks the higher-scored one as chosen,
+# and applies a sigmoid (DPO) or IPO loss against a reference model.
+# Import-time side effects: conditionally imports nested_gather (transformers >= 5.2.0), bitsandbytes, peft, SageMaker MP
+# version flag (IS_SAGEMAKER_MP_POST_1_10), and vLLM classes when available; creates an accelerate logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -101,6 +110,17 @@ RewardFunc = str | PreTrainedModel | Callable[..., list[float | None]]
 
 
 class OnlineDPOTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer subclass (via _BaseTrainer) implementing online DPO with on-the-fly generation and reward scoring.
+    # Key state: ref_model (copy of the policy, or None with PEFT where the adapter is disabled instead), reward_funcs and
+    # reward_processing_classes, reward_weights tensor, reward_func_names, stats (dict of metric lists accumulated per step
+    # and averaged at log time), generation settings (num_generations fixed to 2, temperature, top_p/top_k/min_p,
+    # repetition_penalty), eos_token_ids, vision token ids/strings for VLMs, generation_config (SamplingParams for vLLM or
+    # GenerationConfig otherwise), vllm_client or llm, _last_loaded_step, and _beta (float or per-epoch list).
+    # Flow: __init__ prepares models/tokenizers/vLLM; training_step generates (_generate or _generate_vllm), computes
+    # policy/reference log-probs (_forward), rewards (_calculate_rewards_from_functions), the loss and stats, and backprops;
+    # _move_model_to_vllm and helpers sync weights to vLLM; _maybe_log_save_evaluate logs averaged stats;
+    # _save_checkpoint also writes a model card. Model card metadata in _tag_names, _name and _paper.
     r"""
     Initialize OnlineDPOTrainer.
 
@@ -191,6 +211,46 @@ class OnlineDPOTrainer(_BaseTrainer):
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Builds the trainer: validates inputs, loads models and reward functions, configures generation and vLLM.
+        # Steps:
+        # 1. Requires train_dataset, reward_funcs and processing_class; rejects ref_model identical to model.
+        # 2. Wraps reward_funcs in a list; string entries are loaded as single-label AutoModelForSequenceClassification with
+        # model_init_kwargs (trust_remote_code defaulted from args), remembering the revision; records names (model id tail for
+        # modules, callable name otherwise).
+        # 3. Normalizes reward_processing_classes to a list (length must match); for PreTrainedModel rewards, loads the
+        # tokenizer from the model path if missing, sets pad to eos if absent, and mirrors the pad id onto the reward config.
+        # 4. reward_weights from args (length must match) else all ones.
+        # 5. Seeds, then loads the policy from a string with dtype resolution ("auto"/None/torch dtype/string name) and
+        # device_map default "auto"; rejects model_init_kwargs for an already-instantiated model. Records is_encoder_decoder and
+        # is_vision_model (model type in the image-text-to-text mapping).
+        # 6. Validates peft_config type and wraps with prepare_peft_model when given or already PEFT; enables gradient
+        # checkpointing; optionally disables dropout on model and ref model.
+        # 7. Reference model: copied from the policy without PEFT, None with PEFT, or the provided one set to eval. Reward
+        # models set to eval.
+        # 8. Initializes stats keys (kl, entropy, non_score_reward, chosen/rejected rewards, accuracies, margins, logps,
+        # contain_eos_token, beta, plus rlhf_reward, scores_margin, scores).
+        # 9. Extracts the tokenizer from a processor, sets pad to eos if missing, mirrors pad id onto model config and
+        # generation config, builds eos_token_ids (model's generation eos ids plus tokenizer eos first if absent), reads vision
+        # token ids and decodes the image token string.
+        # 10. Default collator DPODataCollatorWithPadding; for transformers < 5.0 sets use_reentrant False by default.
+        # 11. Calls the parent constructor, adds model tags, stores _beta.
+        # 12. vLLM: server mode creates a VLLMClient on the main process (base URL or host/port) and initializes the NCCL
+        # communicator on the current accelerator device; colocate mode detects 4-bit bitsandbytes (8-bit raises), sets
+        # RANK/LOCAL_RANK/WORLD_SIZE and master addr/port env vars, builds an LLM (external_launcher, max_model_len max_length
+        # plus max_new_tokens, max_num_batched_tokens 4096, per-TP-group seed) and optionally puts it to sleep. Builds
+        # SamplingParams (n 2, detokenize off, generation_kwargs merged, structured outputs regex taking precedence over a
+        # structured_outputs entry, dict converted to StructuredOutputsParams); waits for all processes.
+        # Without vLLM, builds a GenerationConfig (sampling, eos ids, cache unless gradient checkpointing, min_p if set,
+        # generation_kwargs merged, None values dropped) and keeps generation_kwargs.
+        # 13. Prepares ref model and reward models with DeepSpeed, FSDP or accelerate (eval mode).
+        # Inputs: see the class docstring. Outputs: none.
+        # Exceptions: ValueError (missing/invalid arguments, mismatched lengths, bad dtype, 8-bit with vLLM, bad vllm_mode),
+        # ImportError (peft or vLLM missing), TypeError (bad peft_config or processing_class).
+        # Side effects: model downloads, env var mutation, vLLM engine/server connection, mutation of args and model configs.
+        # KNOWN ISSUE: args.model_init_kwargs and args.reward_weights are read before the "args must be provided" check, so a
+        # None args raises AttributeError instead of the intended ValueError. The model_init_kwargs dict from args is mutated
+        # in place (trust_remote_code, dtype, device_map).
         if train_dataset is None:
             raise ValueError("`train_dataset` is required")
 
@@ -592,6 +652,12 @@ class OnlineDPOTrainer(_BaseTrainer):
 
     @property
     def beta(self):
+        # [FUNCTION DOC]
+        # Current beta value. If _beta is a list, returns the entry indexed by the current epoch, or the last entry once the
+        # epoch exceeds the list length; otherwise returns the float.
+        # Inputs: none. Outputs: float. Exceptions: none expected. Side effects: none.
+        # KNOWN ISSUE: state.epoch is a float (fractional epochs), so indexing the list with it raises TypeError; it should be
+        # converted to an integer epoch.
         if isinstance(self._beta, list):
             epoch = self.state.epoch
             return self._beta[epoch] if epoch < len(self._beta) else self._beta[-1]
@@ -600,6 +666,14 @@ class OnlineDPOTrainer(_BaseTrainer):
 
     @staticmethod
     def tokenize_row(feature, is_encoder_decoder: bool, tokenizer: PreTrainedTokenizerBase) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Static helper tokenizing the prompt of one DPO-style row.
+        # Behavior: decoder-only: tokenizes without special tokens and prepends BOS (to ids and mask) if the tokenizer has one
+        # and the prompt does not already start with it; encoder-decoder: tokenizes with special tokens. Prefixes every key with
+        # "prompt_".
+        # Inputs: feature (dict with "prompt"), is_encoder_decoder, tokenizer.
+        # Outputs: dict such as prompt_input_ids and prompt_attention_mask.
+        # Exceptions: KeyError if "prompt" missing. Side effects: none.
         """Tokenize a single row from a DPO specific dataset."""
         if not is_encoder_decoder:
             batch = tokenizer(feature["prompt"], add_special_tokens=False)
@@ -615,6 +689,11 @@ class OnlineDPOTrainer(_BaseTrainer):
         return batch
 
     def _enable_gradient_checkpointing(self, model: PreTrainedModel, args: OnlineDPOConfig) -> PreTrainedModel:
+        # [FUNCTION DOC]
+        # HELPER: Turns on gradient checkpointing.
+        # Behavior: disables use_cache on the config, enables checkpointing on the base model for PEFT models or the model
+        # itself otherwise, then enables input require-grads so checkpointing works with frozen embeddings.
+        # Inputs: model, args (unused). Outputs: the same model. Exceptions: none. Side effects: mutates the model.
         """Enables gradient checkpointing for the model."""
         # Ensure use_cache is disabled
         model.config.use_cache = False
@@ -630,6 +709,17 @@ class OnlineDPOTrainer(_BaseTrainer):
         return model
 
     def _generate_vllm(self, prompts, images=None):
+        # [FUNCTION DOC]
+        # HELPER: Generates two completions per prompt with vLLM and returns padded tensors.
+        # Behavior: dispatches to server or colocate helper (both return lists in block layout: all prompts' first completion,
+        # then all second completions). Left-pads prompt ids to the longest prompt with pad id and builds a left-padded mask;
+        # completion mask is ones over the generated length then zeros up to max_tokens; appends the first eos id to completions
+        # that did not end with an eos and are shorter than max_tokens; right-pads completions to max_tokens.
+        # Inputs: prompts (list of strings or conversations), images (optional list).
+        # Outputs: prompt_ids, prompt_mask, completion_ids, completion_mask tensors on the accelerator device;
+        # shapes (2B, P) and (2B, max_tokens).
+        # Exceptions: IndexError if a completion is empty (its last token is read). Side effects: those of the helpers.
+        # KNOWN ISSUE: the completion mask is computed before the eos is appended, so the appended eos token is masked out.
         pad_token_id = self._tokenizer.pad_token_id
 
         # Generate completion_ids and prompt_ids based on mode
@@ -659,6 +749,17 @@ class OnlineDPOTrainer(_BaseTrainer):
         return prompt_ids, prompt_mask, completion_ids, completion_mask
 
     def _generate_vllm_server(self, prompts, images=None):
+        # [FUNCTION DOC]
+        # HELPER: Generates completions through a remote vLLM server.
+        # Behavior: pushes weights to the server when global_step changed since the last load (or on first call); applies the
+        # chat template for conversational prompts; gathers all prompts (and, with images, multimodal messages with the image
+        # inlined) across processes; on the main process calls the client's chat or generate with n 2 and sampling settings
+        # (top_k None mapped to -1, min_p None to 0.0, structured regex, generation_kwargs); others hold placeholders.
+        # Broadcasts results, keeps this process's slice (2 per local prompt), reorders from interleaved to block layout, and
+        # tokenizes prompts locally (left padded, no special tokens) duplicated twice.
+        # Inputs: prompts, images (optional).
+        # Outputs: (completion_ids list of lists, prompt_ids list of lists).
+        # Exceptions: client/network errors. Side effects: weight sync, cross-process communication, HTTP requests.
         """Generate completions using vLLM server mode"""
         has_images = images is not None
 
@@ -733,6 +834,15 @@ class OnlineDPOTrainer(_BaseTrainer):
         return completion_ids, prompt_ids
 
     def _generate_vllm_colocate(self, prompts, images=None):
+        # [FUNCTION DOC]
+        # HELPER: Generates completions with the in-process vLLM engine.
+        # Behavior: with sleep mode, empties cache and wakes weights; syncs weights when global_step changed; applies the chat
+        # template when conversational; builds vLLM inputs (dict with multi_modal_data image when an image is present); wakes
+        # the KV cache if sleeping; generates with generation_config; collects completions in block layout (all first outputs,
+        # then all second outputs) and prompt token ids duplicated in the same layout; sleeps the engine again if enabled.
+        # Inputs: prompts, images (optional).
+        # Outputs: (completion_ids, prompt_ids) as lists of lists of ints.
+        # Exceptions: vLLM errors. Side effects: GPU memory changes, weight loading into vLLM.
         """Generate completions using vLLM colocate mode"""
         if self.args.vllm_enable_sleep_mode:
             # wake up colocated vLLM instances if needed
@@ -774,6 +884,13 @@ class OnlineDPOTrainer(_BaseTrainer):
         return completion_ids, prompt_ids
 
     def _sync_fsdp2_params_to_vllm(self, module: nn.Module):
+        # [FUNCTION DOC]
+        # HELPER: Pushes FSDP2 parameters to vLLM.
+        # Behavior: for each named parameter, strips PEFT prefixes ("base_model.model." and ".base_layer"), skips adapter
+        # parameters (PEFT prefix in name) and "original_module" copies, cleans the name (also removing
+        # "modules_to_save.default."), moves CPU params to the device, materializes the full tensor, then sends it to the server
+        # (main process) or loads it into the colocated model.
+        # Inputs: module. Outputs: none. Exceptions: communication errors. Side effects: updates vLLM weights.
         # For FSDP2, module.named_parameters() covers all parameters and yields tied weights once, as vLLM requires
         for name, param in module.named_parameters():
             # When using PEFT, we need to recover the original parameter name
@@ -797,6 +914,12 @@ class OnlineDPOTrainer(_BaseTrainer):
                 llm_model.load_weights([(name, param)])
 
     def _move_model_to_vllm(self):
+        # [FUNCTION DOC]
+        # HELPER: Syncs current policy weights to vLLM and resets its prefix cache.
+        # Behavior: on the server main process wraps the inner sync in the client's weight_update context (one update per
+        # model); otherwise calls the inner sync directly (other ranks participate in gathers). Then resets the prefix cache on
+        # the server (main process) or colocated engine.
+        # Inputs: none. Outputs: none. Side effects: network/GPU weight transfers.
         if self.vllm_mode == "server" and self.accelerator.is_main_process:
             # Announce one weight update for the whole model: the server prepares and finalizes it once, rather than
             # once per tensor pushed below. Only the main process holds a client; the other ranks only take part in
@@ -813,6 +936,14 @@ class OnlineDPOTrainer(_BaseTrainer):
             self.llm.reset_prefix_cache()
 
     def _move_model_to_vllm_inner(self):
+        # [FUNCTION DOC]
+        # HELPER: Performs the parameter transfer for _move_model_to_vllm.
+        # Behavior: uses DeepSpeed GatheredParameters under ZeRO-3, else a no-op context. PEFT models: gather all parameters,
+        # merge adapters, then sync via FSDP1 traversal, FSDP2 helper, or a loop that cleans names, skips adapter and
+        # original_module params and sends data; finally unmerge adapters. Non-PEFT: FSDP1/FSDP2 helpers when FSDP is enabled,
+        # else per-parameter gather and send (server main process) or load into the colocated model.
+        # Inputs: none. Outputs: none.
+        # Side effects: temporary adapter merge, weight transfers.
         # For DeepSpeed ZeRO-3 and FSDP, we need to gather all parameters before operations
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
         zero_stage_3 = deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3
@@ -883,6 +1014,13 @@ class OnlineDPOTrainer(_BaseTrainer):
                             llm_model.load_weights([(name, param.data)])
 
     def _sync_fsdp1_params_to_vllm(self, module: nn.Module, prefix: str = "", visited=None):
+        # [FUNCTION DOC]
+        # HELPER: Memory-efficient post-order traversal syncing FSDP1-wrapped parameters to vLLM.
+        # Behavior: recurses into children first (building dotted prefixes), then for FSDP modules summons full params
+        # (non-recursive, no writeback) and sends each parameter with cleaned name (removing "_fsdp_wrapped_module."), skipping
+        # names already in visited.
+        # Inputs: module, prefix (default ""), visited (set shared across recursion; created if None).
+        # Outputs: none. Side effects: updates vLLM weights; mutates visited.
         """Memory-efficient post-order traversal of FSDP modules to extract full parameters and sync with vLLM."""
         # For FSDP1, we need to recurse into children and also use summon_full_params
         if visited is None:
@@ -910,6 +1048,10 @@ class OnlineDPOTrainer(_BaseTrainer):
                         llm_model.load_weights([(full_name, param.data)])
 
     def _fix_param_name_to_vllm(self, name, extra_prefixes: list[str] | None = None):
+        # [FUNCTION DOC]
+        # HELPER: Removes wrapper prefixes from a parameter name: always "_checkpoint_wrapped_module.", plus any extra_prefixes,
+        # by substring removal anywhere in the name.
+        # Inputs: name, extra_prefixes (optional list). Outputs: cleaned name. Exceptions: none. Side effects: none.
         """Clean parameter names for vLLM compatibility"""
         extra_prefixes = extra_prefixes or []
         prefixes = ["_checkpoint_wrapped_module."] + extra_prefixes
@@ -920,6 +1062,13 @@ class OnlineDPOTrainer(_BaseTrainer):
     def process_vision_row(
         self, features: dict[str, list | torch.Tensor], processing_class=None
     ) -> dict[str, list[int]]:
+        # [FUNCTION DOC]
+        # Processes one vision row with the processor (given or self.processing_class): single image plus prompt text, no
+        # special tokens.
+        # Outputs: dict with prompt_input_ids, prompt_attention_mask, and pixel_values, pixel_attention_mask, image_sizes
+        # when the processor produced them (first element of each).
+        # Inputs: features (needs "image" and "prompt"), processing_class (optional).
+        # Exceptions: KeyError on missing fields. Side effects: none.
         """
         Process a vision row for VLM models (adapted from DPO trainer)
         """
@@ -945,6 +1094,19 @@ class OnlineDPOTrainer(_BaseTrainer):
         return output
 
     def _generate(self, model, prompts, images=None):
+        # [FUNCTION DOC]
+        # HELPER: Generates two completions per prompt with transformers generate.
+        # Behavior: builds input dicts (with image when given) and applies the chat template if conversational. For VLMs with
+        # an image token: if the chat template contains the image token, collapses runs of repeated image tokens to one;
+        # otherwise removes image token runs (followed by the vision-end token if known). Tokenizes with the processing class
+        # (left padding, no special tokens, images as single-image lists), moves to the model device, casts pixel_values to the
+        # model dtype (also checking a wrapped module). Repeats prompt ids and mask twice along the batch (block layout) and
+        # duplicates vision inputs. Generates under profiling, unwrap_model_for_generation (ZeRO-3 gather setting and
+        # generation_kwargs override), no_grad and FSDP full params when FSDP is enabled; applies cache_implementation if set.
+        # Slices off prompt tokens and truncates completions after the first eos with truncate_right (pad after).
+        # Inputs: model, prompts, images (optional).
+        # Outputs: prompt_ids, prompt_mask, completion_ids, completion_mask, vision kwargs dict or None.
+        # Exceptions: generation errors. Side effects: none beyond compute.
         """Generate completions using the model"""
         device = next(model.parameters()).device
         pad_token_id = self._tokenizer.pad_token_id
@@ -1056,6 +1218,15 @@ class OnlineDPOTrainer(_BaseTrainer):
         return prompt_ids, prompt_mask, completion_ids, completion_mask, vision_generation_kwargs or None
 
     def _calculate_rewards_from_functions(self, prompts, completions, completion_ids_list, **reward_kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Computes weighted total rewards per completion.
+        # Behavior: adds trainer_state to reward_kwargs. For model rewards: conversational inputs are prompt plus completion
+        # messages rendered with the reward tokenizer's chat template, otherwise string concatenation; tokenized right-padded,
+        # and the first logit column is the reward (inference mode). For callables: called with prompts, completions,
+        # completion_ids and the kwargs; None becomes NaN. Multiplies by reward_weights and sums ignoring NaN.
+        # Inputs: prompts, completions, completion_ids_list, reward_kwargs (extra dataset columns).
+        # Outputs: tensor of shape (number of completions,).
+        # Exceptions: errors from reward functions. Side effects: none.
         """
         Calculate rewards using reward functions
         """
@@ -1102,6 +1273,15 @@ class OnlineDPOTrainer(_BaseTrainer):
         return total_rewards
 
     def _forward(self, model, prompt_ids, prompt_mask, completion_ids, completion_mask, vision_inputs=None):
+        # [FUNCTION DOC]
+        # HELPER: Per-token log-probabilities of completion tokens under a model.
+        # Behavior: without vision inputs, truncates prompt from the left so prompt plus completion fits max_length; concatenates
+        # prompt and completion ids and masks; forwards with attention mask and any vision inputs; takes logits from the last
+        # prompt position to the second-to-last position (all logits if prompt empty), applies log-softmax and gathers the
+        # log-prob of each completion token.
+        # Inputs: model, prompt_ids, prompt_mask, completion_ids, completion_mask, vision_inputs (optional dict).
+        # Outputs: tensor (batch, completion_length) of log-probs.
+        # Exceptions: none specific. Side effects: none.
         # Truncate left to avoid oom, except with images, as it would drop image tokens
         if vision_inputs is None:
             num_tokens_to_truncate = max(prompt_ids.size(1) + completion_ids.size(1) - self.max_length, 0)
@@ -1141,6 +1321,28 @@ class OnlineDPOTrainer(_BaseTrainer):
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # One online DPO optimization step (overrides Trainer.training_step).
+        # Behavior:
+        # 1. Sets train mode; for image batches, rewrites string user message contents to an image placeholder plus text and
+        # system contents to a text part (mutates prompts in place).
+        # 2. Generates two completions per prompt (vLLM or transformers) and flags which contain an eos token.
+        # 3. Computes policy log-probs and, without grad, reference log-probs (ref model, or the policy with adapter disabled).
+        # 4. Decodes completions (wrapped as assistant messages when conversational), duplicates other list columns for reward
+        # kwargs, computes rewards for prompts repeated twice; subtracts missing_eos_penalty for completions without eos.
+        # 5. Splits rewards into first/second halves; the higher (ties to first) is chosen. Gathers chosen/rejected log-probs,
+        # sums over non-padding tokens, computes logits as policy log-ratio minus reference log-ratio.
+        # 6. Loss: sigmoid uses negative log-sigmoid of beta times logits; ipo uses squared (logits minus 1/(2 beta)); mean.
+        # 7. Appends gathered metrics to stats: scores_margin, scores, contain_eos_token, chosen/rejected logps, kl (summed
+        # per-sequence then averaged), non_score_reward (negative beta times kl), rlhf_reward, entropy (negative summed
+        # log-probs), chosen/rejected implicit rewards, margins, accuracies, beta.
+        # 8. Optionally empties cache every torch_empty_cache_steps; passes learning_rate for LOMO optimizers; backward.
+        # Inputs: model, inputs (batch dict with "prompt" and optional "image"/other columns), num_items_in_batch (unused).
+        # Outputs: detached loss divided by gradient_accumulation_steps.
+        # Exceptions: NotImplementedError for an unknown loss_type.
+        # Side effects: gradients, stats mutation, possible vLLM weight sync.
+        # KNOWN ISSUE: the kl, non_score_reward and entropy metrics sum over all completion positions including padding, since
+        # they are not multiplied by the completion mask.
         model.train()
 
         prompts = inputs["prompt"]
@@ -1317,6 +1519,15 @@ class OnlineDPOTrainer(_BaseTrainer):
     def _maybe_log_save_evaluate(
         self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=None
     ):
+        # [FUNCTION DOC]
+        # Override of Trainer._maybe_log_save_evaluate that also logs averaged stats.
+        # Behavior: when logging is due, gathers and averages tr_loss (nested_gather for transformers >= 5.2.0, otherwise the
+        # trainer method), zeroes it in place, logs loss per step since last log, grad_norm, learning rate, and the mean of each
+        # stats list, then resets stats, updates totals and stores flos. Evaluates when due (updating save flag under the
+        # "best" strategy) and saves a checkpoint and fires on_save when due.
+        # Inputs: tr_loss, grad_norm, model, trial, epoch (unused), ignore_keys_for_eval, start_time, learning_rate (optional).
+        # Outputs: none. Exceptions: ZeroDivisionError if a stats list is empty at log time.
+        # Side effects: logging, tr_loss mutation, evaluation, checkpoint writing.
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
             logs: dict[str, float] = {}
 
@@ -1361,6 +1572,10 @@ class OnlineDPOTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Writes a model card (named after hub_model_id's last part or the output_dir name) before delegating to the parent
+        # checkpoint save.
+        # Inputs: model, trial. Outputs: none. Side effects: writes README/model card and checkpoint files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:

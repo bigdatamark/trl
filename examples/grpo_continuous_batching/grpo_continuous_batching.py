@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Example script: GRPO on GSM8K using transformers' continuous batching generation engine instead of generate().
+# Under the main guard: parses ScriptArguments/GRPOConfig/ModelConfig, sets model_init_kwargs (dtype resolved to a
+# torch dtype unless "auto"/None), loads the dataset (default openai/gsm8k "main"), maps rows to system plus user
+# prompts with a reference answer, forces use_transformers_continuous_batching on (default config disables CUDA
+# graphs), trains GRPOTrainer with correctness_reward and optional PEFT, saves, optionally pushes, calls trainer.end().
+# Main contents: SYSTEM_PROMPT (asks for a final "#### <number>" line), extract_answer, correctness_reward.
+# Import-time side effects: sets the "ContinuousBatchingLogger" logger level to ERROR.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,11 +74,20 @@ SYSTEM_PROMPT = (
 
 
 def extract_answer(text: str) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Finds the first "####" followed by optional whitespace and a run of digits/commas, returning the digits with
+    # commas removed, or None. Negative numbers and decimals are not captured.
+    # Inputs: text. Outputs: string or None. Exceptions: none. Side effects: none.
     match = re.search(r"####\s*([\d,]+)", text)
     return match.group(1).replace(",", "") if match else None
 
 
 def correctness_reward(completions, reference_answer, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: for each completion (plain string, or the content of the last message for conversational completions)
+    # extracts the answer and gives 1.0 when it equals the reference string exactly, else 0.0.
+    # Inputs: completions, reference_answer list, kwargs ignored. Outputs: list of floats.
+    # Exceptions: none expected. Side effects: none.
     rewards = []
     for completion, ref in zip(completions, reference_answer, strict=False):
         predicted = extract_answer(completion if isinstance(completion, str) else completion[-1]["content"])
@@ -101,6 +119,11 @@ if __name__ == "__main__":
     )
 
     def make_conversation(example):
+        # [FUNCTION DOC]
+        # HELPER: Defined inside the main guard. Builds a prompt of SYSTEM_PROMPT plus the question as user message, and
+        # reference_answer as the text after the last "####" in the answer, stripped and with commas removed.
+        # Inputs: example with "question" and "answer". Outputs: dict with "prompt" and "reference_answer".
+        # Exceptions: KeyError on missing columns. Side effects: none.
         return {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},

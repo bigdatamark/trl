@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Experimental A2PO trainer package. Exports A2POConfig and A2POTrainer (eager imports of the config and trainer
+# modules). Side effects on import: those of importing the trainer module (and trl.experimental's warning).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

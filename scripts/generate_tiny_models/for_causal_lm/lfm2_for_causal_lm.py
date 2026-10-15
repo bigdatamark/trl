@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Script that builds a tiny randomly initialized Lfm2ForCausalLM mirroring LiquidAI/LFM2-1.2B and pushes it to trl-internal-testing/tiny-Lfm2ForCausalLM.
+# Behavior (all at import time, run as a module): checks the transformers floor from pyproject.toml is installed exactly, seeds RNGs, loads the reference AutoTokenizer and GenerationConfig,
+# builds a scaled-down config (mostly 2 layers, hidden size 8-16, intermediate size 32), instantiates the model in bfloat16, re-initializes weights via init_weights_tiny_model,
+# runs smoke_test, check_dtype_pattern and print_config_diff against the reference, then calls push_to_hub.
+# Details: Hybrid conv/attention config: full_attn_idxs selects layer 1 as attention (layer 0 is a short convolution); block_multiple_of is reduced to 8 so the auto-adjusted MLP width stays tiny; eos is 7 (im_end); reference-only keys and size aliases (block_dim, block_ff_dim, conv_dim, conv_dim_out, num_heads) are set to the scaled values.
+# Inputs: CLI flags --create-pr / --full-diff (parsed by _common). Outputs: none returned.
+# Exceptions: RuntimeError on transformers version mismatch or failed smoke test; Hub/network errors propagate.
+# Side effects: downloads reference tokenizer/config from the Hub, prints diagnostics, creates/updates a Hub repo (or skips if it exists).
+#
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

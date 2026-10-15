@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Callback plumbing for using BEMA weights as the DPO reference model.
+# Main contents: CallbackHandlerWithRefModel (passes ref_model to every callback event) and BEMACallback (extends the
+# stable trl BEMACallback to periodically copy the running BEMA weights into the reference model).
+# Used by the sibling dpo_trainer module. Import-time side effects: creates a module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,16 +32,34 @@ logger = logging.getLogger(__name__)
 
 
 class CallbackHandlerWithRefModel(CallbackHandler):
+    # [CLASS DOC]
+    # Transformers CallbackHandler subclass that additionally stores ref_model and forwards it as a keyword argument in
+    # every callback event, so callbacks such as BEMACallback can modify the reference model.
+    # Construction: callbacks, model, ref_model, processing_class, optimizer, lr_scheduler.
     """
     A [`~transformers.CallbackHandler`] that supports passing a reference model to callbacks.
     """
 
     def __init__(self, callbacks, model, ref_model, processing_class, optimizer, lr_scheduler):
+        # [FUNCTION DOC]
+        # Behavior: initialises the parent handler and stores ref_model.
+        # Inputs: callbacks (list), model, ref_model (model or None, e.g. None with PEFT), processing_class, optimizer,
+        # lr_scheduler. Outputs: none.
+        # Exceptions: none beyond the parent.
+        # Side effects: sets self.ref_model.
         super().__init__(callbacks, model, processing_class, optimizer, lr_scheduler)
         self.ref_model = ref_model
 
     # Copied from CallbackHandler.call_event with the addition of `ref_model` to the callback call.
     def call_event(self, event, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: copy of the parent call_event: for each callback, call its method named by event with args, state,
+        # control and keyword arguments model, ref_model, processing_class, optimizer, lr_scheduler, train/eval dataloaders
+        # plus extra kwargs; if a callback returns a non-None value it replaces control.
+        # Inputs: event (str method name), args, state, control, **kwargs.
+        # Outputs: final TrainerControl.
+        # Exceptions: propagates callback exceptions; AttributeError if a callback lacks the event method.
+        # Side effects: whatever the callbacks do.
         for callback in self.callbacks:
             result = getattr(callback, event)(
                 args,
@@ -57,6 +81,11 @@ class CallbackHandlerWithRefModel(CallbackHandler):
 
 
 class BEMACallback(_BEMACallback):
+    # [CLASS DOC]
+    # Stable BEMACallback extended with optional reference-model refresh.
+    # Extra state: update_ref_model (bool, default False), ref_model_update_freq (default 400), ref_model_update_after
+    # (default 0). Inherits running_model (BEMA weights), _unwrap_model and the BEMA update logic from the parent.
+    # Requires the trainer's callback handler to supply ref_model (CallbackHandlerWithRefModel).
     # docstyle-ignore
     r"""
     A [`~transformers.TrainerCallback`] that implements [BEMA](https://huggingface.co/papers/2508.00180)
@@ -141,6 +170,12 @@ class BEMACallback(_BEMACallback):
         ref_model_update_freq: int = 400,
         ref_model_update_after: int = 0,
     ):
+        # [FUNCTION DOC]
+        # Behavior: passes the BEMA hyperparameters positionally to the parent and stores the ref-model update settings.
+        # Inputs: update_freq, ema_power, bias_power, lag, update_after, multiplier, min_ema_multiplier, device (see
+        # docstring), update_ref_model, ref_model_update_freq, ref_model_update_after.
+        # Outputs: none. Exceptions: none beyond the parent.
+        # Side effects: sets attributes.
         super().__init__(
             update_freq,
             ema_power,
@@ -160,6 +195,18 @@ class BEMACallback(_BEMACallback):
     def on_step_end(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, model: PreTrainedModel, **kwargs
     ):
+        # [FUNCTION DOC]
+        # Behavior: runs the parent BEMA step update (under no_grad). Then, if update_ref_model is set and the global step is
+        # at least ref_model_update_after and the offset from it is a multiple of ref_model_update_freq, takes the running
+        # BEMA state dict and loads it into a target: if ref_model kwarg is None (PEFT), the unwrapped main model's base model
+        # (when it has get_base_model) or the main model itself; otherwise the unwrapped ref_model's base model (if PEFT) or
+        # the ref model. Logs an info message after updating.
+        # Inputs: args, state, control, model, **kwargs (must contain ref_model when updating).
+        # Outputs: none.
+        # Exceptions: ValueError if updating and ref_model is absent from kwargs.
+        # Side effects: mutates BEMA buffers (via parent) and the target model's weights; info log.
+        # KNOWN ISSUE: when ref_model is None and the model is not PEFT, the BEMA weights are loaded into the policy model
+        # being trained itself, overwriting its current weights.
         super().on_step_end(args, state, control, model, **kwargs)
 
         step = state.global_step
@@ -202,6 +249,14 @@ class BEMACallback(_BEMACallback):
             logger.info("BEMACallback: Updated reference model with BEMA weights")
 
     def _update_model_with_bema_weights(self, model, bema_state_dict, is_peft_base=False):
+        # [FUNCTION DOC]
+        # HELPER: Loads a BEMA state dict into a model, non-strictly.
+        # Behavior: when is_peft_base, drops keys starting with "lora_" or "adapter_" and strips a leading "base_model."
+        # prefix from the rest before loading; otherwise loads the dict as is. Uses strict False, so unmatched keys are
+        # silently ignored.
+        # Inputs: model, bema_state_dict (dict name to tensor), is_peft_base (bool, default False).
+        # Outputs: none. Exceptions: shape-mismatch errors from load_state_dict.
+        # Side effects: model weights overwritten.
         """Helper method to update a model with BEMA weights, handling PEFT and distributed scenarios."""
         if is_peft_base:
             # For PEFT base models, filter out adapter parameters

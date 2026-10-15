@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Dataset preprocessing utilities shared by TRL trainers and exported from the trl package.
+# Contents: conversational-format detection and chat-template application (is_conversational, apply_chat_template,
+# maybe_apply_chat_template, is_conversational_from_value, maybe_convert_to_chatml), multimodal message preparation
+# (prepare_multimodal_messages), single-example tokenization (_tokenize), prefix utilities (common_prefix_length),
+# preference dataset reshaping (unpair_preference_dataset, maybe_unpair_preference_dataset, extract_prompt,
+# maybe_extract_prompt), and sequence packing on Arrow tables (pack_dataset with Best-Fit-Decreasing or wrapped
+# strategies, backed by _SegmentTree, _pack_bfd, _pack_wrapped). Defines TypeVars DatasetType and IterableDatasetType.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +40,18 @@ IterableDatasetType = TypeVar("IterableDatasetType", IterableDataset, IterableDa
 
 
 def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | None = None) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Converts messages to structured content blocks and fills image placeholders with the given images.
+    # Behavior: copy-on-write per message. The first user message with string content becomes N image placeholder blocks
+    # (N = number of images) followed by a text block; later string user messages and string system/assistant/tool
+    # content become a single text block; non-string content (already structured, or None with tool_calls) is kept.
+    # Then count unfilled image placeholders (type "image" without an "image" key) in non-tool messages with content and
+    # require it to equal the number of images; fill them in order with the images.
+    # Inputs: messages (list of dicts with role and content/tool_calls), images (optional list, default empty).
+    # Outputs: new list of message dicts (originals are not mutated).
+    # Exceptions: ValueError for an unknown role or a placeholder/image count mismatch; KeyError if a user message lacks
+    # "content".
+    # Side effects: none.
     # docstyle-ignore  # because <Image> is not parsable in the code block
     """
     Convert messages into a structured multimodal format and inject the provided images into the message contents.
@@ -124,6 +146,13 @@ def prepare_multimodal_messages(messages: list[dict[str, Any]], images: list | N
 
 
 def is_conversational(example: dict[str, Any]) -> bool:
+    # [FUNCTION DOC]
+    # Detects conversational examples: picks one of the present keys among prompt/chosen/rejected/completion/messages (an
+    # arbitrary one, popped from a set), and returns True if its value is a list whose first element is a dict containing
+    # "role".
+    # Inputs: example (dict). Outputs: bool.
+    # Exceptions: IndexError if the chosen value is an empty list.
+    # Side effects: none.
     r"""
     Check if the example is in a conversational format.
 
@@ -170,6 +199,24 @@ def apply_chat_template(
     tools: list[dict | Callable] | None = None,
     **template_kwargs,
 ) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # Renders a conversational example to strings with the processing class's chat template.
+    # Behavior: an empty tools list is treated as None. The set of supported keys present must be exactly one of:
+    # messages; prompt; prompt+completion; prompt+chosen+rejected; chosen+rejected; prompt+completion+label. Per-example
+    # "chat_template_kwargs" and the template_kwargs are forwarded to every rendering.
+    # - messages: rendered whole into "text".
+    # - prompt: rendered with add_generation_prompt when the last role is user/tool, or continue_final_message when it is
+    #   assistant. Then for each of chosen/rejected/completion, render prompt + that continuation and shrink the prompt to
+    #   the longest common character prefix (handles templates like DeepSeek-R1 that differ at the boundary); each
+    #   continuation string is the full rendering minus the final prompt prefix.
+    # - implicit prompt (chosen+rejected only): each rendered independently.
+    # "label" is copied through.
+    # Inputs: example, processing_class (tokenizer or processor), tools (optional list of JSON schemas or callables),
+    # template_kwargs.
+    # Outputs: dict with the relevant keys among text, prompt, chosen, rejected, completion, label (all strings except label).
+    # Exceptions: KeyError for unsupported key combinations; ValueError if the prompt's last role is not
+    # user/tool/assistant; template errors propagate.
+    # Side effects: none.
     r"""
     Apply a chat template to a conversational example along with the schema for a list of functions in `tools`.
 
@@ -306,6 +353,9 @@ def maybe_apply_chat_template(
     tools: list[dict | Callable] | None = None,
     **template_kwargs: Any,
 ) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # Applies apply_chat_template when is_conversational(example) is true, otherwise returns the example unchanged.
+    # Inputs/outputs/exceptions: as apply_chat_template. Side effects: none.
     r"""
     If the example is in a conversational format, apply a chat template to it.
 
@@ -369,6 +419,15 @@ def _tokenize(
     input: str | list,
     **apply_chat_template_kwargs,
 ) -> dict[str, list]:
+    # [FUNCTION DOC]
+    # HELPER: Tokenizes one dataset field.
+    # Behavior: a list input is treated as messages - for processors (VLMs) first converted with
+    # prepare_multimodal_messages - and tokenized via apply_chat_template with tokenize and return_dict enabled plus the
+    # given kwargs; a string input is tokenized directly as text. For processors, strip the leading batch dimension from
+    # every output value.
+    # Inputs: processing_class, input (str or list of messages), apply_chat_template_kwargs.
+    # Outputs: dict of token fields (e.g. input_ids, attention_mask, plus vision tensors for VLMs).
+    # Exceptions: tokenizer/template errors. Side effects: none.
     """
     Tokenize a single example for dataset preprocessing.
 
@@ -404,6 +463,9 @@ def _tokenize(
 
 
 def common_prefix_length(ids: list[int], other_ids: list[int]) -> int:
+    # [FUNCTION DOC]
+    # Counts how many leading elements two token-id sequences share (stops at the first mismatch or the shorter end).
+    # Inputs: ids, other_ids (lists of int). Outputs: int. Exceptions: none. Side effects: none.
     """
     Number of leading tokens `ids` and `other_ids` have in common.
 
@@ -429,6 +491,12 @@ def common_prefix_length(ids: list[int], other_ids: list[int]) -> int:
 
 
 def _unpair_row(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
+    # [FUNCTION DOC]
+    # HELPER: Batched map function turning paired preference rows into unpaired rows.
+    # Behavior: completion = all chosen followed by all rejected; label = True for the first half, False for the second;
+    # prompt (if present) and every other column are duplicated (concatenated with themselves) to stay aligned.
+    # Inputs: batch (column name -> list). Outputs: new batch dict with twice the rows. Exceptions: KeyError if
+    # chosen/rejected missing. Side effects: none.
     batch_size = len(batch["chosen"])
     new_batch = {
         "completion": batch["chosen"] + batch["rejected"],
@@ -445,6 +513,16 @@ def _unpair_row(batch: dict[str, list[Any]]) -> dict[str, list[Any]]:
 def unpair_preference_dataset(
     dataset: DatasetType | IterableDatasetType, **map_kwargs
 ) -> DatasetType | IterableDatasetType:
+    # [FUNCTION DOC]
+    # Converts a paired preference dataset (chosen/rejected) into an unpaired one (completion/label) via a batched map
+    # with _unpair_row, removing all original columns. Column names come from the first split for a DatasetDict, the
+    # dataset itself, or (for an IterableDataset without known columns) the keys of its first example.
+    # Inputs: dataset (Dataset, DatasetDict, IterableDataset or IterableDatasetDict), map_kwargs (e.g. num_proc, desc).
+    # Outputs: the mapped dataset of the same kind.
+    # Exceptions: map errors.
+    # KNOWN ISSUE: an IterableDatasetDict is handled by the IterableDataset branch, which reads column_names on the dict
+    # and, if None, iterates the dict itself (yielding split names), so column detection is wrong for that type.
+    # Side effects: none (returns a new dataset).
     """
     Unpair a preference dataset.
 
@@ -497,6 +575,10 @@ def unpair_preference_dataset(
 def maybe_unpair_preference_dataset(
     dataset: DatasetType, num_proc: int | None = None, desc: str | None = None
 ) -> DatasetType:
+    # [FUNCTION DOC]
+    # Calls unpair_preference_dataset (with num_proc and desc) only when the columns (from the first split for a
+    # DatasetDict) include both chosen and rejected; otherwise returns the dataset unchanged.
+    # Inputs: dataset, num_proc (optional), desc (optional). Outputs: dataset. Exceptions: as unpair. Side effects: none.
     r"""
     Unpair a preference dataset if it is paired.
 
@@ -546,6 +628,17 @@ def maybe_unpair_preference_dataset(
 
 
 def extract_prompt(example: dict[str, Sequence]) -> dict[str, Sequence]:
+    # [FUNCTION DOC]
+    # Splits an implicit-prompt preference example into prompt, chosen and rejected by their shared prefix.
+    # Behavior: scan indices up to the shorter length; at the first index where chosen and rejected differ, step back one
+    # if the preceding chosen element is a single space string, and stop. The prompt is chosen up to that index; chosen
+    # and rejected are the remainders. Works for strings (characters) and message lists (messages).
+    # Inputs: example with chosen and rejected sequences. Outputs: dict with prompt, chosen, rejected.
+    # Exceptions: UnboundLocalError (NameError) if either sequence is empty.
+    # KNOWN ISSUE: if one sequence is a prefix of the other (no differing index), idx ends at the last scanned index, so the
+    # final shared element is put into chosen/rejected instead of the prompt. Also at idx 0 the space check looks at the
+    # last element of chosen.
+    # Side effects: none.
     r"""
     Extracts the shared prompt from a preference data example, where the prompt is implicit within both the chosen and
     rejected completions.
@@ -633,6 +726,11 @@ def extract_prompt(example: dict[str, Sequence]) -> dict[str, Sequence]:
 
 
 def maybe_extract_prompt(example: dict[str, list]) -> dict[str, list]:
+    # [FUNCTION DOC]
+    # Extracts an implicit prompt when needed: returns the example unchanged if it is not a preference example (missing
+    # chosen or rejected), or if it has a prompt whose conversational-ness matches that of chosen; otherwise returns
+    # extract_prompt on chosen/rejected (dropping any mismatched prompt and other keys).
+    # Inputs: example dict. Outputs: dict. Exceptions: as extract_prompt / is_conversational. Side effects: none.
     r"""
     Extracts the shared prompt from a preference data example, where the prompt is implicit within both the chosen and
     rejected completions.
@@ -659,6 +757,12 @@ def maybe_extract_prompt(example: dict[str, list]) -> dict[str, list]:
 
 
 def _get_dataset_format(dataset: DatasetType) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the current formatting of a dataset (first split for dict types) as a flat dict suitable for
+    # with_format: for a Dataset its format dict, for an IterableDataset just the format type from its private _formatting;
+    # nested "format_kwargs" are merged into the top level.
+    # Inputs: dataset. Outputs: dict (keys like type, columns, output_all_columns, plus format kwargs).
+    # Exceptions: none expected. Side effects: none (works on a copy for Dataset.format).
     if isinstance(dataset, (DatasetDict, IterableDatasetDict)):
         dataset = dataset[next(iter(dataset))]
     if isinstance(dataset, Dataset):
@@ -671,6 +775,11 @@ def _get_dataset_format(dataset: DatasetType) -> dict[str, Any]:
 
 
 def _check_if_columns_can_be_packed(columns: list[pa.Array]):
+    # [FUNCTION DOC]
+    # HELPER: Validates Arrow columns for packing: every column must be a list or large_list type, and all must have
+    # identical offsets to the first column (same per-row lengths).
+    # Inputs: columns (list of pyarrow Arrays). Outputs: none.
+    # Exceptions: TypeError for non-list columns; ValueError for mismatched lengths. Side effects: none.
     first_column_offsets = None
     for idx, column in enumerate(columns):
         if not (pyarrow.types.is_list(column.type) or pyarrow.types.is_large_list(column.type)):
@@ -683,6 +792,11 @@ def _check_if_columns_can_be_packed(columns: list[pa.Array]):
 
 
 class _SegmentTree:
+    # [CLASS DOC]
+    # HELPER: Max segment tree over integer values 1..maxval used by BFD packing to find, in O(log n), the smallest
+    # available bin space that is at least a requested length. Leaves hold either the value itself (present) or 0;
+    # internal nodes hold the max of their children. tree_size is maxval rounded up to a power of two; tree is a flat
+    # 1-indexed array of size 2*tree_size.
     """
     A segment tree data structure that, when initialized as `_SegmentTree(maxval)`, efficiently finds the next larger
     value for a given input within the range [1, maxval].
@@ -691,12 +805,18 @@ class _SegmentTree:
     """
 
     def __init__(self, maxval: int):
+        # [FUNCTION DOC]
+        # HELPER: Stores maxval, computes tree_size (next power of two >= maxval) and allocates a zeroed tree list.
+        # Inputs: maxval (positive int). Outputs: none. Exceptions: none for positive input. Side effects: sets attributes.
         self.maxval = maxval
         # For non-power-of-2 values, we need to round up to the next power of 2 for the tree size
         self.tree_size = 1 << (maxval - 1).bit_length()
         self.tree = [0] * (2 * self.tree_size)
 
     def add(self, val):
+        # [FUNCTION DOC]
+        # HELPER: Marks val as present (leaf val-1 set to val) and recomputes maxima up to the root.
+        # Inputs: val (1..maxval). Outputs: none. Exceptions: AssertionError if out of range. Side effects: mutates tree.
         assert 0 < val <= self.maxval
         i = self.tree_size + val - 1
         self.tree[i] = val
@@ -707,6 +827,9 @@ class _SegmentTree:
             self.tree[i] = left if left >= right else right
 
     def remove(self, val):
+        # [FUNCTION DOC]
+        # HELPER: Marks val as absent (leaf set to 0) and recomputes maxima up to the root.
+        # Inputs: val (1..maxval). Outputs: none. Exceptions: AssertionError if out of range. Side effects: mutates tree.
         assert 0 < val <= self.maxval
         i = self.tree_size + val - 1
         self.tree[i] = 0
@@ -717,6 +840,10 @@ class _SegmentTree:
             self.tree[i] = left if left >= right else right
 
     def search(self, val):
+        # [FUNCTION DOC]
+        # HELPER: Descends from the root, going left whenever the left child's max is at least val, to return the smallest
+        # present value >= val (assuming one exists; otherwise returns whatever leaf is reached, possibly 0).
+        # Inputs: val (1..maxval). Outputs: int. Exceptions: AssertionError if out of range. Side effects: none.
         assert 0 < val <= self.maxval
         i = 1
         while i < self.tree_size:
@@ -730,6 +857,21 @@ class _SegmentTree:
 def _pack_bfd(
     examples: pa.Table, seq_length: int, on_seq_length_overflow: Literal["truncate", "split"] = "truncate"
 ) -> pa.Table:
+    # [FUNCTION DOC]
+    # HELPER: Packs a batch (Arrow table of list columns) into rows of at most seq_length tokens using Best-Fit-Decreasing.
+    # Behavior: combine chunks and validate columns; drop empty sequences. Overflow handling: "truncate" cuts each
+    # sequence to seq_length; "split" rewrites list offsets so long sequences become consecutive fragments of seq_length
+    # (the last fragment of each sequence possibly shorter). Record each sequence's length in a temporary seq_lengths
+    # column; sort (length, index) descending. Greedy binning: a segment tree tracks available remaining spaces (seq_length
+    # always available meaning "new bin"); for each sequence find the smallest space that fits, reuse a bin with exactly
+    # that space (FIFO per space) or open a new bin, update the bin, and re-register its new remaining space if positive.
+    # Finally reorder rows by bin, rebuild each column with offsets at bin boundaries (one packed row per bin), and add a
+    # seq_lengths list column holding the lengths of the sequences in each packed row (used to build position_ids).
+    # Inputs: examples (pa.Table), seq_length (int), on_seq_length_overflow ("truncate" default, or "split").
+    # Outputs: pa.Table with the same columns packed plus seq_lengths.
+    # Exceptions: ValueError for an invalid overflow mode; TypeError/ValueError from column checks; AssertionError if the
+    # table has no columns.
+    # Side effects: none.
     """Pack sequences in a pyarrow Table using Best Fit Decreasing strategy."""
     columns = [column.chunks[0] for column in examples.combine_chunks().columns]
     _check_if_columns_can_be_packed(columns)
@@ -818,6 +960,11 @@ def _pack_bfd(
 
 
 def _pack_wrapped(examples: pa.Table, seq_length: int) -> pa.Table:
+    # [FUNCTION DOC]
+    # HELPER: Packs a batch by concatenating all sequences (flattening each list column, respecting slice offsets) and
+    # cutting the stream into consecutive chunks of seq_length (the last possibly shorter), ignoring sequence boundaries.
+    # Inputs: examples (pa.Table), seq_length (int). Outputs: pa.Table with the same column names.
+    # Exceptions: TypeError/ValueError from column checks. Side effects: none.
     """Pack sequences in a pyarrow Table using a wrapped strategy."""
     columns = [column.chunks[0] for column in examples.combine_chunks().columns]
     _check_if_columns_can_be_packed(columns)
@@ -840,6 +987,16 @@ def pack_dataset(
     strategy: str = "bfd",
     map_kwargs: dict[str, Any] | None = None,
 ) -> DatasetType:
+    # [FUNCTION DOC]
+    # Packs tokenized list columns of a dataset into sequences of length seq_length.
+    # Behavior: validate strategy ("bfd" = BFD with truncation, "bfd_split" = BFD splitting long sequences, "wrapped");
+    # remember the dataset's format, switch to the arrow format, run a batched map with the matching packing function,
+    # add "seq_lengths" to the format's columns list for BFD strategies when a columns list exists, and restore the format.
+    # Inputs: dataset (Dataset or DatasetDict), seq_length (int), strategy (default "bfd"), map_kwargs (optional dict,
+    # e.g. batch_size, num_proc).
+    # Outputs: packed dataset.
+    # Exceptions: ValueError for an invalid strategy; packing errors.
+    # Side effects: none (new dataset).
     r"""
     Pack sequences in a dataset into chunks of size `seq_length`.
 
@@ -925,6 +1082,10 @@ def pack_dataset(
 
 
 def is_conversational_from_value(example: dict[str, Any]) -> bool:
+    # [FUNCTION DOC]
+    # Returns True if example["conversations"] is a list whose first element is a dict with both "from" and "value" keys
+    # (ShareGPT-style format), else False.
+    # Inputs: example (dict). Outputs: bool. Exceptions: IndexError if conversations is an empty list. Side effects: none.
     r"""
     Check if the example is in a conversational format (from/value). Note that this format isn't recommended. Prefer
     the ChatML format (role/content)
@@ -965,6 +1126,12 @@ def is_conversational_from_value(example: dict[str, Any]) -> bool:
 
 
 def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
+    # [FUNCTION DOC]
+    # Converts from/value message format to ChatML role/content in place.
+    # Behavior: for each of prompt, completion, chosen, rejected, messages, conversations that is a list, rename "from" to
+    # "role" and "value" to "content" in every dict message; then rename the "conversations" key to "messages".
+    # Inputs: example (dict). Outputs: the same (mutated) dict.
+    # Exceptions: none. Side effects: mutates the input example and its message dicts.
     """
     Convert a conversational dataset with fields `from` and `value` to ChatML format.
 
@@ -1015,4 +1182,10 @@ def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
 
 
 def get_dataset_column_names(dataset: Dataset | IterableDataset) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the dataset's column_names, or, when it is None (IterableDataset with unknown features), the keys of
+    # its first example.
+    # Inputs: dataset (Dataset or IterableDataset). Outputs: list of str.
+    # Exceptions: StopIteration on an empty iterable dataset without features. Side effects: may consume one example
+    # from the iterable stream.
     return list(next(iter(dataset)).keys()) if dataset.column_names is None else dataset.column_names

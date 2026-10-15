@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Module trl.experimental.tpo.tpo_trainer: TPOTrainer implementation of Triple Preference Optimization
+# (https://huggingface.co/papers/2405.16681), which combines a reference-free preference loss between chosen
+# and rejected completions with an NLL term on a gold "reference" completion, in a single forward pass.
+# Main contents: _extract_triple_prompt (implicit-prompt extraction covering the reference column),
+# DataCollatorForTriplePreference (concatenates prompt+completion branches into one padded batch) and
+# TPOTrainer (a _BaseTrainer / transformers Trainer subclass).
+# Import-time side effects: imports peft when available; creates a module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,6 +62,14 @@ logger = get_logger(__name__)
 
 
 def _extract_triple_prompt(example: dict) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Dataset map function extracting a shared prompt for chosen/rejected/reference.
+    # Behavior: run extract_prompt on the example (sets prompt and strips it from chosen/rejected); require that
+    # the reference starts with that prompt (sequence/string prefix comparison) and strip it from reference.
+    # Inputs: example dict with chosen, rejected, reference. Outputs: dict with prompt, chosen, rejected,
+    # reference.
+    # Exceptions: ValueError if reference does not start with the extracted prompt; KeyError if reference missing.
+    # Side effects: none.
     """Extract the shared prompt from `chosen`/`rejected` and also strip it from `reference`.
 
     Wraps [`~trl.data_utils.extract_prompt`] — which only rewrites `chosen` and `rejected` — and additionally strips
@@ -75,6 +92,11 @@ def _extract_triple_prompt(example: dict) -> dict:
 
 @dataclass
 class DataCollatorForTriplePreference(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator turning tokenized triple-preference examples into a single right-padded batch.
+    # Fields: pad_token_id, max_length (optional), truncation_mode ("keep_start"), pad_to_multiple_of,
+    # return_tensors ("pt"), include_reference (True). Rows are stacked as all chosen, then all rejected, then (if
+    # include_reference) all reference sequences. Inherits DataCollatorMixin, which dispatches to torch_call.
     """
     Data collator used for triple-preference data. Inputs are dynamically padded to the maximum length of a batch.
 
@@ -147,6 +169,17 @@ class DataCollatorForTriplePreference(DataCollatorMixin):
     include_reference: bool = True
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: for each example build prompt+chosen and prompt+rejected token lists and completion masks (0 over
+        # prompt tokens, 1 over completion tokens); same for reference when include_reference. If max_length is set,
+        # truncate every sequence and mask to its first max_length elements ("keep_start") or last max_length
+        # ("keep_end"). Attention masks are all ones per sequence. Concatenate groups in order chosen, rejected,
+        # reference; convert each to a tensor and right-pad input_ids with pad_token_id and masks with 0, honoring
+        # pad_to_multiple_of.
+        # Inputs: examples (list of dicts with prompt_ids, chosen_ids, rejected_ids, and reference_ids if needed).
+        # Outputs: dict with input_ids, attention_mask, completion_mask, each of shape (2 or 3 times batch, L).
+        # Exceptions: ValueError for an unsupported truncation_mode (only when max_length is set); KeyError for
+        # missing keys. Side effects: none.
         prompt_chosen_ids = [example["prompt_ids"] + example["chosen_ids"] for example in examples]
         prompt_rejected_ids = [example["prompt_ids"] + example["rejected_ids"] for example in examples]
         chosen_mask = [[0] * len(example["prompt_ids"]) + [1] * len(example["chosen_ids"]) for example in examples]
@@ -214,6 +247,14 @@ class DataCollatorForTriplePreference(DataCollatorMixin):
 
 
 class TPOTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer for TPO. Holds loss hyper-parameters copied from TPOConfig (beta, loss_type, label_smoothing,
+    # tpo_alpha, tpo_l_gamma), _tokenizer, _metrics (per mode dict of metric name to list of values),
+    # _total_train_tokens and _tp_size. Construction loads the model/tokenizer, optionally wraps with PEFT,
+    # preprocesses datasets (_prepare_dataset) and sets the default collator; training uses compute_loss ->
+    # _compute_loss which also records metrics, flushed by log. prediction_step forces loss computation during
+    # eval; _save_checkpoint writes a model card. Inherits _BaseTrainer (model card utilities) which is a
+    # transformers Trainer. Class attributes _tag_names, _name and _paper describe the method for the card.
     """
     Trainer for Triple Preference Optimization (TPO) method. This algorithm was initially proposed in the paper [Triple
     Preference Optimization: Achieving Better Alignment using a Single Step
@@ -297,6 +338,32 @@ class TPOTrainer(_BaseTrainer):
         optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         peft_config: "PeftConfig | None" = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior, in order:
+        # 1. If args is None build TPOConfig with output dir "<model basename>-TPO".
+        # 2. Require train_dataset; for an IterableDataset force accelerator_config.dispatch_batches False (warning if
+        # it was True).
+        # 3. set_seed(args.seed). If model is a string, load it with create_model_from_path using model_init_kwargs
+        # (device_map forced to None for MULTI_GPU/DEEPSPEED, trust_remote_code defaulted from args, revision
+        # remembered); otherwise warn if model_init_kwargs was given.
+        # 4. Load the processing class with AutoProcessor if missing; require a PreTrainedTokenizerBase. Set pad
+        # token to eos if missing and copy pad_token_id to the model text config and generation config.
+        # 5. If peft_config: require peft installed, a PeftConfig instance, and a non-PEFT model; wrap with
+        # get_peft_model, passing autocast_adapter_dtype False under ZeRO-3 for non-quantized models. Enable input
+        # grads when PEFT and gradient checkpointing.
+        # 6. Default collator: DataCollatorForTriplePreference with include_reference only when tpo_alpha is non-zero.
+        # 7. Copy loss settings; warn that label smoothing is ignored for hinge/ipo.
+        # 8. Prepare train and eval datasets (dict of datasets supported). For transformers below 5.0.0 with gradient
+        # checkpointing default use_reentrant to False.
+        # 9. Call the parent constructor; disable dropout if configured; init metrics and token counter; set
+        # _tp_size from the accelerator parallelism config (1 if none); add model tags.
+        # Inputs: model (str, PreTrainedModel or PeftModel), args, data_collator, train_dataset, eval_dataset,
+        # processing_class, compute_metrics, callbacks, optimizers, peft_config.
+        # Outputs: none.
+        # Exceptions: ValueError (missing train_dataset, PeftModel plus peft_config, dataset column errors),
+        # TypeError (bad processing_class or peft_config), ImportError (peft missing).
+        # Side effects: seeds RNGs, may download model/tokenizer, mutates args and tokenizer pad token, dataset map
+        # caching, logging warnings.
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
@@ -477,6 +544,12 @@ class TPOTrainer(_BaseTrainer):
         input: str | list,
         **kwargs,
     ) -> dict[str, list]:
+        # [FUNCTION DOC]
+        # HELPER (staticmethod): Tokenize one input for preprocessing.
+        # Behavior: list input is treated as conversation and passed to apply_chat_template with tokenize and
+        # return_dict enabled plus kwargs; string input is tokenized by calling the tokenizer (kwargs ignored).
+        # Inputs: processing_class, input (str or list of messages), kwargs. Outputs: dict containing input_ids.
+        # Exceptions: tokenizer errors. Side effects: none.
         """Tokenize a single example for dataset preprocessing.
 
         Dispatches to `apply_chat_template` for conversational input (list of message dicts) and to `__call__` for
@@ -505,6 +578,20 @@ class TPOTrainer(_BaseTrainer):
         args: TPOConfig,
         dataset_name: str,
     ) -> Dataset | IterableDataset:
+        # [FUNCTION DOC]
+        # HELPER: Validate and tokenize a triple-preference dataset.
+        # Behavior: check the first example has chosen, rejected and reference columns. Use num_proc for map on
+        # regular datasets. Inside global_then_local_main_first: if no prompt column, map _extract_triple_prompt; for
+        # non-conversational data append eos_token to chosen, rejected and reference when missing; then tokenize each
+        # example (prompt with generation prompt, and prompt plus each completion, using tools and
+        # chat_template_kwargs for conversational data). The prompt length is the minimum common-prefix length between
+        # the tokenized prompt and each tokenized prompt+completion (warn once if shorter than the prompt); output
+        # prompt_ids as that prefix and chosen_ids / rejected_ids / reference_ids as the remainders. Map descriptions
+        # are only set for regular datasets.
+        # Inputs: dataset, processing_class, args (TPOConfig), dataset_name (for progress descriptions).
+        # Outputs: the mapped dataset.
+        # Exceptions: ValueError for missing columns or reference/prompt mismatch.
+        # Side effects: dataset map caching; process synchronization barriers; possible warning log.
         # Validate that the triple-preference columns are present
         first_example = next(iter(dataset))
         if "chosen" not in first_example or "rejected" not in first_example:
@@ -539,6 +626,10 @@ class TPOTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
                 def add_eos(example, eos_token):
+                    # [FUNCTION DOC]
+                    # HELPER: Append eos_token to chosen, rejected and reference strings that do not already end with it.
+                    # Inputs: example dict, eos_token (str). Outputs: the mutated example. Exceptions: none.
+                    # Side effects: mutates the example dict.
                     if not example["chosen"].endswith(eos_token):
                         example["chosen"] = example["chosen"] + eos_token
                     if not example["rejected"].endswith(eos_token):
@@ -558,6 +649,11 @@ class TPOTrainer(_BaseTrainer):
             tokenize = self._tokenize
 
             def tokenize_fn(example, processing_class):
+                # [FUNCTION DOC]
+                # HELPER: Map function producing prompt_ids, chosen_ids, rejected_ids and reference_ids for one example, as
+                # described in _prepare_dataset (tools may be a JSON string and are decoded first).
+                # Inputs: example dict, processing_class. Outputs: dict of four token-id lists.
+                # Exceptions: tokenizer / JSON decode errors. Side effects: may log a one-time warning on prompt divergence.
                 tools = example.get("tools")
                 tools = json.loads(tools) if isinstance(tools, str) else tools
                 output = {}
@@ -628,6 +724,10 @@ class TPOTrainer(_BaseTrainer):
         return dataset
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # HELPER: Override so remove_unused_columns keeps prompt_ids, chosen_ids, rejected_ids and reference_ids;
+        # sets _signature_columns only when unset.
+        # Inputs: none. Outputs: none. Exceptions: none. Side effects: sets self._signature_columns.
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs (usually, "input_ids"
         # and "attention_mask").
@@ -635,6 +735,25 @@ class TPOTrainer(_BaseTrainer):
             self._signature_columns = ["prompt_ids", "chosen_ids", "rejected_ids", "reference_ids"]
 
     def _compute_loss(self, model, inputs, return_outputs):
+        # [FUNCTION DOC]
+        # Behavior: mode is train or eval from model.training. Number of branches is 3 when tpo_alpha is non-zero,
+        # else 2. Forward the model on all batch keys except completion_mask with use_cache False. Shift logits/labels/
+        # completion mask by one and get per-token logps and entropies (entropy without grad) restricted to the
+        # completion mask. Sequence logps are the sum over tokens, divided by completion length (at least 1) for
+        # "ipo" and "tpo-l". Split into branches; delta = chosen minus rejected logps. Per-sequence loss:
+        # sigmoid: label-smoothed negative log-sigmoid of beta times delta; hinge: relu of 1 minus beta times delta;
+        # ipo: squared (delta minus 1 over 2 beta); tpo-l: as sigmoid but on delta minus tpo_l_gamma over beta.
+        # Loss is the batch mean, plus tpo_alpha times token-level cross-entropy on reference completion tokens when
+        # three branches are present.
+        # Metrics appended to _metrics[mode]: entropy (mean over completion tokens, gathered), num_tokens (cumulative
+        # attended training tokens gathered and divided by _tp_size; in eval it just reports the running total),
+        # logits/chosen and logits/rejected (vocab-mean logits averaged over completion tokens), mean_token_accuracy
+        # of chosen argmax predictions, rewards/chosen, rewards/rejected (beta times logps), rewards/accuracies,
+        # rewards/margins, logps/chosen and logps/rejected.
+        # Inputs: model, inputs (input_ids, attention_mask, completion_mask), return_outputs.
+        # Outputs: loss, or (loss, model outputs).
+        # Exceptions: ValueError for unknown loss_type.
+        # Side effects: cross-process gathers; mutates _metrics and _total_train_tokens.
         mode = "train" if self.model.training else "eval"
 
         # When `tpo_alpha=0.0` the NLL term is disabled and the collator drops the reference branch, so the batch
@@ -785,6 +904,13 @@ class TPOTrainer(_BaseTrainer):
         ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Behavior: if eval_dataset is given and not a string, preprocess it (or each dict entry) with
+        # _prepare_dataset, then call the parent evaluate.
+        # KNOWN ISSUE: the comment claims _prepare_dataset is idempotent and skips already-tokenized datasets, but
+        # _prepare_dataset has no such check; an already-prepared dataset is tokenized again.
+        # Inputs: eval_dataset (optional), ignore_keys, metric_key_prefix (default "eval").
+        # Outputs: dict of metrics. Exceptions: as _prepare_dataset. Side effects: evaluation run and logging.
         # When a dataset is passed directly to `evaluate` (e.g. a held-out test set), preprocess it the same way
         # `__init__` does, so that `evaluate` accepts the same dataset types as the trainer. `_prepare_dataset` is
         # idempotent: it skips datasets that are already tokenized. A `str` selects a dataset that was already prepared
@@ -802,9 +928,19 @@ class TPOTrainer(_BaseTrainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Behavior: delegate to _compute_loss, ignoring num_items_in_batch.
+        # Inputs: model, inputs, return_outputs, num_items_in_batch. Outputs: as _compute_loss.
+        # Exceptions: as _compute_loss. Side effects: as _compute_loss.
         return self._compute_loss(model, inputs, return_outputs)
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: average each metric list for the current mode, prefix keys with "eval_" in eval mode, merge into
+        # logs, call the parent log, then clear that mode's metrics.
+        # Inputs: logs dict, start_time (optional). Outputs: none.
+        # Exceptions: ZeroDivisionError if a metric list is empty (not expected).
+        # Side effects: mutates logs; logs via callbacks; clears _metrics[mode].
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
@@ -820,6 +956,12 @@ class TPOTrainer(_BaseTrainer):
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and
     # returns logits. We override prediction_step to force compute_loss, because this trainer doesn't involve labels.
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Behavior: prepare inputs, then under no_grad and the loss context manager compute the loss; when not
+        # prediction_loss_only also return the model logits and input_ids as labels.
+        # Inputs: model, inputs, prediction_loss_only, ignore_keys (unused).
+        # Outputs: tuple (loss, logits or None, labels or None).
+        # Exceptions: as compute_loss. Side effects: records eval metrics.
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad(), self.compute_loss_context_manager():
             if prediction_loss_only:
@@ -832,6 +974,11 @@ class TPOTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Behavior: derive a model name from hub_model_id (last path part) or the output_dir name, write the model
+        # card, then call the parent checkpoint save.
+        # Inputs: model, trial. Outputs: none. Exceptions: I/O errors.
+        # Side effects: writes README model card and checkpoint files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:

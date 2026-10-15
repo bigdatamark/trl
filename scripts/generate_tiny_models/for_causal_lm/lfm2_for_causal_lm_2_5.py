@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Script that builds a tiny randomly initialized Lfm2ForCausalLM mirroring LiquidAI/LFM2.5-230M and pushes it to trl-internal-testing/tiny-Lfm2ForCausalLM-2.5.
+# Behavior (all at import time, run as a module): checks pinned transformers 5.0.0 is installed exactly, seeds RNGs, loads the reference AutoTokenizer and GenerationConfig,
+# builds a scaled-down config (mostly 2 layers, hidden size 8-16, intermediate size 32), instantiates the model in bfloat16, re-initializes weights via init_weights_tiny_model,
+# runs smoke_test, check_dtype_pattern and print_config_diff against the reference, then calls push_to_hub.
+# Details: Hybrid conv/attention config given explicitly through layer_types (conv then full_attention), auto FF-dim adjustment disabled, eos 7, plus many reference-only keys and size aliases set to scaled values. Pinned to transformers 5.0.0 because the reference ships a TokenizersBackend tokenizer.
+# Inputs: CLI flags --create-pr / --full-diff (parsed by _common). Outputs: none returned.
+# Exceptions: RuntimeError on transformers version mismatch or failed smoke test; Hub/network errors propagate.
+# Side effects: downloads reference tokenizer/config from the Hub, prints diagnostics, creates/updates a Hub repo (or skips if it exists).
+#
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

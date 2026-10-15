@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Module trl.extras.profiling: lightweight wall-clock profiling for trainer code. Timings are logged as
+# metrics named "<metric_prefix>: <name>" to Weights & Biases, MLflow and/or Trackio.
+# Main contents: ProfilingContext (timing context manager), profiling_context (factory from a Trainer) and
+# profiling_decorator (method decorator used throughout TRL trainers and VLLMGeneration).
+# Import-time side effects: imports mlflow, trackio and wandb when each is installed.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +40,10 @@ if is_wandb_available():
 
 
 class ProfilingContext:
+    # [CLASS DOC]
+    # Context manager that measures elapsed time of a block with time.perf_counter and logs it on exit.
+    # State: name, report_to (list of integration names), is_main_process, step (optional), metric_prefix
+    # (default "profiling/Time taken"), _start_time. Independent of Trainer.
     """
     Context manager for profiling code blocks with configurable logging.
 
@@ -85,6 +96,10 @@ class ProfilingContext:
         step: int | None = None,
         metric_prefix: str = "profiling/Time taken",
     ):
+        # [FUNCTION DOC]
+        # Behavior: store the arguments and set _start_time to None.
+        # Inputs: name, report_to, is_main_process (default True), step (optional), metric_prefix.
+        # Outputs: none. Exceptions: none. Side effects: none.
         self.name = name
         self.report_to = report_to
         self.is_main_process = is_main_process
@@ -93,11 +108,19 @@ class ProfilingContext:
         self._start_time = None
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Behavior: record the start time with perf_counter and return self.
+        # Inputs: none. Outputs: self. Exceptions: none. Side effects: sets _start_time.
         """Start timing when entering the context."""
         self._start_time = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC]
+        # Behavior: if timing started, compute the elapsed seconds and log them via _log_metrics; always return
+        # False so exceptions propagate (the duration is still logged when the block raised).
+        # Inputs: exc_type, exc_val, exc_tb. Outputs: False. Exceptions: errors from logging backends.
+        # Side effects: metric logging.
         """Stop timing and log metrics when exiting the context."""
         if self._start_time is not None:
             duration = time.perf_counter() - self._start_time
@@ -105,6 +128,13 @@ class ProfilingContext:
         return False
 
     def _log_metrics(self, duration: float) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Send one duration metric to the configured backends, only on the main process.
+        # Behavior: wandb.log when "wandb" in report_to, wandb is installed and a run is active (no step passed);
+        # mlflow.log_metrics with step when "mlflow" is configured and an active run exists; trackio.log with step
+        # when "trackio" is configured and installed.
+        # Inputs: duration (float seconds). Outputs: none. Exceptions: backend errors.
+        # Side effects: network/file writes by the logging backends.
         """
         Log profiling metrics to configured backends.
 
@@ -132,6 +162,11 @@ class ProfilingContext:
 
 
 def profiling_context(trainer: Trainer, name: str) -> ProfilingContext:
+    # [FUNCTION DOC]
+    # Build a ProfilingContext for a Trainer: name is "<TrainerClass>.<name>", report_to from trainer.args,
+    # is_main_process from trainer.accelerator, step from trainer.state.global_step.
+    # Inputs: trainer (Trainer-like with state, args, accelerator), name (str). Outputs: ProfilingContext.
+    # Exceptions: AttributeError when the trainer lacks those attributes. Side effects: none.
     """
     Factory function to create a ProfilingContext from a Trainer instance.
 
@@ -174,6 +209,15 @@ def profiling_context(trainer: Trainer, name: str) -> ProfilingContext:
 
 
 def profiling_decorator(func: Callable) -> Callable:
+    # [FUNCTION DOC]
+    # Decorator timing a method call on self.
+    # Behavior: returns a functools.wraps wrapper. If self has state and args, wrap the call in
+    # profiling_context(self, function name). Else if self has accelerator, wrap in a ProfilingContext with
+    # report_to empty (so nothing is actually logged). Otherwise just call the function.
+    # KNOWN ISSUE: the docstring says non-Trainer objects with an accelerator use it "for logging
+    # configuration", but report_to is empty for them, so their timings are measured and never reported.
+    # Inputs: func (callable taking self). Outputs: wrapped callable. Exceptions: none.
+    # Side effects: none at decoration time.
     """
     Decorator to profile a function and log execution time using [`extras.profiling.profiling_context`].
 
@@ -205,6 +249,10 @@ def profiling_decorator(func: Callable) -> Callable:
 
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: The wrapper described in profiling_decorator; forwards args/kwargs and returns func's result.
+        # Inputs: self, args, kwargs. Outputs: func's return value. Exceptions: propagates func's exceptions.
+        # Side effects: profiling metric logging for Trainer-like objects.
         # Check if self is a Trainer-like object with required attributes
         if hasattr(self, "state") and hasattr(self, "args"):
             with profiling_context(self, func.__name__):

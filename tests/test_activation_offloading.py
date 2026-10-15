@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for trl.models.activation_offloading: the OffloadActivations context manager (saved-tensor hooks that move
+# autograd activations to CPU and bring them back for backward) and NoOpManager (temporarily disables offloading).
+# Covers gradient equivalence with/without offloading (plain and PEFT models), NoOpManager, min_offload_size,
+# storage deduplication of views (only in streams mode), protection against reused allocator addresses, clearing
+# of stale tracker state between forwards, and parameter-storage filtering. All tests require an accelerator.
+# Import-time side effects: imports peft (LoraConfig, get_peft_model) only if available.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,9 +37,20 @@ if is_peft_available():
 
 
 class TestActivationOffloading(TrlTestCase):
+    # [CLASS DOC]
+    # Test case for activation offloading; each test builds its own model/context. Inherits TrlTestCase.
     @require_torch_accelerator
     @require_peft
     def test_offloading_with_peft_models(self) -> None:
+        # [FUNCTION DOC]
+        # Checks gradients of a LoRA-wrapped tiny Qwen2 (r 8, alpha 16, dropout 0.1) are the same with and without
+        # offloading.
+        # Setup: random token input (2, 10); seed 42 forward/backward without offloading, store trainable grads, clear
+        # grads, seed 42 forward under OffloadActivations (after update_model_params), backward outside the context.
+        # Assertions: each stored grad is close (rtol 1e-4, atol 1e-5) to the new grad of the same parameter.
+        # KNOWN ISSUE: the comparison is written as a tuple of the assert_close call and a message string, so the message is
+        # never used (assert_close still raises on mismatch).
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: allocates on the accelerator.
         """Test that activation offloading works with PEFT models."""
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id).to(torch_device)
@@ -81,6 +100,10 @@ class TestActivationOffloading(TrlTestCase):
 
     @require_torch_accelerator
     def test_noop_manager_with_offloading(self):
+        # [FUNCTION DOC]
+        # Checks that inside an OffloadActivations context, a forward/backward wrapped in NoOpManager yields the same
+        # gradients (rtol 1e-4, atol 1e-5) as one with offloading active, both seeded 42 on the tiny Qwen2 model.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: allocates on the accelerator.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id).to(torch_device)
         inp = torch.randint(0, 100, (2, 10), device=torch_device)
@@ -113,6 +136,10 @@ class TestActivationOffloading(TrlTestCase):
 
     @require_torch_accelerator
     def test_min_offload_size(self):
+        # [FUNCTION DOC]
+        # Smoke test: a two-layer Linear stack (5 to 5, 5 to 1000) runs forward and backward inside
+        # OffloadActivations with min_offload_size 1000, mixing offloaded and non-offloaded activations. Passes if no error.
+        # Inputs/Outputs: none. Exceptions: any runtime error fails the test. Side effects: accelerator allocations.
         """Test that tensors smaller than min_offload_size aren't offloaded"""
         model = nn.Sequential(
             nn.Linear(5, 5),  # Small layer that shouldn't be offloaded
@@ -130,6 +157,10 @@ class TestActivationOffloading(TrlTestCase):
 
     @require_torch_accelerator
     def test_real_hf_model(self):
+        # [FUNCTION DOC]
+        # Checks on tiny Qwen2 that the loss and every parameter gradient are identical (default tolerances) between a
+        # baseline forward/backward and one where forward and backward both run inside OffloadActivations (seed 42 each).
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: accelerator allocations.
         """Test with an actual HuggingFace model"""
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id).to(torch_device)
@@ -164,14 +195,29 @@ class TestActivationOffloading(TrlTestCase):
 
     @require_torch_accelerator
     def test_tensor_deduplication(self):
+        # [FUNCTION DOC]
+        # Checks that saved tensors sharing storage are deduplicated.
+        # Setup: nested ModelWithViews whose forward saves a flat view and a transpose of the same linear output;
+        # OffloadActivations with min_offload_size 1 and parameters registered; input (10, 100) requiring grad.
+        # Assertions: tensor_id counter positive; tracker has at least one offloaded (modified true) and one deduplicated
+        # (modified false) entry; number of unique offloaded storages is less than total tensor ids; backward succeeds.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: accelerator allocations.
         """Test that deduplication works correctly for tensors sharing storage"""
 
         class ModelWithViews(nn.Module):
+            # [CLASS DOC]
+            # HELPER: Tiny module with one Linear(100, 100) whose forward produces two views of the same output.
             def __init__(self):
+                # [FUNCTION DOC]
+                # HELPER: Initializes nn.Module and creates the Linear(100, 100) layer.
+                # Inputs: none. Outputs: none. Exceptions: none. Side effects: registers the submodule.
                 super().__init__()
                 self.linear = nn.Linear(100, 100)
 
             def forward(self, x):
+                # [FUNCTION DOC]
+                # HELPER: Applies the linear layer, then returns the sum of a flattened view plus the sum of its transpose.
+                # Inputs: x - tensor (N, 100). Outputs: scalar tensor. Exceptions: none. Side effects: none.
                 out = self.linear(x)
                 view1 = out.view(-1)
                 view2 = out.transpose(0, 1)
@@ -205,16 +251,35 @@ class TestActivationOffloading(TrlTestCase):
 
     @require_torch_accelerator
     def test_reused_storage_key_after_stash_reap_is_not_deduplicated(self):
+        # [FUNCTION DOC]
+        # Checks that when a storage key is reused by a new tensor after the earlier one was reaped from the forward stash,
+        # the new tensor is not mistaken for a live view.
+        # Setup: three 4x4 tensors; the module-level _get_unique_tensor_key is temporarily replaced by fake_storage_key so
+        # the first and third tensors share a key; OffloadActivations without pinned memory, with streams,
+        # min_offload_size 1 and max_fwd_stash_size 1; each tensor saved via the SaveTensor Function. The original key
+        # function is restored in a finally block.
+        # Assertions: all 3 tracker entries are offloaded, none deduplicated; backward succeeds.
+        # Inputs/Outputs: none. Exceptions: assertion failure.
+        # Side effects: temporarily monkeypatches the activation_offloading module function.
         """A reused allocator address should not be treated as a live view."""
 
         class SaveTensor(torch.autograd.Function):
+            # [CLASS DOC]
+            # HELPER: Custom autograd Function that saves its input for backward and returns the sum, so the saved tensor goes
+            # through the offloading pack/unpack hooks.
             @staticmethod
             def forward(ctx, tensor):
+                # [FUNCTION DOC]
+                # HELPER: Saves tensor on ctx for backward and returns its sum.
+                # Inputs: ctx, tensor. Outputs: scalar tensor. Exceptions: none. Side effects: stores tensor on ctx.
                 ctx.save_for_backward(tensor)
                 return tensor.sum()
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC]
+                # HELPER: Retrieves the saved tensor and returns a gradient of ones shaped like it, scaled by grad_output.
+                # Inputs: ctx, grad_output. Outputs: gradient tensor. Exceptions: none. Side effects: none.
                 (tensor,) = ctx.saved_tensors
                 return torch.ones_like(tensor) * grad_output
 
@@ -223,6 +288,10 @@ class TestActivationOffloading(TrlTestCase):
         reused = torch.randn(4, 4, device=torch_device, requires_grad=True)
 
         def fake_storage_key(tensor):
+            # [FUNCTION DOC]
+            # HELPER: Replacement storage-key function: returns a shared fixed key (with dtype) for the first and reused
+            # tensors, and a key based on the object id (with dtype) for any other tensor.
+            # Inputs: tensor. Outputs: tuple key. Exceptions: none. Side effects: none.
             if id(tensor) in {id(first), id(reused)}:
                 return ("reused-storage-key", tensor.dtype)
             return (id(tensor), tensor.dtype)
@@ -252,15 +321,30 @@ class TestActivationOffloading(TrlTestCase):
 
     @require_torch_accelerator
     def test_stale_tracker_state_is_cleared_between_forwards(self):
+        # [FUNCTION DOC]
+        # Checks that tracker entries from an unused graph branch do not accumulate across steps.
+        # Setup: nested ModelWithUnusedBranch returning sums of a used and an unused Linear(8, 8); OffloadActivations without
+        # pinned memory or streams, min_offload_size 1. Three iterations of zeroing grads, forward under the context,
+        # backward on the used output only, recording the tracker length.
+        # Assertion: all three recorded lengths are equal.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: accelerator allocations.
         """Test that tensors from unused graph branches don't accumulate across steps."""
 
         class ModelWithUnusedBranch(nn.Module):
+            # [CLASS DOC]
+            # HELPER: Module with two Linear(8, 8) layers, used and unused, whose outputs are both returned as sums.
             def __init__(self):
+                # [FUNCTION DOC]
+                # HELPER: Initializes nn.Module and creates the used and unused Linear(8, 8) layers.
+                # Inputs: none. Outputs: none. Exceptions: none. Side effects: registers submodules.
                 super().__init__()
                 self.used = nn.Linear(8, 8)
                 self.unused = nn.Linear(8, 8)
 
             def forward(self, x):
+                # [FUNCTION DOC]
+                # HELPER: Returns a tuple (sum of used(x), sum of unused(x)).
+                # Inputs: x - tensor (N, 8). Outputs: tuple of two scalars. Exceptions: none. Side effects: none.
                 return self.used(x).sum(), self.unused(x).sum()
 
         model = ModelWithUnusedBranch().to(torch_device)
@@ -280,6 +364,10 @@ class TestActivationOffloading(TrlTestCase):
 
     @require_torch_accelerator
     def test_parameter_filtering(self):
+        # [FUNCTION DOC]
+        # Checks update_model_params records the untyped storage data pointers of all parameters of a two-layer Linear
+        # model: param_storages is non-empty and equals the set of parameter storage pointers.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: accelerator allocations.
         """Test that model parameters are filtered during offloading"""
         model = nn.Sequential(nn.Linear(10, 20), nn.Linear(20, 10)).to(torch_device)
         offload_ctx = OffloadActivations()
@@ -292,20 +380,39 @@ class TestActivationOffloading(TrlTestCase):
 
     @require_torch_accelerator
     def test_tensor_deduplication_only_happens_in_streams_mode(self):
+        # [FUNCTION DOC]
+        # Checks that two saved views of the same 64x64 base tensor are both offloaded when use_streams is False (flags
+        # true, true) but the second is deduplicated when use_streams is True (flags true, false).
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: accelerator allocations.
         """Two saved views of the same storage are deduplicated (one re-offload skipped) only when use_streams=True."""
 
         class SaveTensor(torch.autograd.Function):
+            # [CLASS DOC]
+            # HELPER: Custom autograd Function that saves its input for backward and returns the sum, so the saved tensor goes
+            # through the offloading pack/unpack hooks.
             @staticmethod
             def forward(ctx, tensor):
+                # [FUNCTION DOC]
+                # HELPER: Saves tensor on ctx for backward and returns its sum.
+                # Inputs: ctx, tensor. Outputs: scalar tensor. Exceptions: none. Side effects: stores tensor on ctx.
                 ctx.save_for_backward(tensor)
                 return tensor.sum()
 
             @staticmethod
             def backward(ctx, grad_output):
+                # [FUNCTION DOC]
+                # HELPER: Retrieves the saved tensor and returns a gradient of ones shaped like it, scaled by grad_output.
+                # Inputs: ctx, grad_output. Outputs: gradient tensor. Exceptions: none. Side effects: none.
                 (tensor,) = ctx.saved_tensors
                 return torch.ones_like(tensor) * grad_output
 
         def offload_two_views(use_streams: bool) -> list[bool]:
+            # [FUNCTION DOC]
+            # HELPER: Creates a random 64x64 base tensor requiring grad, takes a flat view and a transpose, saves both via
+            # SaveTensor inside an OffloadActivations context (min_offload_size 1, given use_streams), collects the "modified"
+            # flag of every tracker entry, then runs backward.
+            # Inputs: use_streams - bool. Outputs: list of bool (true means offloaded, false means deduplicated).
+            # Exceptions: none expected. Side effects: accelerator allocations, runs backward.
             base = torch.randn(64, 64, device=torch_device, requires_grad=True)
             view1 = base.view(-1)
             view2 = base.transpose(0, 1)

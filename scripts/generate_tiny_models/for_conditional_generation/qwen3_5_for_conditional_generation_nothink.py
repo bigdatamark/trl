@@ -1,3 +1,21 @@
+# [MODULE DOC]
+# Script that builds and publishes a tiny randomly initialized Qwen3_5ForConditionalGeneration (thinking disabled by default) checkpoint for tests.
+# Reference checkpoint: Qwen/Qwen3.5-0.8B, whose chat template defaults to non-thinking.
+# Behavior: requires transformers 5.2.0; loads only the processor (no generation config exists upstream); builds
+# a 2-layer text model (hidden 16, 4 heads, 2 KV heads) with layer types linear then full attention and
+# full_attention_interval 2, and a 2-block vision tower (hidden 16, 4 heads, intermediate 32, out 16);
+# instantiates in bfloat16, then casts A_log and the norm weight of every linear-attention layer back to
+# float32 to match upstream; runs smoke test, dtype check, config diff and pushes with suffix NoThink and no
+# generation config.
+# Inputs: none programmatic; command-line flags are parsed inside the shared push_to_hub helper of the
+# _common module (e.g. --create-pr). Requires network access to the Hugging Face Hub and write credentials.
+# Outputs: none returned; prints a config diff vs the reference checkpoint and status messages.
+# Exceptions: propagates errors from the version check, Hub downloads, the smoke test and the dtype check.
+# Side effects (all at import/run time, since the whole script is top-level code): checks the installed
+# transformers version, seeds RNGs, downloads the reference config/processor from the Hub, and uploads
+# the tiny model to the trl-internal-testing organization unless the repo already exists.
+# Contents: no functions or classes; meant to be run as a module (python -m) from the generate_tiny_models package.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

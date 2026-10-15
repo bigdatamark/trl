@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Implements reward-model (outcome-supervised, Bradley-Terry) training: RewardTrainer fine-tunes a
+# single-output AutoModelForSequenceClassification on preference pairs so that chosen completions
+# score higher than rejected ones. Also contains DataCollatorForPreference (pads chosen then
+# rejected sequences into one batch) and context managers that silence the expected
+# "newly initialized score head / unused lm_head" warnings when loading a causal LM checkpoint as a
+# sequence classifier (version-dependent strategy).
+# Import-time side effects: imports peft (PeftConfig, PeftModel, PrefixTuningConfig,
+# get_peft_model) only if available; creates the module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -80,6 +90,14 @@ logger = get_logger(__name__)
 # Note: in transformers < 4.57.0, only the MISSING score.weight warning is emitted; lm_head.weight is not reported.
 @contextmanager
 def _suppress_seqcls_cross_arch_keys(logger: logging.Logger):
+    # [FUNCTION DOC]
+    # HELPER: Context manager for transformers < 4.57.0 that hides the "Some weights of ... were not
+    # initialized ... newly initialized" warning on a given logger.
+    # Behavior: compiles a regex matching that two-line message, attaches a logging.Filter rejecting
+    # matching records to the logger for the duration of the block, removes it afterwards.
+    # Inputs: logger (logging.Logger) to filter. Outputs: yields nothing.
+    # Exceptions: none of its own; exceptions in the block propagate after the filter is removed.
+    # Side effects: temporarily adds a filter to the logger.
     pattern = re.compile(
         r"^Some weights of \S+ were not initialized from the model checkpoint at \S+ and are newly initialized: "
         r"\[.*\]\nYou should probably TRAIN this model on a down-stream task to be able to use it for predictions and "
@@ -87,7 +105,13 @@ def _suppress_seqcls_cross_arch_keys(logger: logging.Logger):
     )
 
     class _Filter(logging.Filter):
+        # [CLASS DOC]
+        # HELPER: logging.Filter subclass closed over the compiled pattern; drops matching records.
+        # State: none. Side effects: none.
         def filter(self, record: logging.LogRecord) -> bool:
+            # [FUNCTION DOC]
+            # HELPER: Returns False (drop) if the record's formatted message matches the pattern, else True.
+            # Inputs: record (logging.LogRecord). Outputs: bool. Exceptions: none. Side effects: none.
             return not pattern.search(record.getMessage())
 
     f = _Filter()
@@ -101,6 +125,14 @@ def _suppress_seqcls_cross_arch_keys(logger: logging.Logger):
 # New approach using scoped override (for transformers >= 4.57.0)
 @contextmanager
 def _ignore_seqcls_cross_arch_keys():
+    # [FUNCTION DOC]
+    # HELPER: Context manager for transformers >= 4.57.0 that temporarily extends the class-level
+    # ignore lists on GenericForSequenceClassification.
+    # Behavior: copies the existing _keys_to_ignore_on_load_missing (or empty) and adds the regex for
+    # the score weight; copies _keys_to_ignore_on_load_unexpected (or empty) and adds the regex for the
+    # lm_head prefix; assigns both, yields, and restores the original values (including None) on exit.
+    # Inputs: none. Outputs: yields nothing. Exceptions: none of its own.
+    # Side effects: mutates class attributes globally while active (not thread-safe).
     # Scoped override: ignore the expected seq-clf head key (newly added) and the causal LM head
     # key (present in the checkpoint but absent from seq-clf).
     old_missing = getattr(GenericForSequenceClassification, "_keys_to_ignore_on_load_missing", None)
@@ -126,6 +158,12 @@ def _ignore_seqcls_cross_arch_keys():
 # Version-aware wrapper that chooses the appropriate approach
 @contextmanager
 def suppress_seqcls_warning():
+    # [FUNCTION DOC]
+    # HELPER: Version-aware context manager used around model loading in RewardTrainer.
+    # Behavior: if transformers version >= 4.57.0 enters _ignore_seqcls_cross_arch_keys; otherwise
+    # enters _suppress_seqcls_cross_arch_keys on the "transformers.modeling_utils" logger.
+    # Inputs: none. Outputs: yields nothing. Exceptions: none of its own.
+    # Side effects: those of the chosen context manager.
     # Use the new approach for transformers >= 4.57.0, old approach for earlier versions
     # The old approach is needed for 4.56.2 to avoid meta tensor issues with device_map=None
     if Version(transformers.__version__) >= Version("4.57.0"):
@@ -140,6 +178,12 @@ def suppress_seqcls_warning():
 
 @dataclass
 class DataCollatorForPreference(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator (DataCollatorMixin) for tokenized preference pairs.
+    # Attributes: pad_token_id (int, required), pad_to_multiple_of (int or None), return_tensors
+    # ("pt"; DataCollatorMixin dispatches to torch_call).
+    # Output layout: batch of size 2N where rows 0..N-1 are chosen and N..2N-1 are rejected.
+    # Side effects: none.
     """
     Data collator used for preference data. Inputs are dynamically padded to the maximum length of a batch.
 
@@ -201,6 +245,16 @@ class DataCollatorForPreference(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Builds the padded batch.
+        # Behavior: converts each example's chosen_ids and rejected_ids to tensors, concatenates the list
+        # of chosen followed by the list of rejected, builds all-ones attention masks, right-pads ids with
+        # pad_token_id and masks with 0 (optionally to a multiple of pad_to_multiple_of). If the first
+        # example has "margin", margins of all examples are collected as a float tensor of shape (N,).
+        # Inputs: examples (list of dicts with chosen_ids, rejected_ids, optional margin).
+        # Outputs: dict with input_ids and attention_mask of shape (2N, L), plus margin if present.
+        # Exceptions: KeyError if an example lacks a required key (or margin when the first has it).
+        # Side effects: none.
         # Convert to tensor
         chosen_ids = [torch.tensor(example["chosen_ids"]) for example in examples]
         rejected_ids = [torch.tensor(example["rejected_ids"]) for example in examples]
@@ -230,6 +284,15 @@ class DataCollatorForPreference(DataCollatorMixin):
 
 
 class RewardTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer (via _BaseTrainer, a transformers.Trainer subclass) for scalar reward models.
+    # Construction (__init__) loads/validates the model, tokenizer, PEFT, pad token, collator and
+    # datasets, then calls Trainer.__init__. Training uses compute_loss (pairwise log-sigmoid loss,
+    # optional margin and centering term), records metrics in self._metrics[mode] which log() averages
+    # and flushes. evaluate() preprocesses raw datasets passed at call time. training_step wraps the
+    # parent in an activation-offloading context; _save_checkpoint also writes a model card.
+    # Key state: _metrics (per-mode dict of lists), _total_train_tokens, _tp_size,
+    # maybe_activation_offload_context, can_return_loss True and empty label_names.
     """
     Trainer for Outcome-supervised Reward Models (ORM).
 
@@ -354,6 +417,45 @@ class RewardTrainer(_BaseTrainer):
         quantization_config: "BitsAndBytesConfig | None" = None,
         peft_config: "PeftConfig | None" = None,
     ):
+        # [FUNCTION DOC]
+        # Builds a ready-to-train reward trainer.
+        # Behavior:
+        # 1. args default to RewardConfig with output_dir "<model basename>-Reward".
+        # 2. train_dataset is required; IterableDataset forces accelerator dispatch_batches False (warning
+        # if it was True); other non-Dataset types rejected.
+        # 3. set_seed(args.seed) before loading (random score head). If model is a string: copy
+        # model_init_kwargs, inject quantization_config (error if also in kwargs), device_map None under
+        # MULTI_GPU/DEEPSPEED, num_labels 1, default trust_remote_code, load with
+        # create_model_from_path under suppress_seqcls_warning. Otherwise warn that model_init_kwargs /
+        # quantization_config are ignored and require model.config.num_labels to be 1.
+        # 4. Tokenizer: AutoTokenizer from the model id and revision when processing_class is None.
+        # 5. args.eos_token: must be in vocab; set on tokenizer and mirrored to text config eos_token_id.
+        # 6. chat_template_path: a .jinja/.j2 file is read into chat_template; otherwise
+        # clone_chat_template is applied and may return added tokens.
+        # 7. PEFT: requires peft installed, a PeftConfig, a non-PEFT model; added tokens become trainable
+        # token indices and lm_head is appended to modules_to_save (with a warning); under ZeRO-3 with a
+        # non-quantized model passes autocast_adapter_dtype False; rejects prefix tuning with
+        # peft <= 0.17.1 on a device-mapped model; wraps with get_peft_model.
+        # 8. PEFT + ZeRO-3 + gradient checkpointing forces use_reentrant True (warn if user set False);
+        # PEFT + gradient checkpointing enables input require-grads; quantized models get trainable
+        # non-DoRA-magnitude params cast to bfloat16.
+        # 9. Optionally disables dropout. Pad token = args.pad_token, else tokenizer pad, else eos; must be
+        # in vocab; set on tokenizer and text config pad_token_id.
+        # 10. Default collator DataCollatorForPreference; prepares train and eval datasets (dict eval
+        # datasets per key).
+        # 11. For transformers < 5.0.0 with gradient checkpointing, default use_reentrant to False.
+        # 12. Calls Trainer.__init__, rejects n_gpu > 1 (DataParallel), sets can_return_loss and
+        # label_names, activation-offload context, metric stores, tp size from parallelism_config, and
+        # adds model tags.
+        # Inputs: model, args, data_collator, train_dataset, eval_dataset, processing_class,
+        # compute_metrics, callbacks, optimizers, optimizer_cls_and_kwargs,
+        # preprocess_logits_for_metrics, quantization_config, peft_config.
+        # Outputs: none.
+        # Exceptions: ValueError (missing dataset, duplicate quantization config, num_labels not 1, eos or
+        # pad token not in vocab, PEFT model with peft_config, old peft prefix tuning, DataParallel);
+        # TypeError (bad dataset or peft_config type); ImportError (peft missing).
+        # Side effects: seeds RNGs; mutates args (dispatch_batches, gradient_checkpointing_kwargs),
+        # tokenizer, model config and peft_config; may download models; logs warnings.
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
@@ -653,6 +755,19 @@ class RewardTrainer(_BaseTrainer):
         args: RewardConfig,
         dataset_name: str,
     ) -> Dataset | IterableDataset:
+        # [FUNCTION DOC]
+        # HELPER: Tokenizes and filters a preference dataset; idempotent on already-processed data.
+        # Behavior: processed if chosen_ids and rejected_ids columns exist; legacy chosen_input_ids /
+        # rejected_input_ids columns are renamed with a FutureWarning. num_proc set for map-style datasets.
+        # Inside global_then_local_main_first: if not processed, (a) for non-conversational data append
+        # the tokenizer EOS to chosen and rejected text when missing; (b) tokenize: parse a JSON-string
+        # "tools" column, merge per-example chat_template_kwargs, prepend "prompt" to chosen and rejected
+        # when present, then tokenize each (conversational via chat template with tools) into chosen_ids
+        # and rejected_ids. Then, when max_length is set, drop pairs where either side is longer.
+        # Inputs: dataset, processing_class, args (RewardConfig), dataset_name (for progress text).
+        # Outputs: the processed Dataset or IterableDataset.
+        # Exceptions: errors from map/tokenization (e.g. missing chosen/rejected keys).
+        # Side effects: emits FutureWarning; may write datasets cache files.
         # If the dataset is already preprocessed (tokenized), skip the processing steps.
         column_names = get_dataset_column_names(dataset)
         is_processed = "chosen_ids" in column_names and "rejected_ids" in column_names
@@ -682,6 +797,10 @@ class RewardTrainer(_BaseTrainer):
                         map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
                     def add_eos(example, eos_token):
+                        # [FUNCTION DOC]
+                        # HELPER: Appends eos_token to example chosen (and rejected if present) when not already ending
+                        # with it. Inputs: example dict, eos_token str. Outputs: the mutated example. Exceptions: none.
+                        # Side effects: mutates example in place.
                         if not example["chosen"].endswith(eos_token):
                             example["chosen"] = example["chosen"] + eos_token
                         if "rejected" in example and not example["rejected"].endswith(eos_token):
@@ -699,6 +818,11 @@ class RewardTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
                 def tokenize_fn(example, processing_class):
+                    # [FUNCTION DOC]
+                    # HELPER: Tokenizes one example into chosen_ids and rejected_ids as described in the parent block.
+                    # Inputs: example dict, processing_class. Outputs: dict with chosen_ids and rejected_ids lists.
+                    # Exceptions: KeyError for missing chosen/rejected; JSON errors for malformed tools strings.
+                    # Side effects: mutates example chosen/rejected when a prompt is present.
                     tools = example.get("tools")
                     tools = json.loads(tools) if isinstance(tools, str) else tools
                     apply_chat_template_kwargs = {"tools": tools, **example.get("chat_template_kwargs", {})}
@@ -742,6 +866,10 @@ class RewardTrainer(_BaseTrainer):
         return dataset
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # Override: when unset, keeps columns chosen_ids, rejected_ids and margin so remove_unused_columns
+        # does not drop them. Inputs: self. Outputs: none. Exceptions: none.
+        # Side effects: sets self._signature_columns.
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs (usually, "input_ids"
         # and "attention_mask").
@@ -759,6 +887,13 @@ class RewardTrainer(_BaseTrainer):
         ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Override that preprocesses datasets passed directly to evaluate.
+        # Behavior: if eval_dataset is given and not a string key, runs _prepare_dataset on it (per key for
+        # dicts), then delegates to Trainer.evaluate.
+        # Inputs: eval_dataset, ignore_keys, metric_key_prefix ("eval"). Outputs: metrics dict.
+        # Exceptions: those of preprocessing and evaluation. Side effects: logging and metric resets via
+        # the parent.
         # When a dataset is passed directly to `evaluate` (e.g. a held-out test set), preprocess it the same way
         # `__init__` does, so that `evaluate` accepts the same dataset types as the trainer. `_prepare_dataset` is
         # idempotent: it skips datasets that are already tokenized. A `str` selects a dataset that was already prepared
@@ -776,6 +911,19 @@ class RewardTrainer(_BaseTrainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Computes the pairwise reward loss and records metrics.
+        # Behavior: sets use_cache False, runs the model, squeezes logits to shape (2N,) and splits into
+        # chosen (first half) and rejected (second half) rewards. Loss = negative mean log-sigmoid of
+        # (chosen minus rejected, minus margin if provided). If center_rewards_coefficient is set, adds it
+        # times the mean of (chosen plus rejected) squared. In train mode, adds the globally gathered
+        # attention-mask sum divided by tp size to _total_train_tokens; num_tokens metric is set to that
+        # total in both modes. Without grad, logs min/mean/max of gathered rewards, accuracy (fraction
+        # chosen > rejected) and mean margin (chosen minus rejected), each gathered across processes.
+        # Inputs: model, inputs (collator batch), return_outputs, num_items_in_batch (unused).
+        # Outputs: loss tensor, or (loss, outputs) when return_outputs.
+        # Exceptions: none of its own. Side effects: mutates inputs, _total_train_tokens, _metrics;
+        # cross-process gathers.
         mode = "train" if self.model.training else "eval"
 
         # If not set, defaults from model config and may warn since cache isn't compatible with gradient checkpointing
@@ -818,10 +966,21 @@ class RewardTrainer(_BaseTrainer):
 
     # Override training step to add activation offloading context.
     def training_step(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Runs Trainer.training_step inside maybe_activation_offload_context.
+        # Inputs: passthrough args. Outputs: the parent's loss. Exceptions: none of its own.
+        # Side effects: those of the parent step.
         with self.maybe_activation_offload_context:
             return super().training_step(*args, **kwargs)
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Merges averaged custom metrics into logs.
+        # Behavior: mode from model.training; averages each list in _metrics[mode]; prefixes keys with
+        # "eval_" in eval mode; updates logs, calls the parent log, then clears _metrics[mode].
+        # Inputs: logs dict, start_time. Outputs: none.
+        # Exceptions: ZeroDivisionError if a metric list were empty (not normally possible).
+        # Side effects: mutates logs and clears stored metrics; parent emits to callbacks/loggers.
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
@@ -836,6 +995,12 @@ class RewardTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Writes a model card before the regular checkpoint save.
+        # Behavior: model name is the output_dir basename, or the last component of hub_model_id when set;
+        # calls create_model_card then the parent _save_checkpoint.
+        # Inputs: model, trial. Outputs: none. Exceptions: those of saving.
+        # Side effects: writes README/model card and checkpoint files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for TRL's CLI utilities: TrlParser (dataclass argument parser with YAML --config support, env section,
+# remaining strings and subparsers) and get_dataset with DatasetMixtureConfig/DatasetConfig (loading, streaming,
+# mixing, column selection, fraction weighting, test split creation, YAML parsing).
+# Main contents: two small dataclasses used as parser targets, TestTrlParser and TestGetDataset.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,16 +45,22 @@ from .testing_utils import TrlTestCase
 
 @dataclass
 class MyDataclass:
+    # [CLASS DOC]
+    # HELPER: Minimal parser target dataclass with arg1 (int, required) and arg2 (str, default "default").
     arg1: int
     arg2: str = "default"
 
 
 @dataclass
 class InvalidDataclass:
+    # [CLASS DOC]
+    # HELPER: Dataclass with a field named "config", which TrlParser must reject because it clashes with --config.
     config: str  # This should raise an error in the TrlParser
 
 
 class TestTrlParser(TrlTestCase):
+    # [CLASS DOC]
+    # Tests TrlParser construction and parse_args_and_config behavior. Inherits TrlTestCase.
     @pytest.mark.parametrize(
         ("config_cls", "field_name", "value", "expected"),
         [
@@ -59,6 +72,10 @@ class TestTrlParser(TrlTestCase):
         ],
     )
     def test_dict_field_from_command_line(self, config_cls, field_name, value, expected):
+        # [FUNCTION DOC]
+        # Parametrized over config classes and dict-typed fields (SFT dataset_kwargs, GRPO/RLOO chat_template_kwargs,
+        # GRPO/Distillation generation_kwargs): parses "--output_dir dummy --<field> <json>" and asserts the field equals
+        # the decoded dict. Inputs: config_cls, field_name, value, expected. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Dict-typed fields are passed as JSON on the command line and decoded into dicts."""
         parser = TrlParser(dataclass_types=[config_cls])
         (config,) = parser.parse_args_into_dataclasses(["--output_dir", "dummy", f"--{field_name}", value])
@@ -71,17 +88,25 @@ class TestTrlParser(TrlTestCase):
         ("value", "expected"), [("128", 128), ("None", None), ("none", None), ("null", None), ("auto", None)]
     )
     def test_pad_to_multiple_of_from_command_line(self, config_cls, value, expected):
+        # [FUNCTION DOC]
+        # Parametrized over all trainer config classes and string values "128", "None", "none", "null", "auto": asserts
+        # pad_to_multiple_of parses to 128 or None ("auto" resolves to None when not on Neuron).
+        # Inputs: config_cls, value, expected. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """`pad_to_multiple_of` arrives as a string on the command line; `"auto"` resolves to `None` off Neuron."""
         parser = TrlParser(dataclass_types=[config_cls])
         (config,) = parser.parse_args_into_dataclasses(["--output_dir", "dummy", "--pad_to_multiple_of", value])
         assert config.pad_to_multiple_of == expected
 
     def test_init_without_config_field(self):
+        # [FUNCTION DOC]
+        # Checks TrlParser accepts MyDataclass and returns a TrlParser instance. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test initialization without 'config' field in the dataclasses."""
         parser = TrlParser(dataclass_types=[MyDataclass])
         assert isinstance(parser, TrlParser)
 
     def test_init_with_config_field(self):
+        # [FUNCTION DOC]
+        # Checks TrlParser raises ValueError ("has a field named 'config'") for InvalidDataclass. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test initialization with a 'config' field in the dataclass (should raise ValueError)."""
         with pytest.raises(ValueError, match="has a field named 'config'"):
             TrlParser(dataclass_types=[InvalidDataclass])
@@ -90,6 +115,13 @@ class TestTrlParser(TrlTestCase):
     @patch("yaml.safe_load")
     @patch("os.environ", new_callable=dict)  # Mock os.environ as a dictionary
     def test_parse_args_and_config_with_valid_config(self, mock_environ, mock_yaml_load):
+        # [FUNCTION DOC]
+        # Checks a YAML config with an env section and arg1 2 combined with CLI --arg2 value yields MyDataclass(arg1 2,
+        # arg2 "value"). Setup: builtins.open is patched with mock_open and yaml.safe_load is patched to return the config dict, so
+        # "config.yaml" is never read from disk. os.environ is replaced with a plain dict.
+        # KNOWN ISSUE: the test writes VAR1/VAR2 into the mocked environ itself before asserting them, so it does not verify
+        # that the parser exported the env section.
+        # Inputs: mock_environ, mock_yaml_load (patch-injected). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test parse_args_and_config method with valid arguments and config."""
         mock_yaml_load.return_value = {"env": {"VAR1": "value1", "VAR2": "value2"}, "arg1": 2}
 
@@ -117,6 +149,10 @@ class TestTrlParser(TrlTestCase):
     @patch("builtins.open", mock_open(read_data="arg1: 2"))
     @patch("yaml.safe_load")
     def test_parse_args_and_arg_override_config(self, mock_yaml_load):
+        # [FUNCTION DOC]
+        # Checks a CLI value (--arg1 3) overrides the config value (arg1 2). Setup: builtins.open is patched with mock_open and yaml.safe_load is patched to return the config dict, so
+        # "config.yaml" is never read from disk.
+        # Inputs: mock_yaml_load. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test parse_args_and_config method and check that arguments override the config."""
         mock_yaml_load.return_value = {"arg1": 2}  # this arg is meant to be overridden
 
@@ -135,6 +171,10 @@ class TestTrlParser(TrlTestCase):
     @patch("builtins.open", mock_open(read_data="env: not_a_dict"))
     @patch("yaml.safe_load")
     def test_parse_args_and_config_with_invalid_env(self, mock_yaml_load):
+        # [FUNCTION DOC]
+        # Checks a config whose env field is a string raises ValueError ("env field should be a dict").
+        # Setup: builtins.open is patched with mock_open and yaml.safe_load is patched to return the config dict, so
+        # "config.yaml" is never read from disk. Inputs: mock_yaml_load. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test parse_args_and_config method when the 'env' field is not a dictionary."""
         mock_yaml_load.return_value = {"env": "not_a_dict"}
 
@@ -149,6 +189,10 @@ class TestTrlParser(TrlTestCase):
     @patch("builtins.open", mock_open())
     @patch("yaml.safe_load")
     def test_parse_args_and_config_with_non_mapping_config(self, mock_yaml_load, config):
+        # [FUNCTION DOC]
+        # Parametrized over YAML contents None, empty list, string and int: checks parse_args_and_config raises ValueError
+        # ("must contain a YAML mapping"). Setup: builtins.open is patched with mock_open and yaml.safe_load is patched to return the config dict, so
+        # "config.yaml" is never read from disk. Inputs: mock_yaml_load, config. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         mock_yaml_load.return_value = config
         parser = TrlParser(dataclass_types=[MyDataclass])
 
@@ -156,6 +200,8 @@ class TestTrlParser(TrlTestCase):
             parser.parse_args_and_config(["--config", "config.yaml"])
 
     def test_parse_args_and_config_without_config(self):
+        # [FUNCTION DOC]
+        # Checks plain CLI parsing without --config returns one MyDataclass with arg1 2 and arg2 "value". Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test parse_args_and_config without the `--config` argument."""
         parser = TrlParser(dataclass_types=[MyDataclass])
 
@@ -171,6 +217,8 @@ class TestTrlParser(TrlTestCase):
         assert result_args[0].arg2 == "value"
 
     def test_set_defaults_with_config(self):
+        # [FUNCTION DOC]
+        # Checks set_defaults_with_config(arg1 42) makes parsing an empty argv yield arg1 42. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test set_defaults_with_config updates the defaults."""
         parser = TrlParser(dataclass_types=[MyDataclass])
 
@@ -184,6 +232,8 @@ class TestTrlParser(TrlTestCase):
         assert result_args[0].arg1 == 42
 
     def test_parse_args_and_config_with_remaining_strings(self):
+        # [FUNCTION DOC]
+        # Checks return_remaining_strings True returns the dataclass plus the unknown positional list ["remaining"]. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         parser = TrlParser(dataclass_types=[MyDataclass])
 
         args = ["--arg1", "2", "--arg2", "value", "remaining"]
@@ -201,6 +251,11 @@ class TestTrlParser(TrlTestCase):
     @patch("builtins.open", mock_open(read_data="remaining_string_in_config: abc"))
     @patch("yaml.safe_load")
     def test_parse_args_and_config_with_remaining_strings_in_config_and_args(self, mock_yaml_load):
+        # [FUNCTION DOC]
+        # Checks unknown keys from the config and unknown CLI flags are both returned as remaining strings, config-derived
+        # flags first ("--remaining_string_in_config abc" then "--remaining_string_in_args def"). Setup: builtins.open is patched with mock_open and yaml.safe_load is patched to return the config dict, so
+        # "config.yaml" is never read from disk.
+        # Inputs: mock_yaml_load. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         mock_yaml_load.return_value = {"remaining_string_in_config": "abc"}
 
         parser = TrlParser(dataclass_types=[MyDataclass])
@@ -219,6 +274,10 @@ class TestTrlParser(TrlTestCase):
     @patch("builtins.open", mock_open(read_data="arg1: 2\narg2: config_value"))
     @patch("yaml.safe_load")
     def test_subparsers_with_config_defaults(self, mock_yaml_load):
+        # [FUNCTION DOC]
+        # Checks config values become defaults for a subparser: parsing "subcommand --config" yields arg1 2 and arg2
+        # "config_value". Setup: a bare TrlParser with subparsers (dest "command", parser_class TrlParser) and a "subcommand" parser
+        # for MyDataclass; YAML loading mocked to return arg1 2 and a second key. Inputs: mock_yaml_load. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test that config defaults are applied to all subparsers."""
         mock_yaml_load.return_value = {"arg1": 2, "arg2": "config_value"}
 
@@ -245,6 +304,10 @@ class TestTrlParser(TrlTestCase):
     @patch("builtins.open", mock_open(read_data="arg1: 2\narg2: config_value"))
     @patch("yaml.safe_load")
     def test_subparsers_with_config_defaults_and_arg_override(self, mock_yaml_load):
+        # [FUNCTION DOC]
+        # Checks a CLI flag to a subcommand (--arg1 3) overrides the config while arg2 still comes from the config.
+        # Setup: a bare TrlParser with subparsers (dest "command", parser_class TrlParser) and a "subcommand" parser
+        # for MyDataclass; YAML loading mocked to return arg1 2 and a second key. Inputs: mock_yaml_load. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test that config defaults are applied to all subparsers."""
         mock_yaml_load.return_value = {"arg1": 2, "arg2": "config_value"}
 
@@ -268,6 +331,12 @@ class TestTrlParser(TrlTestCase):
     @patch("builtins.open", mock_open(read_data="arg1: 2\nthis_arg_does_not_exist: config_value"))
     @patch("yaml.safe_load")
     def test_subparsers_with_config_defaults_and_arg_override_wrong_name(self, mock_yaml_load):
+        # [FUNCTION DOC]
+        # Checks an unknown config key raises ValueError by default and is accepted when fail_with_unknown_args is False.
+        # Setup: a bare TrlParser with subparsers (dest "command", parser_class TrlParser) and a "subcommand" parser
+        # for MyDataclass; YAML loading mocked to return arg1 2 and a second key.
+        # KNOWN ISSUE: its docstring is copied from the defaults test and does not describe the unknown-key behavior tested.
+        # Inputs: mock_yaml_load. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test that config defaults are applied to all subparsers."""
         mock_yaml_load.return_value = {"arg1": 2, "this_arg_does_not_exist": "config_value"}
 
@@ -290,6 +359,10 @@ class TestTrlParser(TrlTestCase):
     @patch("builtins.open", mock_open(read_data="arg1: 2\narg2: config_value"))
     @patch("yaml.safe_load")
     def test_subparsers_multiple_with_config_defaults(self, mock_yaml_load):
+        # [FUNCTION DOC]
+        # Checks config defaults apply to each of two subparsers (subcommand0, subcommand1): both parse to arg1 2 and
+        # arg2 "config_value". Setup: a bare TrlParser with subparsers (dest "command", parser_class TrlParser) and a "subcommand" parser
+        # for MyDataclass; YAML loading mocked to return arg1 2 and a second key. Inputs: mock_yaml_load. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         """Test that config defaults are applied to all subparsers."""
         mock_yaml_load.return_value = {"arg1": 2, "arg2": "config_value"}
 
@@ -317,7 +390,11 @@ class TestTrlParser(TrlTestCase):
 
 
 class TestGetDataset:
+    # [CLASS DOC]
+    # Tests get_dataset on real zen dataset configs. Plain pytest class (no TrlTestCase), no state.
     def test_single_dataset_with_config(self):
+        # [FUNCTION DOC]
+        # Checks a single language-modeling dataset entry yields the same train split as load_dataset. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         mixture_config = DatasetMixtureConfig(
             datasets=[DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling")]
         )
@@ -326,6 +403,8 @@ class TestGetDataset:
         assert expected["train"][:] == result["train"][:]
 
     def test_single_dataset_preference_config(self):
+        # [FUNCTION DOC]
+        # Same as the single-dataset test for the standard_preference config. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         mixture_config = DatasetMixtureConfig(
             datasets=[DatasetConfig(path="trl-internal-testing/zen", name="standard_preference")]
         )
@@ -334,6 +413,8 @@ class TestGetDataset:
         assert expected["train"][:] == result["train"][:]
 
     def test_single_dataset_streaming(self):
+        # [FUNCTION DOC]
+        # Checks streaming True yields an iterable train split whose rows equal the non-streaming train rows. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         mixture_config = DatasetMixtureConfig(
             datasets=[DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling")],
             streaming=True,
@@ -343,6 +424,10 @@ class TestGetDataset:
         assert expected["train"].to_list() == list(result["train"])
 
     def test_dataset_mixture_basic(self):
+        # [FUNCTION DOC]
+        # Checks mixing the prompt_completion and preference train splits restricted to the prompt column gives a
+        # DatasetDict whose train split has only "prompt", with the first half equal to the preference prompts and the
+        # second half equal to the prompt_completion prompts. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         dataset_config1 = DatasetConfig(
             path="trl-internal-testing/zen", name="standard_prompt_completion", split="train", columns=["prompt"]
         )
@@ -362,6 +447,10 @@ class TestGetDataset:
         assert prompts[len(prompts) // 2 :] == expected_second_half["prompt"]
 
     def test_dataset_mixture_with_weights(self):
+        # [FUNCTION DOC]
+        # Same as the basic mixture but each source uses split "train[:50%]"; asserts the same half/half ordering.
+        # KNOWN ISSUE: despite its name no weights or fraction are set; it only tests percentage split slicing.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         dataset_config1 = DatasetConfig(
             path="trl-internal-testing/zen", name="standard_prompt_completion", split="train[:50%]", columns=["prompt"]
         )
@@ -383,6 +472,9 @@ class TestGetDataset:
         assert prompts[len(prompts) // 2 :] == expected_second_half["prompt"]
 
     def test_dataset_fraction(self):
+        # [FUNCTION DOC]
+        # Checks fraction 0.75/0.25 on two copies of the same source: the result is the full first source followed by
+        # the first round(len / 3) rows of the second (fractions normalized and capped so no source is oversampled). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         # `fraction` sets each source's target share of the final mixture: normalized to sum to one and capped so no
         # source is oversampled. With weights 0.75/0.25 on two equally-sized sources, the 0.75 source is the binding
         # constraint (kept in full) and the 0.25 source contributes a third of its rows.
@@ -399,6 +491,8 @@ class TestGetDataset:
         assert list(result["train"]) == expected
 
     def test_dataset_fraction_partial_raises_error(self):
+        # [FUNCTION DOC]
+        # Checks setting fraction on only one of two datasets raises ValueError ("must be set for either all datasets"). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         mixture_config = DatasetMixtureConfig(
             datasets=[
                 DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling", fraction=0.5),
@@ -409,6 +503,8 @@ class TestGetDataset:
             get_dataset(mixture_config)
 
     def test_dataset_fraction_streaming_raises_error(self):
+        # [FUNCTION DOC]
+        # Checks fraction combined with streaming raises ValueError ("not supported with streaming datasets"). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         mixture_config = DatasetMixtureConfig(
             datasets=[DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling", fraction=0.5)],
             streaming=True,
@@ -417,6 +513,8 @@ class TestGetDataset:
             get_dataset(mixture_config)
 
     def test_dataset_mixture_with_test_split(self):
+        # [FUNCTION DOC]
+        # Checks test_split_size 2 splits the 17-row language-modeling train set into 15 train and 2 test rows. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         mixture_config = DatasetMixtureConfig(
             datasets=[DatasetConfig(path="trl-internal-testing/zen", name="standard_language_modeling")],
             test_split_size=2,
@@ -429,12 +527,17 @@ class TestGetDataset:
         assert len(result["test"]) == 2
 
     def test_empty_dataset_mixture_raises_error(self):
+        # [FUNCTION DOC]
+        # Checks an empty datasets list raises ValueError ("No datasets were loaded"). Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         mixture_config = DatasetMixtureConfig(datasets=[])
 
         with pytest.raises(ValueError, match="No datasets were loaded"):
             get_dataset(mixture_config)
 
     def test_mixture_multiple_different_configs(self):
+        # [FUNCTION DOC]
+        # Checks mixing the conversational_preference train split (prompt column) with conversational_prompt_only test
+        # split produces a DatasetDict with a non-empty train split. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: downloads/loads zen dataset configs.
         dataset_config1 = DatasetConfig(
             path="trl-internal-testing/zen", name="conversational_preference", split="train", columns=["prompt"]
         )
@@ -448,6 +551,10 @@ class TestGetDataset:
         assert len(result["train"]) > 0
 
     def test_trlparser_parses_yaml_config_correctly(self):
+        # [FUNCTION DOC]
+        # Checks TrlParser parses a YAML file (written to a NamedTemporaryFile) with a datasets list into a
+        # DatasetMixtureConfig with two DatasetConfig entries with the right path/name, columns None for the first and
+        # ["prompt"] for the second. Inputs/Outputs: none. Exceptions: assertion failure. Side effects: temp file.
         # Prepare YAML content exactly like your example
         # docstyle-ignore
         yaml_content = """
@@ -488,6 +595,9 @@ class TestGetDataset:
         assert dataset_config2.columns == ["prompt"]  # Columns specified
 
     def test_trlparser_parses_yaml_and_loads_dataset(self):
+        # [FUNCTION DOC]
+        # Checks a YAML-parsed DatasetMixtureConfig passed to get_dataset yields the same train split as load_dataset.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: temp file; loads the dataset.
         # Prepare YAML content exactly like your example
         # docstyle-ignore
         yaml_content = """

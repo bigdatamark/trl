@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Example training script: (optionally LoRA) SFT of NVIDIA Nemotron 3 hybrid Mamba models on a reasoning chat dataset
+# (e.g. HuggingFaceH4/Multilingual-Thinking), with assistant thinking folded into think tags in the message content.
+# Under the main guard parses ScriptArguments, SFTConfig and ModelConfig (ignoring unknown remaining CLI strings) and
+# calls main. Importing has no side effects. Requires transformers 5.7.0 or newer and the mamba_ssm/causal_conv1d kernels.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -61,6 +67,14 @@ from trl import ModelConfig, ScriptArguments, SFTConfig, SFTTrainer, TrlParser, 
 
 
 def main(script_args, training_args, model_args):
+    # [FUNCTION DOC]
+    # Prepares the dataset and runs SFT.
+    # Behavior: sets model_init_kwargs (revision, attention implementation, raw dtype string); loads the dataset by
+    # name/config; maps every row through merge_thinking_and_remove_key; uses the test split for eval only when
+    # eval_strategy is not no and the split exists; builds SFTTrainer from the model name with optional PEFT; trains,
+    # saves, optionally pushes, calls end.
+    # Inputs: script_args, training_args (SFTConfig), model_args (ModelConfig). Outputs: none.
+    # Exceptions: propagated. Side effects: downloads, GPU training, file writes, optional Hub upload.
     training_args.model_init_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
@@ -72,6 +86,13 @@ def main(script_args, training_args, model_args):
 
     # Merge thinking into message content using <think> tags and remove extra columns
     def merge_thinking_and_remove_key(example):
+        # [FUNCTION DOC]
+        # HELPER: Map function rewriting each message as only role and content.
+        # Behavior: for every message, if it has a non-blank string thinking field, content becomes the thinking wrapped in
+        # think open/close tags on their own lines followed by the original content; all other keys of the message (including
+        # thinking) are dropped. Rows' other columns are kept.
+        # Inputs: example (dict with messages list). Outputs: the mutated example. Exceptions: KeyError if role/content missing.
+        # Side effects: mutates the example dict.
         new_messages = []
         for msg in example["messages"]:
             content = msg["content"]

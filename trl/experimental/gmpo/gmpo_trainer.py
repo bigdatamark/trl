@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Experimental GMPO (Geometric-Mean Policy Optimization) trainer.
+# Main content: GMPOTrainer, a GRPOTrainer subclass that only overrides the loss to maximize the geometric mean of
+# token-level importance ratios. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +25,10 @@ from .gmpo_config import GMPOConfig
 
 
 class GMPOTrainer(GRPOTrainer):
+    # [CLASS DOC]
+    # GRPOTrainer subclass; generation, rewards, advantages, weight sync and logging are inherited. Only construction
+    # defaults (GMPOConfig) and _compute_loss differ. Uses inherited attributes epsilon_low, epsilon_high (here in log
+    # space), beta, top_entropy_quantile, accelerator and _metrics. Model-card tags: trl, gmpo.
     """
     Trainer for Geometric-Mean Policy Optimization (GMPO).
 
@@ -34,6 +43,12 @@ class GMPOTrainer(GRPOTrainer):
     _tag_names = ["trl", "gmpo"]
 
     def __init__(self, model, reward_funcs, args=None, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: if args is None, builds a default GMPOConfig whose output dir is the last path component of the model id
+        # (model string, or the id read from model.config) suffixed with "-GMPO"; then calls the GRPOTrainer constructor.
+        # Inputs: model (str or model), reward_funcs, args (GMPOConfig or None), **kwargs forwarded to GRPOTrainer.
+        # Outputs: none. Exceptions: those of GRPOTrainer.
+        # Side effects: full trainer construction.
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             args = GMPOConfig(f"{model_name.split('/')[-1]}-GMPO")
@@ -41,6 +56,28 @@ class GMPOTrainer(GRPOTrainer):
         super().__init__(model, reward_funcs, args=args, **kwargs)
 
     def _compute_loss(self, model, inputs):
+        # [FUNCTION DOC]
+        # Behavior:
+        # 1. Concatenate prompt and completion ids/masks; mask is completion_mask times tool_mask when present.
+        # 2. Compute per-token log-probs and entropies for completion tokens (multimodal inputs forwarded when present).
+        # 3. If top_entropy_quantile is below 1, build a high-entropy token mask; else none.
+        # 4. Old log-probs default to detached current log-probs when not supplied. log_ratio is current minus old.
+        # 5. Clamp log_ratio to [-epsilon_low, epsilon_high]; one-sided clipping: for positive advantage take the elementwise
+        # minimum of raw and clamped, otherwise the maximum.
+        # 6. Sequence mask is mask times entropy mask when present. Per-sequence log weight is the masked mean of clipped log
+        # ratios (denominator clamped to at least 1); coef is its exponential; per-sequence loss is minus coef times advantage.
+        # 7. If beta is non-zero, add beta times the masked mean over tokens of the k3 KL estimator (exp of ref minus current,
+        # minus that difference, minus 1).
+        # 8. Loss is the mean over sequences, divided by current_gradient_accumulation_steps in train mode (1 in eval).
+        # 9. Metrics into _metrics[mode]: kl (if beta non-zero), entropy, clip_ratio/low_mean, high_mean, region_mean (global
+        # masked means reduced across processes), clip_ratio/low_min and high_max (nan-aware min/max of gathered per-sequence
+        # means). Low clipped means log_ratio below -epsilon_low with negative advantage; high means above epsilon_high with
+        # positive advantage.
+        # Inputs: model, inputs dict (prompt_ids, prompt_mask, completion_ids, completion_mask, advantages of shape (B,),
+        # optional tool_mask, old_per_token_logps, ref_per_token_logps, multimodal tensors).
+        # Outputs: scalar loss tensor.
+        # Exceptions: KeyError if ref_per_token_logps is missing while beta is non-zero.
+        # Side effects: appends metrics; collective reduce/gather across processes.
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -123,11 +160,22 @@ class GMPOTrainer(GRPOTrainer):
 
         # Log the metrics
         def masked_seq_mean(x):
+            # [FUNCTION DOC]
+            # HELPER: Per-sequence mean over valid completion tokens.
+            # Behavior: if the tensor has a single column, return it squeezed to (B,); otherwise masked sum divided by the mask
+            # count per row (no clamp, so an all-zero mask row gives NaN, tolerated by the nan-aware min/max).
+            # Inputs: x of shape (B, T) or (B, 1). Outputs: tensor (B,). Exceptions: none. Side effects: none.
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence": already one value per sequence
                 return x.squeeze(1)
             return (x * mask).sum(-1) / mask.sum(-1)
 
         def global_masked_mean(x):
+            # [FUNCTION DOC]
+            # HELPER: Mean over all valid tokens across all processes.
+            # Behavior: local sum and count (masked, or per-sequence when x has one column) are stacked, sum-reduced over
+            # processes, and divided with the count clamped to at least 1; returns a Python float.
+            # Inputs: x of shape (B, T) or (B, 1). Outputs: float.
+            # Exceptions: none. Side effects: collective reduce communication.
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence": one value per sequence
                 local_sum, local_count = x.sum(), torch.tensor(float(x.shape[0]), device=x.device)
             else:

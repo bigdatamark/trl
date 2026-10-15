@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Implements supervised fine-tuning: SFTTrainer and its two data collators.
+# Main contents: DataCollatorForLanguageModeling (pads pre-tokenized text examples, optionally padding-free with
+# packed-sequence position ids and varlen boundaries), DataCollatorForVisionLanguageModeling (tokenizes and
+# processes images on the fly for VLMs), and SFTTrainer (a transformers.Trainer subclass via _BaseTrainer) that
+# loads the model/processor, prepares datasets (formatting, ChatML conversion, EOS, tokenization, label masks,
+# truncation, packing), and trains with a fused LM head NLL or DFT loss.
+# Fits in the package as the SFT entry point exported by trl.
+# Import-time side effects: imports peft pieces when available; creates a module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,6 +95,13 @@ logger = get_logger(__name__)
 
 @dataclass
 class DataCollatorForLanguageModeling(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator for tokenized language-modeling examples (inherits transformers DataCollatorMixin, which
+    # routes calls to torch_call).
+    # Fields: pad_token_id (required), padding_free (default False), return_position_ids (default False; set by
+    # SFTTrainer under sequence parallelism), pad_to_multiple_of (default None), return_tensors "pt".
+    # Expects examples with input_ids, optional labels (else labels = input_ids, already -100-masked by the trainer),
+    # optional seq_lengths for packed rows.
     """
     Data collator used for language modeling data. Inputs are dynamically padded to the maximum length of a batch.
 
@@ -166,6 +183,16 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: converts input_ids and labels to tensors. If padding_free or return_position_ids, builds position ids
+        # (restarting at each packed document from seq_lengths, else a range per example). If not padding_free, builds an
+        # all-ones attention mask per example. Padding-free concatenates all examples into one row. Right-pads input_ids
+        # with pad_token_id and labels with -100 (to pad_to_multiple_of). Padding-free: pads position ids with 0, masks
+        # labels at every position whose position id is 0 (first token of each document), computes int32 cu_seq_lens_q/k
+        # from document starts plus total length, max_length_q/k as the longest document, and seq_idx (document index
+        # per token, shape 1 x total). Otherwise adds padded position_ids if requested and the padded attention_mask.
+        # Inputs: examples list of dicts. Outputs: dict of batched tensors (and ints for max lengths).
+        # Exceptions: KeyError if input_ids is missing. Side effects: none.
         input_ids = [example["input_ids"] for example in examples]
         batch_seq_lengths = [example["seq_lengths"] for example in examples] if "seq_lengths" in examples[0] else None
         labels = [example.get("labels", example["input_ids"]) for example in examples]
@@ -228,6 +255,13 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
 
     @staticmethod
     def get_position_ids_from_packed_seq_lengths(batch_seq_lengths: list[list[int]]) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Builds position ids for packed rows from per-document lengths.
+        # Behavior: flattens all document lengths, starts with ones, sets the first value to 0 and, at each document
+        # boundary, a negative value equal to one minus the previous document length, so the cumulative sum restarts at 0
+        # per document; then splits back into one tensor per row by the row totals.
+        # Inputs: batch_seq_lengths (list of lists of ints). Outputs: list of 1-D position-id tensors.
+        # Exceptions: none. Side effects: none.
         """
         Get position IDs for packed sequences.
 
@@ -256,6 +290,11 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
 
 @dataclass
 class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator for VLM data that tokenizes text and processes images per batch (no pre-tokenization).
+    # Fields: processor, max_length, completion_only_loss, pad_to_multiple_of, dataset_text_field ("text"),
+    # assistant_only_loss, chat_template, return_tensors "pt". Dispatches to _collate_language_modeling for
+    # messages/text examples and _collate_prompt_completion for prompt/completion examples.
     """
     Data collator for vision-language modeling tasks.
 
@@ -350,6 +389,12 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Behavior: routes a batch by its first example's keys: messages or the text field -> language modeling (error if
+        # completion_only_loss); prompt and completion -> prompt-completion.
+        # Inputs: examples. Outputs: collated dict.
+        # Exceptions: ValueError if assistant_only_loss without messages, or completion_only_loss with language-modeling
+        # data; KeyError for unknown key sets. Side effects: none of its own.
         if self.assistant_only_loss and "messages" not in examples[0]:
             raise ValueError(
                 "The `assistant_only_loss` argument is only supported for conversational language modeling datasets."
@@ -366,6 +411,16 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
             raise KeyError(f"Unexpected input keys in examples: {list(examples[0].keys())}.")
 
     def _collate_language_modeling(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Collates messages or text examples with images.
+        # Behavior: normalizes a single image column into an images list (mutating examples); images None if all lists
+        # are empty. Processor kwargs: right padding, pad_to_multiple_of, truncation to max_length when set, no special
+        # tokens. Messages: converted to multimodal messages and rendered/tokenized with apply_chat_template (kwargs
+        # nested under processor_kwargs for transformers>=5.4.0), returning assistant masks if assistant_only_loss.
+        # Text: processor called on images and text. Labels = input ids with padding set to -100, and non-assistant
+        # tokens set to -100 when assistant_only_loss (assistant_masks removed from the output).
+        # Inputs: examples. Outputs: processor output dict plus labels.
+        # Exceptions: KeyError if neither messages nor text field present. Side effects: mutates example dicts.
         if "image" in examples[0]:
             for example in examples:
                 example["images"] = [example.pop("image")]
@@ -417,6 +472,17 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
         return output
 
     def _collate_prompt_completion(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Collates prompt/completion examples with images.
+        # Behavior: rejects pad_to_multiple_of. Normalizes image column as above. Conversational examples become
+        # multimodal messages and are rendered with the chat template. Processes prompts with images (left padded) and
+        # completions as text (right padded), no special tokens. Concatenates ids and masks; completion mask is zeros for
+        # the prompt part. token_type_ids are concatenated from both; mm_token_type_ids extended with zeros. flush_left
+        # removes leading padding columns jointly across tensors. Truncates all to max_length (keeping the start). Labels =
+        # ids with padding -100 and, if completion_only_loss, prompt tokens -100. Output reuses the prompt processor
+        # output (keeps pixel values) with replaced ids, mask, labels, and type ids.
+        # Inputs: examples. Outputs: dict of tensors.
+        # Exceptions: NotImplementedError if pad_to_multiple_of is set. Side effects: mutates example dicts.
         if self.pad_to_multiple_of is not None:
             raise NotImplementedError(
                 "Padding to a multiple of a value is not yet implemented for vision-language modeling and "
@@ -513,6 +579,14 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
 
 
 class SFTTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer for supervised fine-tuning of causal LMs and VLMs. Inherits _BaseTrainer -> transformers.Trainer.
+    # Key state: _tokenizer, _is_vlm, _is_vision_dataset, padding_free, completion_only_loss, chat_template (training
+    # template with generation markers or None), _skip_prepare_dataset, _formatting_func, router_aux_loss_coef /
+    # aux_loss_enabled, _metrics per mode, _total_train_tokens, _tp_size, maybe_activation_offload_context.
+    # Flow: __init__ configures model/processor/collator and calls _prepare_dataset for train/eval datasets;
+    # compute_loss runs the model with the fused LM head and logs entropy, token accuracy and token counts; log
+    # averages metrics; evaluate prepares datasets passed directly.
     """
     Trainer for Supervised Fine-Tuning (SFT) method.
 
@@ -646,6 +720,51 @@ class SFTTrainer(_BaseTrainer):
         peft_config: "PeftConfig | None" = None,
         formatting_func: Callable[[dict], str] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: builds the trainer. Steps:
+        # 1. Args: None -> SFTConfig "<model-name>-SFT"; a plain TrainingArguments is converted to SFTConfig (keeping hub_token).
+        # 2. train_dataset required; IterableDataset forces dispatch_batches False (warning if True); other types TypeError.
+        # 3. Seeds, loads a string model with create_model_from_path (copied model_init_kwargs, quantization_config,
+        #    device_map None when distributed, trust_remote_code) or warns that load kwargs are ignored for instances.
+        # 4. Processor defaults to AutoProcessor; sets _tokenizer and _is_vlm (TypeError otherwise). args.eos_token must be
+        #    in the vocab; sets it on the tokenizer and model config and prepends it to generation config eos ids.
+        #    chat_template_path: a .jinja/.j2 file is read as the template; otherwise clone_chat_template copies a template
+        #    (possibly adding tokens).
+        # 5. Detects a vision dataset from the first train sample (image/images key); requires a VLM; enables
+        #    ddp_find_unused_parameters for VLMs as in other trainers; rejects for vision data: packing, padding_free,
+        #    assistant_only_loss on transformers<5.18.0.dev0, and keep_end truncation with max_length.
+        # 6. PEFT: same checks as other trainers; added template tokens are made trainable via trainable_token_indices and
+        #    lm_head added to modules_to_save with a warning; ZeRO-3 disables adapter dtype autocast; old-peft prefix
+        #    tuning with device map rejected. PEFT + ZeRO-3 + checkpointing forces use_reentrant True (selective
+        #    checkpointing rejected there). Enables input grads for PEFT + checkpointing; casts quantized trainable params
+        #    (except DoRA magnitude) to bf16.
+        # 7. padding_free = args.padding_free or packing with bfd/bfd_split; then a custom collator is rejected; warns for
+        #    wrapped packing and for batch size 1 without packing. assistant_only_loss requires conversational data; swaps
+        #    in a training chat template if the current one lacks generation markers and warns if the stop token is not
+        #    trained. completion_only_loss defaults to whether the data is prompt-completion.
+        # 8. Default collator: pad token = args.pad_token, tokenizer pad, or eos (must be in vocab), mirrored to model
+        #    configs; vision -> DataCollatorForVisionLanguageModeling, else DataCollatorForLanguageModeling.
+        # 9. Datasets: rejects padding_free without packing but with max_length for text data. _skip_prepare_dataset when
+        #    dataset_kwargs has skip_prepare_dataset or for vision data. Checks skipped datasets have labels when masks
+        #    exist. Otherwise rejects completion_only_loss with formatting_func and prepares train/eval datasets (eval
+        #    uses eval_packing if set).
+        # 10. Loss checks: loss_type must be nll or dft; dft incompatible with compute_loss_func; FutureWarnings for
+        #     compute_loss_func and label smoothing with nll; rejects PEFT on lm_head. Defaults use_reentrant False for
+        #     transformers<5. Selective activation checkpointing requires checkpointing and non-reentrant mode and wraps the
+        #     model; otherwise the selective key is dropped.
+        # 11. Calls Trainer.__init__; rejects n_gpu>1; handles deprecated use_liger_kernel like RLOO; installs the fused LM
+        #     head with log_probs, entropy and is_top1 outputs.
+        # 12. Rejects context parallelism with packing; enables collator position ids under sequence parallelism
+        #     (accelerate>=1.12); rejects DeepSpeed SP with dft, compute_loss_func or label smoothing.
+        # 13. Activation offloading context or nullcontext. MoE aux loss coef/enabled as in RLOO, and writes
+        #     output_router_logits / router_aux_loss_coef back into the model text config when it declares the coef.
+        # 14. Initializes metrics, token counter, _tp_size from the parallelism config, adds model tags.
+        # Inputs: model, args, data_collator, train_dataset, eval_dataset, processing_class, compute_loss_func,
+        # compute_metrics, callbacks, optimizers, optimizer_cls_and_kwargs, preprocess_logits_for_metrics,
+        # quantization_config, peft_config, formatting_func.
+        # Outputs: none. Exceptions: ValueError, TypeError, ImportError for the checks above.
+        # Side effects: loads models/tokenizers, mutates args and the tokenizer/model configs, maps datasets (cached),
+        # warnings and logs.
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
@@ -1234,6 +1353,22 @@ class SFTTrainer(_BaseTrainer):
         formatting_func: Callable[[dict], str] | None,
         dataset_name: str,
     ) -> Dataset | IterableDataset:
+        # [FUNCTION DOC]
+        # Behavior: turns a raw dataset into a trainer-ready one, inside global_then_local_main_first so the main
+        # process maps first. Raises if a Dataset uses a custom with_transform format. Treats datasets with input_ids as
+        # already processed (warns and ignores formatting_func). For unprocessed data: applies formatting_func into a text
+        # column; converts ShareGPT-style conversations to ChatML; for non-conversational data appends eos to the text
+        # field or completion when missing; tokenizes with tokenize_fn. Then, unless a labels column exists, builds labels
+        # from assistant_masks and (if completion_only_loss) completion_mask and drops those columns. If max_length is set
+        # and not packing, truncates input_ids and labels per truncation_mode and filters out examples with all labels
+        # -100. If packing, requires max_length, keeps input_ids/labels, optionally shuffles, and packs with
+        # pack_dataset (adds seq_lengths). Finally shuffles when shuffle_dataset. num_proc applies to map-style datasets
+        # only and desc strings label progress.
+        # Inputs: dataset, processing_class, args, packing flag, formatting_func, dataset_name.
+        # Outputs: processed Dataset or IterableDataset.
+        # Exceptions: ValueError for with_transform datasets, invalid truncation_mode, or packing without max_length;
+        # RuntimeError from tokenize_fn.
+        # Side effects: dataset map/filter caching, warnings, distributed barriers.
         if isinstance(dataset, Dataset) and dataset.format["type"] == "custom":
             raise ValueError(
                 "SFTTrainer cannot prepare a dataset that uses `Dataset.with_transform()`. The preparation pipeline "
@@ -1266,6 +1401,9 @@ class SFTTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Applying formatting function to {dataset_name} dataset"
 
                 def _func(example):
+                    # [FUNCTION DOC]
+                    # HELPER: Map function wrapping formatting_func; returns a dict with its string under text.
+                    # Inputs: example. Outputs: dict. Exceptions: from formatting_func. Side effects: none.
                     return {"text": formatting_func(example)}
 
                 dataset = dataset.map(_func, batched=False, **map_kwargs)
@@ -1290,6 +1428,9 @@ class SFTTrainer(_BaseTrainer):
                         map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
                     def add_eos(example, eos_token, dataset_text_field):
+                        # [FUNCTION DOC]
+                        # HELPER: Appends eos_token to the text field, or else to completion, when the value does not already end with it.
+                        # Inputs: example, eos_token, dataset_text_field. Outputs: the mutated example. Exceptions: none. Side effects: mutates example.
                         # language modeling case
                         if dataset_text_field in example and not example[dataset_text_field].endswith(eos_token):
                             example[dataset_text_field] = example[dataset_text_field] + eos_token
@@ -1312,6 +1453,17 @@ class SFTTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
                 def tokenize_fn(example, processing_class, dataset_text_field, assistant_only_loss, chat_template):
+                    # [FUNCTION DOC]
+                    # HELPER: Tokenizes one example.
+                    # Behavior: parses tools from JSON when a string; chat template kwargs = chat_template, tools, plus the example's
+                    # chat_template_kwargs. Prompt-completion: conversational prompts tokenized with a generation prompt and
+                    # prompt+completion tokenized (with assistant masks if requested); non-conversational tokenized as text. The
+                    # completion starts at the common prefix length of the two id lists (warns once if the prompt is not a prefix);
+                    # returns input_ids and completion_mask (0 for prefix, 1 after), plus assistant_masks. Language modeling:
+                    # conversational messages tokenized (input_ids and assistant_masks), else the text field.
+                    # Inputs: example, processing_class, dataset_text_field, assistant_only_loss, chat_template.
+                    # Outputs: dict with input_ids and optionally completion_mask/assistant_masks.
+                    # Exceptions: RuntimeError if assistant_masks contains no 1. Side effects: one-time warning.
                     tools = example.get("tools")
                     tools = json.loads(tools) if isinstance(tools, str) else tools
                     apply_chat_template_kwargs = {
@@ -1419,6 +1571,9 @@ class SFTTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Building labels for {dataset_name} dataset"
 
                 def build_labels(example, mask_columns):
+                    # [FUNCTION DOC]
+                    # HELPER: Builds labels equal to input_ids except -100 where any mask column is 0 (zip non-strict).
+                    # Inputs: example, mask_columns. Outputs: dict with labels. Exceptions: none. Side effects: none.
                     masks = [example[column] for column in mask_columns]
                     labels = [
                         token_id if all(bits) else -100
@@ -1449,6 +1604,9 @@ class SFTTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Truncating {dataset_name} dataset"
 
                 def truncate(example, sl):
+                    # [FUNCTION DOC]
+                    # HELPER: Slices input_ids and labels with the given slice (keep start or keep end).
+                    # Inputs: example, sl. Outputs: dict with truncated input_ids and labels. Exceptions: none. Side effects: none.
                     return {"input_ids": example["input_ids"][sl], "labels": example["labels"][sl]}
 
                 dataset = dataset.map(truncate, fn_kwargs={"sl": sl}, **map_kwargs)
@@ -1485,6 +1643,10 @@ class SFTTrainer(_BaseTrainer):
         return dataset
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets columns kept by Trainer: messages, prompt, completion, image, images for vision data; otherwise
+        # input_ids, labels, seq_lengths. Only when not already set.
+        # Inputs: self. Outputs: none. Exceptions: none. Side effects: sets _signature_columns.
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs (usually, "input_ids",
         # "attention_mask" and "labels"). Dataset preparation also produces a "seq_lengths" column (for packing /
@@ -1496,6 +1658,13 @@ class SFTTrainer(_BaseTrainer):
                 self._signature_columns = ["input_ids", "labels", "seq_lengths"]
 
     def _reject_skip_prepare_without_labels(self, datasets: dict[str, Dataset], data_collator) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Guards against skipped preparation silently training on full sequences.
+        # Behavior: only when preparation is skipped, the data is not vision, and the collator is
+        # DataCollatorForLanguageModeling: for each named dataset, raises if it has completion_mask or assistant_masks
+        # but no labels column.
+        # Inputs: datasets dict name->dataset, data_collator. Outputs: none.
+        # Exceptions: ValueError as described. Side effects: none.
         # This guard may look defensive, but it covers a behavior change introduced when label building moved from
         # the collator to dataset preparation: the collator used to consume the mask columns directly, so a
         # skipped-preparation dataset carrying masks trained correctly. Now labels are built during preparation, which
@@ -1528,6 +1697,12 @@ class SFTTrainer(_BaseTrainer):
         ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Behavior: when preparation is not skipped and a dataset object (not a string key) is passed, prepares it (or each
+        # entry of a dict) like __init__ using eval_packing or packing; runs the label guard on the passed datasets; then
+        # calls Trainer.evaluate.
+        # Inputs: eval_dataset, ignore_keys, metric_key_prefix. Outputs: metrics dict.
+        # Exceptions: ValueError from preparation or guard. Side effects: dataset mapping, evaluation logging.
         # When a dataset is passed directly to `evaluate` (e.g. a held-out test set), preprocess it the same way
         # `__init__` does, so that `evaluate` accepts the same dataset types as the trainer (language modeling,
         # prompt-completion, etc.). `_prepare_dataset` is idempotent: it skips datasets that are already tokenized. A
@@ -1558,6 +1733,23 @@ class SFTTrainer(_BaseTrainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Behavior: sets use_cache False and output_router_logits when aux loss is enabled. Loss computation:
+        # - DeepSpeed Ulysses SP in training: uses Trainer.compute_loss with the fused LM head (model's own loss).
+        # - compute_loss_func: called on full-logit outputs; metrics come from an extra no-grad fused forward.
+        # - label smoothing with nll: LabelSmoother on full logits (passing num_items_in_batch on transformers>=5.15);
+        #   metrics from a no-grad fused forward.
+        # - default: fused forward; per-token loss is the negative log prob (DFT multiplies by the detached probability);
+        #   summed and divided by num_items_in_batch or the label-mask count (clamped to 1); aux loss weighted.
+        # For non-SP paths, multiplies the loss by processes / tp size when average_tokens_across_devices and
+        # num_items_in_batch is given, and adds the weighted aux loss divided by accumulation steps (when
+        # num_items_in_batch is given). A ValueError about image features vs tokens is re-raised with max_length advice.
+        # Metrics: entropy and mean_token_accuracy over valid tokens (gathered), num_tokens (train counts attention mask
+        # sum or position_ids length, divided by tp size), aux_loss. With return_outputs, warns deprecated and reruns a
+        # full-logit no-grad forward for outputs.
+        # Inputs: model, inputs, return_outputs, num_items_in_batch. Outputs: loss or (loss, outputs).
+        # Exceptions: ValueError for missing attention_mask/position_ids or image-token mismatch.
+        # Side effects: mutates inputs dict, updates _metrics and _total_train_tokens, FutureWarning.
         mode = "train" if self.model.training else "eval"
 
         # If not set, defaults from model config and may warn since cache isn't compatible with gradient checkpointing
@@ -1677,6 +1869,11 @@ class SFTTrainer(_BaseTrainer):
     # During eval, Trainer calls prediction_step, which asks `compute_loss` for the outputs even when only the loss is
     # needed. Ask for them only when the logits are, since they take an extra forward pass.
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Behavior: prepares inputs and under no_grad computes the loss only, or loss plus outputs, returning logits and
+        # labels only when prediction_loss_only is false.
+        # Inputs: model, inputs, prediction_loss_only, ignore_keys (unused). Outputs: tuple loss, logits or None, labels or None.
+        # Exceptions: propagated. Side effects: metrics via compute_loss.
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad(), self.compute_loss_context_manager():
             if prediction_loss_only:
@@ -1689,10 +1886,18 @@ class SFTTrainer(_BaseTrainer):
 
     # Override training step to add activation offloading context.
     def training_step(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: runs Trainer.training_step inside the activation offloading context (nullcontext when disabled).
+        # Inputs: passthrough args. Outputs: loss. Exceptions: propagated. Side effects: activation offloading.
         with self.maybe_activation_offload_context:
             return super().training_step(*args, **kwargs)
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: averages each metric of the current mode, prefixes eval_ in eval mode, merges into logs, calls
+        # Trainer.log, and clears the mode's metrics.
+        # Inputs: logs, start_time. Outputs: none. Exceptions: ZeroDivisionError impossible in practice (lists are non-empty
+        # when present). Side effects: logging, clears _metrics[mode].
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
@@ -1707,6 +1912,9 @@ class SFTTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Behavior: writes a model card named after output_dir or hub_model_id, then saves the checkpoint via the parent.
+        # Inputs: model, trial. Outputs: none. Exceptions: propagated. Side effects: writes files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:

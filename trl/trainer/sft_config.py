@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Defines SFTConfig, the dataclass of hyperparameters for SFTTrainer (supervised fine-tuning).
+# Main contents: the SFTConfig dataclass (extends _BaseConfig, a TrainingArguments subclass) with fields for
+# model loading, dataset preparation (text field, tokenization, truncation, packing, padding-free), loss
+# masking (completion-only, assistant-only), loss type and activation offloading.
+# Fits in the package as the config consumed by trl.trainer.sft_trainer and parsed by the CLI.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +29,15 @@ from .base_config import _BaseConfig
 
 @dataclass
 class SFTConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Configuration dataclass for SFTTrainer; each field carries help metadata for HfArgumentParser.
+    # Inheritance: _BaseConfig -> transformers.TrainingArguments. Overrides learning_rate default to 2e-5.
+    # Key defaults: dataset_text_field "text", max_length 1024, truncation_mode "keep_start", packing False,
+    # packing_strategy "bfd", padding_free False, pad_to_multiple_of "auto", completion_only_loss None (auto),
+    # assistant_only_loss False, loss_type "nll", activation_offloading False, shuffle_dataset False,
+    # eval_packing None (follows packing), pad_token None (deprecated).
+    # Inputs: keyword arguments for any field. Outputs: the config instance.
+    # Exceptions: see __post_init__ (int conversion of pad_to_multiple_of). Side effects: FutureWarnings in __post_init__.
     r"""
     Configuration class for the [`SFTTrainer`].
 
@@ -302,6 +319,17 @@ class SFTConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: calls the parent __post_init__, then normalizes and handles deprecations:
+        # - pad_to_multiple_of given as a string other than "auto": "none"/"null" (case-insensitive) -> None, else int.
+        #   "auto" -> 128 on a neuron device, otherwise None.
+        # - loss_type "chunked_nll": FutureWarning and rewritten to "nll".
+        # - pad_token not None: FutureWarning only (value kept).
+        # - truncation_mode "keep_end": FutureWarning only.
+        # - packing_strategy "bfd-requeue": FutureWarning and renamed to "bfd_split".
+        # Inputs: self. Outputs: none.
+        # Exceptions: ValueError if pad_to_multiple_of is a non-numeric string other than none/null/auto.
+        # Side effects: mutates pad_to_multiple_of, loss_type, packing_strategy; emits FutureWarnings.
         super().__post_init__()
         # The CLI passes the value as a string
         if isinstance(self.pad_to_multiple_of, str) and self.pad_to_multiple_of != "auto":

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Example training script: QLoRA SFT teaching tool calling to CohereLabs/tiny-aya-global on bebechien/SimpleToolCalling,
+# using a custom tool-aware chat template file (tiny_aya_chat_template.jinja next to this script) that is saved with
+# the tokenizer. Contents: TOOLS (two function schemas: search_knowledge_base and search_google, each taking a query
+# string), create_conversation and main. Importing has no side effects; running the file calls main.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -78,6 +84,13 @@ TOOLS = [
 
 
 def create_conversation(sample):
+    # [FUNCTION DOC]
+    # HELPER: Map function converting a raw row into a prompt-completion tool-calling example.
+    # Behavior: prompt is one user message with user_content; completion is one assistant message whose tool_calls
+    # holds a single function call named tool_name with arguments parsed from the tool_arguments JSON string; tools is
+    # the TOOLS list.
+    # Inputs: sample (dict with user_content, tool_name, tool_arguments). Outputs: dict with prompt, completion, tools.
+    # Exceptions: KeyError on missing fields; JSON decode errors for malformed arguments. Side effects: none.
     return {
         "prompt": [{"role": "user", "content": sample["user_content"]}],
         "completion": [
@@ -99,6 +112,16 @@ def create_conversation(sample):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Runs the example end to end.
+    # Behavior: loads the train split, maps it with create_conversation removing all original columns, splits it 50/50
+    # with shuffling (only the train half is used; no eval); loads the model with sdpa attention, float16, hub kernels
+    # and 4-bit NF4 double-quantized bitsandbytes (float16 compute); LoRA r 32 / alpha 32 on attention and MLP
+    # projections; SFTConfig with batch 1, gradient accumulation 4, the custom chat template path, 5 warmup steps,
+    # learning rate 2e-4, paged 8-bit AdamW, logging every step to trackio (space named after output dir), max length
+    # 1024, activation offloading and push_to_hub enabled; trains, saves to output_dir, pushes to the Hub and calls end.
+    # Inputs: none. Outputs: none. Exceptions: propagated (Hub push requires credentials).
+    # Side effects: downloads, GPU training, file writes, Hub uploads, trackio logging.
     model_id = "CohereLabs/tiny-aya-global"
     dataset_name = "bebechien/SimpleToolCalling"
     output_dir = "tiny-aya-global-tool-calling-SFT"

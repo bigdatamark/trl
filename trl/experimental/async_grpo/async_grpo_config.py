@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Configuration dataclass for AsyncGRPOTrainer. Contents: AsyncGRPOConfig only.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +24,18 @@ from ...trainer.base_config import _BaseConfig
 
 @dataclass
 class AsyncGRPOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass extending _BaseConfig (TrainingArguments wrapper) with async-GRPO fields grouped as: model loading
+    # (model_init_kwargs, dtype default "float32", trust_remote_code, router_aux_loss_coef), overridden TrainingArguments
+    # defaults (learning_rate 1e-6, logging_steps 1, lr_scheduler_type "constant", ignore_data_skip True), generation
+    # sampling (num_generations 8, max_completion_length 2048, temperature, top_p, top_k, min_p, repetition_penalty,
+    # chat_template_kwargs, max_tool_calling_iterations, fork_threshold_tokens 1024), vLLM server (base url, readiness
+    # timeout 240, request_timeout 600, weight_sync_timeout 1800), loss (epsilon 0.2, epsilon_high, token_budget), the
+    # rollout pipeline (max_inflight_tasks -1 auto, max_staleness 4, queue_maxsize 1024, weight_sync_steps 1,
+    # heartbeat_stale_after_s 300) and logging (log_completions, num_completions_to_print).
+    # _VALID_DICT_FIELDS adds model_init_kwargs and chat_template_kwargs so they may be passed as JSON strings.
+    # Derived values (epsilon_high fallback, auto max_inflight_tasks, token_budget from the server) are resolved by the
+    # trainer, not here.
     r"""
     Configuration class for the [`experimental.async_grpo.AsyncGRPOTrainer`].
 
@@ -394,6 +410,14 @@ class AsyncGRPOConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates and forces settings after the parent post-init.
+        # Behavior: calls the parent __post_init__; raises if parallelism_config enables context or sequence parallelism;
+        # then forces split_batches and dispatch_batches to True on accelerator_config, creating a dict if missing/None,
+        # setting keys if it is a dict, otherwise setting attributes on the config object.
+        # Inputs: none (self). Outputs: none.
+        # Exceptions: ValueError for cp/sp parallelism; errors from the parent post-init.
+        # Side effects: mutates accelerator_config.
         super().__post_init__()
 
         if self.parallelism_config is not None and (

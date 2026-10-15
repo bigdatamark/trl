@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# Experimental integration of Harbor agentic task suites with GRPOTrainer's environment_factory.
+# Exports AGENTS (registry of base agents/harnesses), HarborEnv, HarborBashEnv (environment classes) and HarborSpec
+# (dataset/task spec that builds the environment factory).
+# The harbor package itself is imported lazily inside the submodules, so importing this package works without it.
+# No side effects beyond importing the submodules.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

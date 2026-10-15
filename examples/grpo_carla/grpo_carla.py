@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Example script: text-only GRPO on OpenEnv's CARLA emergency-driving scenario (default Qwen3-0.6B): the model must
+# observe and pick an action (brake or change lane) to minimize harm; tool responses are text scene descriptions.
+# One environment URL per concurrent rollout. Main contents: parse_args, PROMPT, CarlaGRPOEnv, reward_func, main.
+# Import-time side effects: none beyond imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -56,6 +62,10 @@ from trl import GRPOConfig, GRPOTrainer
 
 
 def parse_args():
+    # [FUNCTION DOC]
+    # Behavior: argparse for model (Qwen/Qwen3-0.6B), env URLs (default the public Space), trackio space id
+    # (carla-grpo-trolley), optional hub model id and run name.
+    # Inputs: command line. Outputs: Namespace. Exceptions: SystemExit on bad args. Side effects: may print usage.
     parser = argparse.ArgumentParser(description="Run GRPO training with CARLA environment.")
     parser.add_argument(
         "--model",
@@ -103,14 +113,29 @@ Observe the scene first, then decide the best course of action to minimize harm.
 
 
 class CarlaGRPOEnv:
+    # [CLASS DOC]
+    # Per-rollout environment wrapping a CarlaEnv client. Class attribute _env_url_iter (set by main) supplies one URL
+    # per instance. Instance state: client and reward (latest rubric reward, set by reset and tools). reset starts the
+    # scenario; observe, emergency_stop and lane_change are tools returning text built by _describe. No base class.
     _env_url_iter = None
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: takes the next URL from the class-level iterator and creates a CarlaEnv client with 30 s connect and
+        # 120 s message timeouts.
+        # Inputs: none. Outputs: none.
+        # Exceptions: StopIteration when more instances are created than URLs; TypeError if the iterator was never set.
+        # Side effects: advances the shared iterator; creates a client.
         url = next(CarlaGRPOEnv._env_url_iter)
         self.client = CarlaEnv(base_url=url, connect_timeout_s=30, message_timeout_s=120)
 
     @staticmethod
     def _describe(obs) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Static method building a text description: speed in km/h with one decimal, then one line per nearby actor
+        # ("- <type> at <distance>m", with defaults "actor" and "?") or "No nearby actors detected.", plus a collision line
+        # naming the collided object (or "unknown") when a collision was detected; lines joined by newlines.
+        # Inputs: observation. Outputs: string. Exceptions: none expected. Side effects: none.
         """Build a text description from the observation fields."""
         parts = []
         parts.append(f"Speed: {obs.speed_kmh:.1f} km/h.")
@@ -124,11 +149,18 @@ class CarlaGRPOEnv:
         return "\n".join(parts)
 
     def reset(self, **kwargs) -> str | None:
+        # [FUNCTION DOC]
+        # Behavior: resets the remote scenario "trolley_micro_escape_exists", sets reward to 0 and returns the text
+        # description of the initial observation.
+        # Inputs: kwargs ignored. Outputs: string. Exceptions: network errors. Side effects: remote reset, mutates reward.
         result = self.client.reset(scenario_name="trolley_micro_escape_exists")
         self.reward = 0.0
         return self._describe(result.observation)
 
     def observe(self) -> str:
+        # [FUNCTION DOC]
+        # Tool: steps with an observe action, sets reward to the rubric reward (None treated as 0) and returns the text
+        # description. Inputs: none. Outputs: string. Exceptions: network errors. Side effects: remote step, mutates reward.
         """
         Get the current scene description without taking any action.
 
@@ -140,6 +172,9 @@ class CarlaGRPOEnv:
         return self._describe(result.observation)
 
     def emergency_stop(self) -> str:
+        # [FUNCTION DOC]
+        # Tool: steps with an emergency_stop action, updates reward from the rubric reward and returns the description.
+        # Inputs: none. Outputs: string. Exceptions: network errors. Side effects: remote step, mutates reward.
         """
         Apply maximum braking to stop the vehicle.
 
@@ -151,6 +186,10 @@ class CarlaGRPOEnv:
         return self._describe(result.observation)
 
     def lane_change(self, direction: str) -> str:
+        # [FUNCTION DOC]
+        # Tool: steps with a lane_change action in the given direction (validated server-side), updates reward and returns
+        # the description. Inputs: direction. Outputs: string. Exceptions: network/server errors.
+        # Side effects: remote step, mutates reward.
         """
         Change lane to avoid obstacles.
 
@@ -166,10 +205,20 @@ class CarlaGRPOEnv:
 
 
 def reward_func(environments, **kwargs):
+    # [FUNCTION DOC]
+    # Behavior: returns each environment's latest reward. Inputs: environments, kwargs ignored. Outputs: list of floats.
+    # Exceptions: AttributeError if reset was never called. Side effects: none.
     return [environment.reward for environment in environments]
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: parses args, sets the URL iterator, builds 1000 identical PROMPT rows and trains GRPOTrainer with reward_func
+    # and environment_factory CarlaGRPOEnv; thinking disabled, completion logging every 2 steps, completion length 1024,
+    # batch size and num_generations equal to number of URLs, one step per generation, grad accumulation 16, 50 steps,
+    # hub push when an id is given, trackio. Then calls trainer.end().
+    # Inputs: command line. Outputs: none. Exceptions: propagates training/network errors.
+    # Side effects: mutates class attribute, remote simulator traffic, GPU training, logging, optional push.
     args = parse_args()
     CarlaGRPOEnv._env_url_iter = iter(args.env_urls)
 

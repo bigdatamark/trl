@@ -1,3 +1,11 @@
+# [PACKAGE DOC]
+# Package trl.scripts: command-line entry scripts (sft, dpo, grpo, kto, reward, rloo, distillation, env,
+# vllm_serve) plus shared script utilities.
+# Exports (lazily, from utils): DatasetMixtureConfig, ScriptArguments, TrlParser, get_dataset, init_zero_verbose.
+# Lazy imports: outside TYPE_CHECKING the package's sys.modules entry is replaced with a _LazyModule over
+# _import_structure, so utils (and its heavy deps) load only on first attribute access.
+# Side effects on import: replaces its own sys.modules entry.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

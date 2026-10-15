@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Multi-accelerator tests (skipped unless at least two accelerators are present).
+# Contents: run_command and get_config_path helpers; TestDistributed, which launches the TRL CLI scripts under
+# accelerate with DDP/DeepSpeed ZeRO-2/ZeRO-3/FSDP2 configs; TestModelParallel, which trains in-process models
+# split across two devices with a device_map (naive pipeline parallelism).
+# Side effects at import: computes ROOT (repository root, two levels above tests/distributed). Tests spawn
+# subprocesses, download tiny models/datasets from the Hub and write to temp dirs.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,13 +56,24 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def run_command(command: list[str], env: dict[str, str]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Run a command as a subprocess from the repository root with the given environment and assert it
+    # succeeded. Inputs: command (list of str), env (dict). Outputs: None.
+    # Exceptions: AssertionError on non-zero return code. Side effects: spawns a blocking subprocess (output not captured).
     result = subprocess.run(command, env=env, cwd=ROOT)
     assert result.returncode == 0
 
 
 @pytest.fixture
 def get_config_path(lazy_shared_datadir):
+    # [FUNCTION DOC]
+    # HELPER: Pytest fixture returning a function that maps an accelerate config name to the path
+    # accelerate_configs/<name>.yaml inside the lazily copied shared test data dir.
+    # Inputs: lazy_shared_datadir fixture. Outputs: callable. Exceptions: none. Side effects: none.
     def _get_config_path(config_name):
+        # [FUNCTION DOC]
+        # HELPER: Return the Path of the YAML accelerate config with the given name (not checked for existence).
+        # Inputs: config_name (str). Outputs: pathlib Path. Exceptions: none. Side effects: none.
         return lazy_shared_datadir / "accelerate_configs" / f"{config_name}.yaml"
 
     return _get_config_path
@@ -62,6 +81,9 @@ def get_config_path(lazy_shared_datadir):
 
 @require_torch_multi_accelerator
 class TestDistributed(TrlTestCase):
+    # [CLASS DOC]
+    # Test class (inherits TrlTestCase for tmp_dir) running each TRL CLI training script end-to-end under
+    # accelerate launch with several distributed backends. Every test only checks the launched process exits cleanly.
     @pytest.mark.parametrize(
         "config",
         [
@@ -84,6 +106,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_sft(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # SFT smoke test.
+        # Parametrized over accelerate configs ddp, zero2, zero3 and fsdp2 (zero2/zero3 marked xfail on transformers 5.1.0).
+        # Launches trl/scripts/sft.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config standard_language_modeling,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -119,6 +146,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_sft_nll_loss(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # SFT with the nll loss type.
+        # Parametrized over accelerate configs ddp, zero2, zero3 and fsdp2 (zero2/zero3 marked xfail on transformers 5.1.0).
+        # Launches trl/scripts/sft.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config standard_language_modeling with loss_type nll,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -155,6 +187,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_dpo(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # DPO smoke test.
+        # Parametrized over accelerate configs ddp, zero2, zero3 and fsdp2 (zero2/zero3 marked xfail on transformers 5.1.0).
+        # Launches trl/scripts/dpo.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config standard_preference,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -190,6 +227,12 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_dpo_precompute_ref_log_probs(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # DPO with precomputed reference log-probs for both train and eval splits (eval_strategy epoch),
+        # regression for multi-GPU precompute fingerprint and ZeRO-3 re-initialization bugs.
+        # Parametrized over accelerate configs ddp, zero2, zero3 and fsdp2 (zero2/zero3 marked xfail on transformers 5.1.0).
+        # Launches trl/scripts/dpo.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config standard_preference with precompute_ref_log_probs and eval_strategy epoch,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # `--eval_strategy epoch` passes an eval dataset, so reference log-probs are precomputed for both the train and
         # eval splits (two passes), which is what previously broke multi-GPU precompute (fingerprint cache mismatch, and
         # a corrupted ZeRO-3 parameter coordinator from re-initializing DeepSpeed on the policy model per pass).
@@ -230,6 +273,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_kto_precompute_ref_log_probs(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # KTO with precomputed reference log-probs and per-epoch evaluation.
+        # Parametrized over accelerate configs ddp, zero2, zero3 and fsdp2 (zero2/zero3 marked xfail on transformers 5.1.0).
+        # Launches trl/scripts/kto.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config standard_unpaired_preference with precompute_ref_log_probs and eval_strategy epoch,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -268,6 +316,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_dpo_liger(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # DPO with Liger kernels (requires liger-kernel).
+        # Parametrized over accelerate configs ddp, zero2, zero3 and fsdp2 (zero2/zero3 marked xfail on transformers 5.1.0).
+        # Launches trl/scripts/dpo.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config standard_preference with use_liger_kernel,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -305,6 +358,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_kto_liger(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # KTO with Liger kernels (requires liger-kernel).
+        # Parametrized over accelerate configs ddp, zero2, zero3 and fsdp2 (zero2/zero3 marked xfail on transformers 5.1.0).
+        # Launches trl/scripts/kto.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config standard_unpaired_preference with use_liger_kernel,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -341,6 +399,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_sft_dataset_streaming(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # SFT with a streamed dataset.
+        # Parametrized over accelerate configs ddp, zero2, zero3 and fsdp2 (zero2/zero3 marked xfail on transformers 5.1.0).
+        # Launches trl/scripts/sft.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config standard_language_modeling with dataset_streaming and max_steps 3,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -380,6 +443,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_sft_peft(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # SFT with PEFT (LoRA).
+        # Parametrized over ddp, zero2, zero3, fsdp2; zero2/zero3 marked xfail on torch >= 2.10 with transformers < 5.1.0.
+        # Launches trl/scripts/sft.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config standard_language_modeling with use_peft,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -416,6 +484,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_reward(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # Reward model training smoke test.
+        # Parametrized over accelerate configs ddp, zero2, zero3 and fsdp2 (zero2/zero3 marked xfail on transformers 5.1.0).
+        # Launches trl/scripts/reward.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config conversational_implicit_prompt_preference,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -458,6 +531,12 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_rloo(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # RLOO smoke test.
+        # Parametrized over ddp, zero2 (xfail on transformers 5.1.0), zero3 (strict xfail for transformers in [5.0.0, 5.5.4))
+        # and fsdp2 (skipped for transformers in [5.4.0, 5.6.0)).
+        # Launches trl/scripts/rloo.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config conversational_prompt_only using trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 as reward model,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -495,6 +574,12 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_grpo(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # GRPO smoke test.
+        # Parametrized over ddp, zero2 (xfail on transformers 5.1.0), zero3 (strict xfail for transformers in [5.0.0, 5.5.4))
+        # and fsdp2.
+        # Launches trl/scripts/grpo.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config conversational_prompt_only using trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 as reward model,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -533,6 +618,11 @@ class TestDistributed(TrlTestCase):
         ],
     )
     def test_grpo_liger(self, config, get_config_path):
+        # [FUNCTION DOC]
+        # GRPO with Liger kernels (requires liger-kernel).
+        # Parametrized like test_grpo (ddp, zero2 xfail on 5.1.0, zero3 strict xfail in [5.0.0, 5.5.4), fsdp2).
+        # Launches trl/scripts/grpo.py through accelerate launch with the tiny Qwen2.5 causal LM on the zen dataset config conversational_prompt_only using trl-internal-testing/tiny-Qwen2ForSequenceClassification-2.5 as reward model and use_liger_kernel,
+        # writing to the test tmp_dir. Asserts only that the subprocess exits with code 0.
         # fmt: off
         run_command(
             [
@@ -551,7 +641,17 @@ class TestDistributed(TrlTestCase):
 
 @require_torch_multi_accelerator
 class TestModelParallel:
+    # [CLASS DOC]
+    # Tests for single-process naive model parallelism: models loaded with a device_map that puts embeddings
+    # and layer 0 on device 0, layer 1, norm and rotary embedding on device 1, and the head on device 0.
+    # Plain class (not TrlTestCase); uses pytest tmp_path for output dirs.
     def test_fused_lm_head(self):
+        # [FUNCTION DOC]
+        # Checks the fused LM head on a split model matches a single-device model.
+        # Setup: tiny Qwen3 loaded on device 0 and loaded split; add_fused_lm_head on both with log_probs and entropy
+        # outputs; random input ids of shape 2 by 16 with the first 4 label positions masked to -100.
+        # Asserts log_probs and entropy are close between the two, and that backward on the split model's loss gives
+        # every parameter a gradient.
         """With the model split across two devices, the fused LM head matches the model on a single device."""
         model_id = "trl-internal-testing/tiny-Qwen3ForCausalLM"
         # The layout documented for naive pipeline parallelism: layers split across devices, `lm_head` on device 0
@@ -579,6 +679,9 @@ class TestModelParallel:
         assert all(param.grad is not None for param in model_split.parameters())
 
     def test_train_sft(self, tmp_path):
+        # [FUNCTION DOC]
+        # Trains SFTTrainer on a split tiny-Qwen3 model (zen standard_language_modeling, default SFTConfig) and asserts train_loss is logged and every
+        # parameter changed vs a pre-training clone. Shows Trainer does not wrap split models in DataParallel.
         """A model split across two devices trains, since `Trainer` doesn't wrap it in `nn.DataParallel`."""
         model_id = "trl-internal-testing/tiny-Qwen3ForCausalLM"
         # The layout documented for naive pipeline parallelism: layers split across devices, `lm_head` on device 0
@@ -608,6 +711,10 @@ class TestModelParallel:
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_distillation(self, tmp_path):
+        # [FUNCTION DOC]
+        # Trains DistillationTrainer with a split tiny-Qwen3 student and a split small-Qwen3 teacher (same
+        # device map) on zen standard_prompt_only (lr 0.1, batch 3, completion length 8). Asserts train_loss is logged
+        # and all student parameters changed.
         """A student and a teacher split across two devices train with the chunked divergence loss."""
         # The layout documented for naive pipeline parallelism: layers split across devices, `lm_head` on device 0
         device_map = {
@@ -649,6 +756,10 @@ class TestModelParallel:
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_distillation_heads_on_different_devices(self, tmp_path):
+        # [FUNCTION DOC]
+        # Checks DistillationTrainer refuses when the student head (device 0) and teacher head (device 1, teacher
+        # loaded with model on 0 and lm_head on 1) are on different devices: train raises ValueError matching
+        # "Place both on the same device".
         """The chunked divergence loss needs the student and teacher heads on the same device, so training refuses."""
         # The layout documented for naive pipeline parallelism: layers split across devices, `lm_head` on device 0
         device_map = {
@@ -682,6 +793,9 @@ class TestModelParallel:
             trainer.train()
 
     def test_train_dpo(self, tmp_path):
+        # [FUNCTION DOC]
+        # Trains DPOTrainer on a split tiny-Qwen3 model (zen standard_preference, lr 0.1) and asserts train_loss is logged and every
+        # parameter changed vs a pre-training clone. Shows Trainer does not wrap split models in DataParallel.
         """A model split across two devices trains, since `Trainer` doesn't wrap it in `nn.DataParallel`."""
         model_id = "trl-internal-testing/tiny-Qwen3ForCausalLM"
         # The layout documented for naive pipeline parallelism: layers split across devices, `lm_head` on device 0
@@ -715,6 +829,9 @@ class TestModelParallel:
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_kto(self, tmp_path):
+        # [FUNCTION DOC]
+        # Trains KTOTrainer on a split tiny-Qwen3 model (zen standard_unpaired_preference, lr 0.1) and asserts train_loss is logged and every
+        # parameter changed vs a pre-training clone. Shows Trainer does not wrap split models in DataParallel.
         """A model split across two devices trains, since `Trainer` doesn't wrap it in `nn.DataParallel`."""
         model_id = "trl-internal-testing/tiny-Qwen3ForCausalLM"
         # The layout documented for naive pipeline parallelism: layers split across devices, `lm_head` on device 0
@@ -748,6 +865,10 @@ class TestModelParallel:
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_reward(self, tmp_path):
+        # [FUNCTION DOC]
+        # Trains RewardTrainer on a split tiny-Qwen3 model (AutoModelForSequenceClassification with num_labels 1 and the score head on device 0,
+        # zen standard_implicit_prompt_preference, default RewardConfig) and asserts train_loss is logged and every
+        # parameter changed vs a pre-training clone. Shows Trainer does not wrap split models in DataParallel.
         """A model split across two devices trains, since `Trainer` doesn't wrap it in `nn.DataParallel`."""
         model_id = "trl-internal-testing/tiny-Qwen3ForCausalLM"
         # The layout documented for naive pipeline parallelism: layers split across devices, `score` on device 0
@@ -779,6 +900,10 @@ class TestModelParallel:
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_grpo(self, tmp_path):
+        # [FUNCTION DOC]
+        # Trains GRPOTrainer on a split tiny-Qwen3 model (zen standard_prompt_only, lr 0.1, batch 3, 3 generations, completion length 8,
+        # tiny Qwen2.5 sequence classifier as reward) and asserts train_loss is logged and every
+        # parameter changed vs a pre-training clone. Shows Trainer does not wrap split models in DataParallel.
         """A model split across two devices trains, since `Trainer` doesn't wrap it in `nn.DataParallel`."""
         model_id = "trl-internal-testing/tiny-Qwen3ForCausalLM"
         # The layout documented for naive pipeline parallelism: layers split across devices, `lm_head` on device 0
@@ -820,6 +945,10 @@ class TestModelParallel:
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_rloo(self, tmp_path):
+        # [FUNCTION DOC]
+        # Trains RLOOTrainer on a split tiny-Qwen3 model (zen standard_prompt_only, lr 0.1, batch 3, 3 generations, completion length 8,
+        # tiny Qwen2.5 sequence classifier as reward) and asserts train_loss is logged and every
+        # parameter changed vs a pre-training clone. Shows Trainer does not wrap split models in DataParallel.
         """A model split across two devices trains, since `Trainer` doesn't wrap it in `nn.DataParallel`."""
         model_id = "trl-internal-testing/tiny-Qwen3ForCausalLM"
         # The layout documented for naive pipeline parallelism: layers split across devices, `lm_head` on device 0

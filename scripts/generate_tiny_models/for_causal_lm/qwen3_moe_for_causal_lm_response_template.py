@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Script that re-publishes trl-internal-testing/tiny-Qwen3MoeForCausalLM as tiny-Qwen3MoeForCausalLM-ResponseTemplate,
+# a fixture whose tokenizer natively carries a response_template, to test that callers of add_response_schema detect
+# and keep an existing template.
+# Behavior (import time): requires transformers 5.13.0 exactly, seeds RNGs, loads the existing tiny model (bfloat16),
+# tokenizer and generation config, applies add_response_schema to obtain the template, then prepends a Jinja comment
+# marker to the chat template so it no longer matches any known template by string equality (rendered output is
+# unchanged), runs smoke_test and push_to_hub.
+# Inputs: --create-pr CLI flag. Outputs: none. Exceptions: version mismatch / smoke test RuntimeError; Hub errors.
+# Side effects: Hub download and upload.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Defines KTOConfig, the TrainingArguments subclass (via _BaseConfig) used to configure KTOTrainer
+# (Kahneman-Tversky Optimization on unpaired desirable/undesirable completions).
+# Inputs/Outputs: none at module level. Exceptions: none. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +25,18 @@ from .base_config import _BaseConfig
 
 @dataclass
 class KTOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass extending _BaseConfig with KTO-specific options; adds model_init_kwargs to
+    # _VALID_DICT_FIELDS so it can be given as a JSON string on the CLI.
+    # Fields: learning_rate (1e-6 override), train_sampling_strategy ("sequential"; KL-estimating
+    # losses rely on fixed-order batches); model: model_init_kwargs, trust_remote_code (False),
+    # router_aux_loss_coef (None = use model config), disable_dropout (True); data: dataset_num_proc,
+    # max_length (1024, right truncation), pad_to_multiple_of ("auto"), precompute_ref_log_probs
+    # (False), precompute_ref_batch_size (None); training: loss_type ("kto" or "apo_zero_unpaired"),
+    # beta (0.1), desirable_weight / undesirable_weight (1.0), activation_offloading (False),
+    # sync_ref_model (False), ref_model_mixup_alpha (0.6), ref_model_sync_steps (512) for TR-DPO style
+    # reference syncing.
+    # Construction: keyword args; normalization in __post_init__. Side effects: none beyond that.
     r"""
     Configuration class for the [`KTOTrainer`].
 
@@ -253,6 +270,14 @@ class KTOConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs the parent post-init, then normalizes pad_to_multiple_of.
+        # Behavior: a string other than "auto" (CLI input) becomes None for "none"/"null"
+        # (case-insensitive) or an int otherwise; "auto" resolves to 128 when self.device.type is
+        # "neuron", else None.
+        # Inputs: self. Outputs: none.
+        # Exceptions: ValueError from int conversion of a non-numeric string; whatever the parent raises.
+        # Side effects: mutates pad_to_multiple_of; reading self.device may initialize distributed state.
         super().__post_init__()
         # The CLI passes the value as a string
         if isinstance(self.pad_to_multiple_of, str) and self.pad_to_multiple_of != "auto":

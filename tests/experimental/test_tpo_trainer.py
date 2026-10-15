@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Tests for the experimental TPO (Triple Preference Optimization) trainer in trl.experimental.tpo.
+# Main contents: a helper that synthesizes the required "reference" (gold) completion column from "chosen";
+# tests for DataCollatorForTriplePreference padding/mask layout with and without the reference branch; and
+# TPOTrainer integration tests (training, eval dataset variants, evaluate on raw data, trust_remote_code, loss
+# types, conversational and implicit-prompt data, tpo_alpha 0, missing/mismatched reference errors, seeded PEFT
+# init, PEFT training, pad token syncing). Uses trl-internal-testing/zen datasets and tiny models.
+# Import-time side effects: imports peft.LoraConfig only if PEFT is available.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,13 +37,26 @@ if is_peft_available():
 
 
 def _add_reference_column(example):
+    # [FUNCTION DOC]
+    # HELPER: Dataset map function that sets example["reference"] to a copy of example["chosen"] (same object).
+    # Inputs: example - dict row with a "chosen" key. Outputs: the same dict, mutated.
+    # Exceptions: KeyError if "chosen" missing. Side effects: mutates the input row.
     """Synthesize a `reference` (gold) completion for tests by reusing the chosen completion."""
     example["reference"] = example["chosen"]
     return example
 
 
 class TestDataCollatorForTriplePreference(TrlTestCase):
+    # [CLASS DOC]
+    # Unit tests for DataCollatorForTriplePreference on hand-built tokenized examples (pad_token_id 0).
+    # Inherits TrlTestCase. No state.
     def test_padding_and_masks(self):
+        # [FUNCTION DOC]
+        # Checks the default collator stacks prompt+chosen rows for all examples, then prompt+rejected, then
+        # prompt+reference (3 times batch size rows), right-padded with 0 to the longest row.
+        # Assertions: output keys are exactly input_ids, attention_mask, completion_mask; input_ids match the expected
+        # six rows; attention_mask is 1 on real tokens; completion_mask is 1 only on completion tokens.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         collator = DataCollatorForTriplePreference(pad_token_id=0)
         examples = [
             {"prompt_ids": [1, 2, 3], "chosen_ids": [4, 5], "rejected_ids": [6], "reference_ids": [7, 8]},
@@ -79,6 +101,10 @@ class TestDataCollatorForTriplePreference(TrlTestCase):
         torch.testing.assert_close(result["completion_mask"], expected_completion_mask)
 
     def test_exclude_reference(self):
+        # [FUNCTION DOC]
+        # Checks include_reference False yields only the chosen and rejected rows (2 times batch size, shape (4, 5)), with
+        # the same ordering and padding, and the same three output keys.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: none.
         # When `include_reference=False`, the collator only emits the chosen/rejected halves so the per-step
         # compute/memory cost matches DPO's `DataCollatorForPreference`. This is the layout used by
         # `TPOTrainer` when `tpo_alpha=0.0`.
@@ -103,7 +129,16 @@ class TestDataCollatorForTriplePreference(TrlTestCase):
 
 
 class TestTPOTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # Integration tests for TPOTrainer with the tiny Qwen2 model (and others where noted).
+    # Inherits TrlTestCase (self.tmp_dir). Each test loads a zen preference dataset and adds the reference column.
     def test_train(self):
+        # [FUNCTION DOC]
+        # Trains TPOTrainer on the standard_preference train split (learning_rate 0.1, other defaults).
+        # Assertions: final log_history entry has a non-None train_loss and every parameter snapshot taken before
+        # training differs from the parameter after training.
+        # Inputs: none (self.tmp_dir). Outputs: none. Exceptions: assertion failure.
+        # Side effects: downloads/loads dataset and tiny model; trains and writes to self.tmp_dir.
         # Get the dataset and synthesize a reference (gold) completion
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
         dataset = dataset.map(_add_reference_column)
@@ -143,6 +178,14 @@ class TestTPOTrainer(TrlTestCase):
         ],
     )
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over eval dataset kinds: Dataset, IterableDataset, DatasetDict, IterableDatasetDict, plain dict of
+        # Dataset, plain dict of IterableDataset, or None. Builds the eval set from the zen test split (streaming when the
+        # kind contains "iterable"), with reference column added; constructs the trainer.
+        # Assertions: None stays None; dict-like eval sets keep keys data1/data2 and each split's first row has
+        # prompt_ids (tokenized independently); single datasets have prompt_ids in their first row.
+        # Inputs: eval_dataset_type - parametrized string. Outputs: none. Exceptions: assertion failure.
+        # Side effects: loads datasets/model.
         # Get the dataset and synthesize a reference (gold) completion
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
         train_dataset = train_dataset.map(_add_reference_column)
@@ -182,6 +225,10 @@ class TestTPOTrainer(TrlTestCase):
             assert "prompt_ids" in next(iter(trainer.eval_dataset))
 
     def test_evaluate_with_raw_dataset(self):
+        # [FUNCTION DOC]
+        # Checks evaluate accepts an unprocessed dataset (the raw train split with reference column) passed directly
+        # and returns metrics with a non-None eval_loss (regression for issue 6115).
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads model/dataset, runs evaluation.
         # `evaluate` should accept the same (unprocessed) dataset types as the trainer, e.g. a held-out test set
         # passed directly to `evaluate`, mirroring DPO/KTO. See https://github.com/huggingface/trl/issues/6115.
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
@@ -196,6 +243,10 @@ class TestTPOTrainer(TrlTestCase):
         assert metrics["eval_loss"] is not None
 
     def test_trust_remote_code(self):
+        # [FUNCTION DOC]
+        # Checks loading tiny-RemoteForCausalLM raises ValueError mentioning "custom code" without trust_remote_code,
+        # and succeeds with trust_remote_code True, producing a model whose class name is RemoteForCausalLM.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads remote-code model.
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
         dataset = dataset.map(_add_reference_column)
         model_id = "trl-internal-testing/tiny-RemoteForCausalLM"
@@ -216,6 +267,13 @@ class TestTPOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("loss_type", ["sigmoid", "hinge", "ipo", "tpo-l"])
     def test_train_loss_types(self, loss_type):
+        # [FUNCTION DOC]
+        # Parametrized over loss_type sigmoid, hinge, ipo, tpo-l: trains on the train split with evaluation on the test
+        # split every 3 steps (learning_rate 0.1).
+        # Assertions: final log_history entry has a non-None train_loss and every parameter snapshot taken before
+        # training differs from the parameter after training.
+        # Inputs: none (self.tmp_dir). Outputs: none. Exceptions: assertion failure.
+        # Side effects: downloads/loads dataset and tiny model; trains and writes to self.tmp_dir.
         # Get the dataset and synthesize a reference (gold) completion
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference")
         dataset = dataset.map(_add_reference_column)
@@ -247,6 +305,12 @@ class TestTPOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_conversational(self):
+        # [FUNCTION DOC]
+        # Trains on the conversational_preference train split (learning_rate 0.1).
+        # Assertions: final log_history entry has a non-None train_loss and every parameter snapshot taken before
+        # training differs from the parameter after training.
+        # Inputs: none (self.tmp_dir). Outputs: none. Exceptions: assertion failure.
+        # Side effects: downloads/loads dataset and tiny model; trains and writes to self.tmp_dir.
         # Get the dataset and synthesize a reference (gold) completion
         dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
         dataset = dataset.map(_add_reference_column)
@@ -274,6 +338,13 @@ class TestTPOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_without_nll(self):
+        # [FUNCTION DOC]
+        # Checks tpo_alpha 0.0: the default data collator is DataCollatorForTriplePreference with include_reference
+        # False, collating two train rows gives 4 rows (chosen and rejected only), then trains (learning_rate 0.1).
+        # Assertions: final log_history entry has a non-None train_loss and every parameter snapshot taken before
+        # training differs from the parameter after training.
+        # Inputs: none (self.tmp_dir). Outputs: none. Exceptions: assertion failure.
+        # Side effects: downloads/loads dataset and tiny model; trains and writes to self.tmp_dir.
         # Setting tpo_alpha=0.0 disables the NLL term, skips the corresponding cross-entropy, and also drops the
         # reference branch from the collated batch so the model doesn't pay the extra forward-pass cost.
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
@@ -309,6 +380,14 @@ class TestTPOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_implicit_prompt(self):
+        # [FUNCTION DOC]
+        # Regression test for implicit-prompt data (no prompt column; prompt embedded in chosen, rejected and the
+        # synthesized reference): trains on standard_implicit_prompt_preference (learning_rate 0.1) to make sure prompt
+        # extraction also strips the reference.
+        # Assertions: final log_history entry has a non-None train_loss and every parameter snapshot taken before
+        # training differs from the parameter after training.
+        # Inputs: none (self.tmp_dir). Outputs: none. Exceptions: assertion failure.
+        # Side effects: downloads/loads dataset and tiny model; trains and writes to self.tmp_dir.
         # Implicit-prompt variant: no `prompt` column, the prompt is embedded in `chosen`/`rejected` and (for TPO)
         # also in `reference`. Regression test for the `extract_prompt` bug where the reference column was left
         # untouched, silently doubling the prompt in the reference branch.
@@ -338,12 +417,20 @@ class TestTPOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_implicit_prompt_mismatched_reference_raises(self):
+        # [FUNCTION DOC]
+        # Checks that with implicit-prompt data whose reference does not share the chosen/rejected prompt prefix,
+        # constructing TPOTrainer raises ValueError mentioning "implicit prompt".
+        # Setup: reference overwritten by a nested map function with an unrelated string.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads model/dataset.
         # When the dataset has no `prompt` column and the `reference` completion does not share the implicit
         # prompt prefix of `chosen`/`rejected`, the trainer must raise a clear error rather than silently
         # corrupting the reference branch.
         dataset = load_dataset("trl-internal-testing/zen", "standard_implicit_prompt_preference", split="train")
 
         def _set_unrelated_reference(example):
+            # [FUNCTION DOC]
+            # HELPER: Map function setting example["reference"] to a fixed unrelated sentence without the prompt prefix.
+            # Inputs: example dict. Outputs: the mutated dict. Exceptions: none. Side effects: mutates the row.
             example["reference"] = "unrelated completion without the shared prompt prefix."
             return example
 
@@ -358,6 +445,9 @@ class TestTPOTrainer(TrlTestCase):
             )
 
     def test_missing_reference_column_raises(self):
+        # [FUNCTION DOC]
+        # Checks that a preference dataset without a "reference" column makes TPOTrainer raise ValueError matching
+        # "reference". Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads model/dataset.
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
 
         training_args = TPOConfig(output_dir=self.tmp_dir, report_to="none")
@@ -370,6 +460,12 @@ class TestTPOTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_init_is_seeded(self):
+        # [FUNCTION DOC]
+        # Checks LoRA adapter initialization is deterministic given the config seed regardless of global RNG state.
+        # Setup: for global seeds 0 and 1, set torch's global seed, build a trainer with a default LoraConfig and clone all
+        # lora_A parameters. Requires PEFT.
+        # Assertions: some lora_A params exist and each one is identical across the two trainers.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: alters the global torch RNG; loads models.
         # Two trainers with the same seed start from the same adapter weights
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
         dataset = dataset.map(_add_reference_column)
@@ -390,6 +486,10 @@ class TestTPOTrainer(TrlTestCase):
 
     @require_peft
     def test_train_with_peft(self):
+        # [FUNCTION DOC]
+        # Trains with a default LoraConfig (learning_rate 0.1). Requires PEFT.
+        # Assertions: train_loss logged; every parameter whose name contains "lora" changed after training.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads model/dataset, trains.
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
         dataset = dataset.map(_add_reference_column)
 
@@ -417,6 +517,10 @@ class TestTPOTrainer(TrlTestCase):
                 assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_pad_token_id_synced_with_model_config(self):
+        # [FUNCTION DOC]
+        # Checks that with tiny-MistralForCausalLM-0.2 (tokenizer without a pad token, so eos is used) the trainer sets a
+        # non-None pad_token_id on the processing class and copies it into model.config and model.generation_config.
+        # Inputs/Outputs: none. Exceptions: assertion failure. Side effects: loads model/dataset.
         # This model's tokenizer has no pad token, so the trainer falls back to the eos token. The model configs must
         # follow: otherwise `Trainer` realigns them at train time and reports it as a change the user did not make.
         dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")

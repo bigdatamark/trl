@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Dataset preparation script: converts openai/summarize_from_feedback "comparisons" into standard preference format
+# (prompt, chosen, rejected) covering both CNN/DailyMail and Reddit batches, optionally pushing with a dataset card.
+# Main contents: ScriptArguments, to_preference, model_card. Import-time side effects: builds the ModelCard.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +26,10 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI options parsed by HfArgumentParser: push_to_hub (default False), repo_id (target Hub
+    # dataset repo), dataset_num_proc (worker count for map/filter, default None). No methods; plain data holder.
+    # Side effects: none.
     r"""
     Arguments for the script.
 
@@ -48,6 +57,13 @@ class ScriptArguments:
 
 
 def to_preference(example):
+    # [FUNCTION DOC]
+    # Behavior: for CNN/DM batches (batch0_cnndm, cnndm0, cnndm2) builds "TITLE: ..." plus the article (double newlines
+    # collapsed to single) and "TL;DR:"; for Reddit batches (batch3..batch22 and edit_b2_eval_test) builds the
+    # SUBREDDIT/TITLE/POST format with the post's double newlines collapsed. Chosen is the summary text at index "choice",
+    # rejected the other one (1 minus choice).
+    # Inputs: example with "info", "batch", "choice", "summaries". Outputs: dict with "prompt", "chosen", "rejected".
+    # Exceptions: ValueError for an unknown batch name. Side effects: none.
     info = example["info"]
     if example["batch"] in ["batch0_cnndm", "cnndm0", "cnndm2"]:  # CNN Daily Mail batches
         article = info["article"].replace("\n\n", "\n")

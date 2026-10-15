@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# trl.experimental: namespace for unstable/incubating trainers and utilities that may change or disappear without
+# deprecation. Exports nothing itself; subpackages are imported explicitly.
+# Side effects on import: emits a TRLExperimentalWarning unless the TRL_EXPERIMENTAL_SILENCE environment variable is set.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

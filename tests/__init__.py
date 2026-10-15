@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Test package for TRL; marks the tests directory as a package so test modules can use relative imports
+# (e.g. of testing_utils).
+# Exports: nothing. Lazy imports: none. Side effects on import: none (license header only).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

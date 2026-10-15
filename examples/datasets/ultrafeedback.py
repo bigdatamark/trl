@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Dataset preparation script: builds an unpaired preference (KTO-style prompt, completion, label) dataset from
+# openbmb/UltraFeedback for one target model and rating aspect: keeps rows containing that model, takes its response
+# and labels it desirable when the aspect rating is at least 5; splits 5% test (seed 42); optionally pushes with a card.
+# Main contents: ScriptArguments, to_unpaired_preference, model_card. Import-time side effects: builds the ModelCard.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +27,10 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI options: model_name (one of the UltraFeedback model names, default gpt-3.5-turbo), aspect
+    # (helpfulness, honesty, instruction-following or truthfulness; default helpfulness), push_to_hub, repo_id and
+    # dataset_num_proc. No methods. Side effects: none.
     r"""
     Arguments for the script.
 
@@ -85,6 +95,12 @@ class ScriptArguments:
 
 
 def to_unpaired_preference(example, model_name, aspect):
+    # [FUNCTION DOC]
+    # Behavior: prompt is one user message with "instruction"; locates model_name in "models", takes the corresponding
+    # completion's response as a single assistant message, parses its annotations[aspect]["Rating"] as int and sets
+    # label True when the score is at least 5.
+    # Inputs: example row, model_name, aspect. Outputs: dict with "prompt", "completion", "label".
+    # Exceptions: ValueError if the model is absent or the rating is non-numeric (e.g. "N/A"). Side effects: none.
     prompt = [{"role": "user", "content": example["instruction"]}]
     model_index = example["models"].index(model_name)
     response_content = example["completions"][model_index]["response"]

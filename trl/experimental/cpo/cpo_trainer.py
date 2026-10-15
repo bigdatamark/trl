@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Experimental CPO trainer: reference-free preference optimization on paired (prompt, chosen, rejected) data.
+# Main content: CPOTrainer, supporting loss types sigmoid (CPO), hinge, ipo and simpo (SimPO; AlphaPO via alpha),
+# plus a behavior-cloning NLL term on chosen responses weighted by cpo_alpha.
+# Fits in trl.experimental.cpo alongside CPOConfig; uses DPO-style collator and token helpers from
+# trl.experimental.utils. Import-time side effects: conditional imports of peft and wandb; module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -80,6 +87,18 @@ logger = get_logger(__name__)
 
 
 class CPOTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Transformers-Trainer-based (via trl _BaseTrainer) trainer for CPO-family losses without a reference model.
+    # Key state: is_encoder_decoder, decoder_start_token_id/pad_token_id (encoder-decoder), max_length (default 512 when
+    # unset), max_completion_length (128 default for encoder-decoder), generate_during_eval, beta, label_smoothing,
+    # loss_type, cpo_alpha, simpo_gamma (simpo only), alpha (AlphaPO), aux_loss_enabled/aux_loss_coef (MoE router loss),
+    # use_dpo_data_collator, _peft_has_been_casted_to_bf16, _stored_metrics (mode to key to list of floats).
+    # Class attributes: loss_is_scaled_for_ga False, model-card tags/name/paper info.
+    # Flow: __init__ tokenizes datasets with tokenize_row; compute_loss and prediction_step call get_batch_loss_metrics,
+    # which runs concatenated_forward (one pass over chosen and rejected concatenated on the batch dimension) then
+    # cpo_loss; metrics are buffered by store_metrics and averaged into logs by log.
+    # KNOWN ISSUE: the docstring says the model should preferably be a sequence-classification model, but the code loads
+    # string models with AutoModelForCausalLM and needs LM logits.
     r"""
     Initialize CPOTrainer.
 
@@ -155,6 +174,39 @@ class CPOTrainer(_BaseTrainer):
         peft_config: "PeftConfig | None" = None,
         compute_metrics: Callable[[EvalLoopOutput], dict] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior:
+        # 1. Requires train_dataset. Reads args.model_init_kwargs: if set, model must be a string; dtype strings (other than
+        # "auto") are converted to torch dtypes and validated; device_map defaults to "auto". trust_remote_code defaults from
+        # args; revision kept for tokenizer loading.
+        # 2. set_seed(args.seed), then loads a string model with AutoModelForCausalLM.
+        # 3. PEFT: when peft_config is given, validates peft availability, type and that model is not already a PEFT model;
+        # for 8/4-bit models runs prepare_model_for_kbit_training (with gradient checkpointing kwargs when supported), else
+        # with gradient checkpointing enables input grads (or registers a forward hook); wraps with get_peft_model, disabling
+        # adapter dtype autocast under ZeRO-3 with a non-quantized model; for bf16 with 4-bit, casts modules to bf16 and sets
+        # _peft_has_been_casted_to_bf16. Without PEFT, gradient checkpointing still enables input grads.
+        # 4. Validates generate_during_eval needs wandb or comet; determines is_encoder_decoder from the model config or args.
+        # 5. Loads a tokenizer from the model id when processing_class is None; resolves max_length/max_completion_length
+        # with warnings; builds DPODataCollatorWithPadding when no collator (forcing remove_unused_columns False with a
+        # warning).
+        # 6. Disables dropout if configured; sets pad token to eos when missing and mirrors it onto model text config and
+        # generation config.
+        # 7. Warns that hinge/ipo ignore label smoothing; rejects kto_pair; stores loss hyperparameters and MoE aux-loss
+        # settings (warns if enabled with coefficient 0).
+        # 8. Under main-process-first, maps datasets through prompt extraction, chat-template application and tokenize_row.
+        # 9. For transformers below 5.0.0 with gradient checkpointing, defaults use_reentrant to False.
+        # 10. Calls the base Trainer constructor, adds model tags if supported, and checks an accelerator exists.
+        # Inputs: model (model, string or None), args (CPOConfig), data_collator, train_dataset, eval_dataset (Dataset or
+        # dict), processing_class, model_init, callbacks, optimizers, preprocess_logits_for_metrics, peft_config,
+        # compute_metrics.
+        # Outputs: none.
+        # Exceptions: ValueError (missing train_dataset, init kwargs with instantiated model, bad dtype, PEFT model plus
+        # peft_config, missing wandb/comet, missing is_encoder_decoder, kto_pair); ImportError/TypeError for PEFT problems;
+        # AttributeError when no accelerator.
+        # Side effects: may download models/tokenizers; mutates args (remove_unused_columns, gradient_checkpointing_kwargs),
+        # tokenizer pad token and model configs; dataset map caching.
+        # KNOWN ISSUE: args defaults to None but is dereferenced immediately (model_init_kwargs), so omitting args raises
+        # AttributeError; no default CPOConfig is built.
         if train_dataset is None:
             raise ValueError("`train_dataset` is required")
 
@@ -227,6 +279,11 @@ class CPOTrainer(_BaseTrainer):
                 else:
 
                     def make_inputs_require_grad(module, input, output):
+                        # [FUNCTION DOC]
+                        # HELPER: Forward hook on the input embeddings that marks their output as requiring grad (PEFT plus gradient
+                        # checkpointing on models without enable_input_require_grads).
+                        # Inputs: module, input, output. Outputs: none. Exceptions: none.
+                        # Side effects: sets requires_grad on output in place.
                         output.requires_grad_(True)
 
                     model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
@@ -264,6 +321,10 @@ class CPOTrainer(_BaseTrainer):
             else:
 
                 def make_inputs_require_grad(module, input, output):
+                    # [FUNCTION DOC]
+                    # HELPER: Same hook as above, used in the non-PEFT gradient-checkpointing branch.
+                    # Inputs: module, input, output. Outputs: none. Exceptions: none.
+                    # Side effects: sets requires_grad on output in place.
                     output.requires_grad_(True)
 
                 model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
@@ -425,6 +486,14 @@ class CPOTrainer(_BaseTrainer):
             )
 
     def build_tokenized_answer(self, prompt, answer):
+        # [FUNCTION DOC]
+        # Behavior: tokenizes prompt plus answer jointly and the prompt alone (no special tokens). The answer start index is
+        # the prompt length, decremented by one if the joint tokenization's prefix differs from the standalone prompt tokens
+        # (merge at the boundary). Splits joint ids and attention mask into prompt and answer parts.
+        # Inputs: prompt (str), answer (str).
+        # Outputs: dict with prompt_input_ids, prompt_attention_mask, input_ids, attention_mask (lists).
+        # Exceptions: ValueError on length mismatches (both checks hold by construction, so never raised in practice).
+        # Side effects: none.
         """
         Llama tokenizer does satisfy `enc(a + b) = enc(a) + enc(b)`. It does ensure `enc(a + b) = enc(a) + enc(a +
         b)[len(enc(a)):]`. Reference:
@@ -474,6 +543,19 @@ class CPOTrainer(_BaseTrainer):
         )
 
     def tokenize_row(self, feature, model: PreTrainedModel | nn.Module | None = None) -> dict:
+        # [FUNCTION DOC]
+        # Behavior: decoder-only: requires string prompt/chosen/rejected; tokenizes the prompt and both answers via
+        # build_tokenized_answer; truncates prompt tokens to the shorter of the two answer-side prompt lengths; errors if the
+        # chosen/rejected prompt ids differ in more than one token or length by more than one; adds BOS to prompts and EOS to
+        # answers if missing; truncates each answer so prompt plus answer fits max_length (warning once if it becomes empty);
+        # builds full sequences with labels equal to input ids but -100 over the prompt. Emits keys chosen_*, rejected_*
+        # (input_ids, attention_mask, labels) and prompt_* (token_type_ids skipped).
+        # Encoder-decoder: tokenizes chosen/rejected with truncation to max_completion_length (special tokens on) as labels and
+        # the prompt untruncated; if a model with prepare_decoder_input_ids_from_labels is given, adds decoder input ids.
+        # Inputs: feature (dict with prompt, chosen, rejected), model (optional).
+        # Outputs: dict of token lists.
+        # Exceptions: ValueError for non-string fields or inconsistent prompt tokenization.
+        # Side effects: possible warning log.
         """Tokenize a single row from a CPO specific dataset.
 
         At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation in case the prompt +
@@ -617,6 +699,16 @@ class CPOTrainer(_BaseTrainer):
         padding_value: int = 0,
         device: torch.device | None = None,
     ) -> dict[str, torch.LongTensor]:
+        # [FUNCTION DOC]
+        # Behavior: static. max length is the larger of chosen/rejected label (encoder-decoder) or input id (decoder-only)
+        # widths. Each chosen tensor key is renamed to concatenated and right-padded to that length (labels or any key in
+        # encoder-decoder mode padded with -100, input ids with padding_value, attention masks with 0); rejected tensors are
+        # padded likewise and concatenated after chosen on the batch dimension, moved to device. Encoder-decoder also repeats
+        # prompt ids and mask twice as the concatenated encoder inputs.
+        # Inputs: batch (dict of tensors), is_encoder_decoder (default False), padding_value (default 0), device (optional).
+        # Outputs: dict of concatenated tensors of batch size 2B.
+        # Exceptions: KeyError for missing chosen/rejected keys.
+        # Side effects: none.
         """Concatenate the chosen and rejected inputs into a single tensor.
 
         Args:
@@ -680,6 +772,18 @@ class CPOTrainer(_BaseTrainer):
         policy_chosen_logps: torch.FloatTensor,
         policy_rejected_logps: torch.FloatTensor,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        # [FUNCTION DOC]
+        # Behavior: if alpha is non-zero, rewards are the AlphaPO transform (1 minus probability to the power of -alpha) over
+        # alpha applied to the exponentiated log-probs, and logits are chosen minus rejected rewards; otherwise logits are
+        # chosen minus rejected log-probs. Losses: simpo subtracts simpo_gamma over beta from logits, then uses the
+        # label-smoothed sigmoid loss; sigmoid is minus log-sigmoid of beta times logits weighted by one minus
+        # label_smoothing, minus log-sigmoid of the negation weighted by label_smoothing; hinge is ReLU of one minus beta
+        # times logits; ipo is the square of logits minus 1 over 2 beta. Logged rewards are beta times the (transformed)
+        # rewards or log-probs, detached.
+        # Inputs: policy_chosen_logps, policy_rejected_logps (shape (B,)).
+        # Outputs: tuple (losses (B,), chosen_rewards (B,), rejected_rewards (B,)) on the accelerator device.
+        # Exceptions: ValueError for unknown loss_type.
+        # Side effects: none.
         """Compute the CPO loss for a batch of policy and reference model log probabilities.
 
         Args:
@@ -755,6 +859,14 @@ class CPOTrainer(_BaseTrainer):
         average_log_prob: bool = False,
         is_encoder_decoder: bool = False,
     ) -> torch.FloatTensor:
+        # [FUNCTION DOC]
+        # Behavior: static. For decoder-only, drops the first label column and the last logits position. Mask is labels not
+        # equal to -100; masked labels are set to 0; per-token log-probs via selective log-softmax; returns the masked sum, or
+        # the masked mean if average_log_prob.
+        # Inputs: logits (B, T, V), labels (B, T), average_log_prob (default False), is_encoder_decoder (default False).
+        # Outputs: tensor (B,).
+        # Exceptions: ValueError if logits and labels shapes disagree.
+        # Side effects: in encoder-decoder mode the labels tensor is modified in place (no clone).
         """Compute the log probabilities of the given labels under the given logits.
 
         Args:
@@ -792,6 +904,15 @@ class CPOTrainer(_BaseTrainer):
     def concatenated_forward(
         self, model: nn.Module, batch: dict[str, list | torch.LongTensor]
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        # [FUNCTION DOC]
+        # Behavior: builds the concatenated batch on the accelerator device, runs one model forward (decoder_input_ids from
+        # right-shifted labels for encoder-decoder, output_router_logits when aux loss enabled, use_cache False). NLL loss is
+        # token cross-entropy on the chosen half (zero tensor if cpo_alpha is 0). Sequence log-probs come from
+        # get_batch_logps, averaged per token for ipo and simpo, summed otherwise; splits into chosen and rejected halves.
+        # Inputs: model, batch (collated dict).
+        # Outputs: tuple (chosen_logps, rejected_logps, chosen_logits, rejected_logits, nll_loss), plus aux_loss when enabled.
+        # Exceptions: errors from the model forward.
+        # Side effects: none beyond computation.
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
 
         We do this to avoid doing two forward passes, because it's faster for FSDP.
@@ -824,6 +945,10 @@ class CPOTrainer(_BaseTrainer):
         all_logits = outputs.logits
 
         def cross_entropy_loss(logits, labels):
+            # [FUNCTION DOC]
+            # HELPER: Mean token cross-entropy ignoring -100 labels; shifts logits/labels by one position for decoder-only
+            # models, flattens, and moves labels to the logits device.
+            # Inputs: logits, labels. Outputs: scalar tensor. Exceptions: none. Side effects: none.
             if not self.is_encoder_decoder:
                 # Shift so that tokens < n predict n
                 logits = logits[..., :-1, :].contiguous()
@@ -868,6 +993,15 @@ class CPOTrainer(_BaseTrainer):
         batch: dict[str, list | torch.LongTensor],
         train_eval: Literal["train", "eval"] = "train",
     ):
+        # [FUNCTION DOC]
+        # Behavior: runs concatenated_forward and cpo_loss; loss is mean losses plus cpo_alpha times NLL, plus
+        # aux_loss_coef times aux loss when enabled. Metrics (prefixed "eval_" in eval mode), gathered across processes and
+        # averaged: rewards/chosen, rewards/rejected, rewards/accuracies (chosen reward greater than rejected),
+        # rewards/margins, logps/rejected, logps/chosen, logits/rejected, logits/chosen (mean logits), nll_loss.
+        # Inputs: model, batch, train_eval ("train" or "eval", default "train").
+        # Outputs: tuple (loss tensor, metrics dict of floats).
+        # Exceptions: those of the forward/loss.
+        # Side effects: cross-process gathers.
         """Compute the CPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
 
@@ -923,6 +1057,13 @@ class CPOTrainer(_BaseTrainer):
         return_outputs=False,
         num_items_in_batch=None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Behavior: computes loss and metrics in train mode (under autocast when PEFT modules were cast to bf16), stores
+        # metrics, and returns the loss or (loss, metrics) when return_outputs.
+        # Inputs: model, inputs, return_outputs (default False), num_items_in_batch (ignored).
+        # Outputs: loss tensor or tuple.
+        # Exceptions: those of get_batch_loss_metrics.
+        # Side effects: appends to _stored_metrics["train"].
         compute_loss_context_manager = (
             autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
         )
@@ -938,6 +1079,13 @@ class CPOTrainer(_BaseTrainer):
         return loss
 
     def generate_from_model(self, model, batch: dict[str, torch.LongTensor]) -> str:
+        # [FUNCTION DOC]
+        # Behavior: samples from the model given prompt ids/mask with max_length as total length and sampling enabled (under
+        # autocast when PEFT bf16-cast), pads outputs to max_length with the pad token, and batch-decodes skipping special
+        # tokens.
+        # Inputs: model, batch (needs prompt_input_ids, prompt_attention_mask).
+        # Outputs: list of decoded strings (annotated as str).
+        # Exceptions: generation errors. Side effects: none.
         """Generate samples from the model and reference model for the given batch of inputs."""
 
         # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
@@ -967,6 +1115,15 @@ class CPOTrainer(_BaseTrainer):
         prediction_loss_only: bool,
         ignore_keys: list[str] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: resolves ignore_keys from model config keys_to_ignore_at_inference when not given; computes eval loss and
+        # metrics without gradients (autocast when needed) and stores them. Returns (loss, None, None) if
+        # prediction_loss_only; otherwise logits is a tensor of the eval_logits/chosen and eval_logits/rejected metric values
+        # not in ignore_keys, and labels a zero tensor of matching length.
+        # Inputs: model, inputs, prediction_loss_only (bool), ignore_keys (optional list).
+        # Outputs: tuple (loss, logits or None, labels or None).
+        # Exceptions: those of get_batch_loss_metrics.
+        # Side effects: appends to _stored_metrics["eval"].
         if ignore_keys is None:
             if hasattr(model, "config"):
                 ignore_keys = getattr(model.config, "keys_to_ignore_at_inference", [])
@@ -998,6 +1155,10 @@ class CPOTrainer(_BaseTrainer):
         return (loss.detach(), logits, labels)
 
     def store_metrics(self, metrics: dict[str, float], train_eval: Literal["train", "eval"] = "train") -> None:
+        # [FUNCTION DOC]
+        # HELPER: Appends each metric value to _stored_metrics[train_eval][key].
+        # Inputs: metrics (dict), train_eval (default "train"). Outputs: none. Exceptions: none.
+        # Side effects: mutates _stored_metrics.
         for key, value in metrics.items():
             self._stored_metrics[train_eval][key].append(value)
 
@@ -1009,6 +1170,15 @@ class CPOTrainer(_BaseTrainer):
         ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> EvalLoopOutput:
+        # [FUNCTION DOC]
+        # Behavior: if generate_during_eval, samples eval_batch_size random dataset indices, collates and prepares them,
+        # generates completions, and builds a table of prompt and completion (decoded text minus the prompt prefix by
+        # character length), logging it as "game_log" to wandb and/or comet when in report_to. Then runs the base evaluation
+        # loop and returns its output.
+        # Inputs: dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix (default "eval").
+        # Outputs: EvalLoopOutput.
+        # Exceptions: ValueError from random sampling when the dataset is smaller than eval_batch_size.
+        # Side effects: generation; logging to wandb/comet.
         """
         Overriding built-in evaluation loop to store metrics for each batch. Prediction/evaluation loop, shared by
         `Trainer.evaluate()` and `Trainer.predict()`.
@@ -1053,6 +1223,11 @@ class CPOTrainer(_BaseTrainer):
         return initial_output
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: picks "train" if logs contains "loss" else "eval"; adds the mean of each stored metric list to logs,
+        # clears that mode's stored metrics, and delegates to the base log.
+        # Inputs: logs (dict), start_time (optional float). Outputs: whatever the base returns (None).
+        # Exceptions: none. Side effects: mutates logs and _stored_metrics; base logging.
         """
         Log `logs` on the various objects watching training, including stored metrics.
 
@@ -1071,6 +1246,12 @@ class CPOTrainer(_BaseTrainer):
         return super().log(logs, start_time)
 
     def _shift_right(self, input_ids):
+        # [FUNCTION DOC]
+        # HELPER: Builds decoder inputs by shifting labels right by one and inserting decoder_start_token_id at position 0
+        # (torch FX proxies use concatenation instead of item assignment), then replaces -100 with pad_token_id.
+        # Inputs: input_ids (B, T). Outputs: tensor of same shape.
+        # Exceptions: ValueError if decoder_start_token_id or pad_token_id is None.
+        # Side effects: none.
         if self.decoder_start_token_id is None:
             raise ValueError(
                 "model.config.decoder_start_token_id has to be defined. It is usually set to the pad_token_id."
@@ -1095,6 +1276,12 @@ class CPOTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Behavior: derives the model name from hub_model_id (last component) or the output_dir name, writes the model card,
+        # then calls the base checkpoint save.
+        # Inputs: model, trial. Outputs: none.
+        # Exceptions: those of saving.
+        # Side effects: writes model card and checkpoint files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:

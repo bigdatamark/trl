@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# NCCL weight streaming from the async-distillation trainer (student) to its vLLM server.
+# Contents: WeightTransferClient. At import, selects the vLLM API by version: for vLLM 0.28.0 or newer it imports the
+# rendezvous helper (aliased open_trainer_endpoint) and packed_nccl_broadcast_producer; for older vLLM it imports the
+# static NCCLWeightTransferEngine and NCCLTrainerSendWeightsArgs; also imports get_ip/get_open_port when vLLM is present.
+# Import-time side effects: these conditional imports and the module logger; _HAS_STATEFUL_TRAINER_ENGINE flag.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,6 +47,12 @@ logger = get_logger(__name__)
 
 
 class WeightTransferClient:
+    # [CLASS DOC]
+    # Drives the trainer side (rank 0) of an NCCL group with the vLLM server workers (ranks 1..N) and pushes weights.
+    # State: vllm (VLLMClient), weight_sync_timeout, _weight_update_info (with packed=True added for old vLLM),
+    # model_update_group (None until init_weight_transfer succeeds), class constant _CONTROL_TIMEOUT = 300 s.
+    # Flow: init_weight_transfer once; per sync: pause, send_weights, resume; destroy at shutdown. Every NCCL call runs on
+    # a daemon thread while the matching HTTP call runs on the caller's thread.
     """Streams the student's weights to its own vLLM server over NCCL.
 
     Ported verbatim from [`~trl.experimental.async_grpo.weight_transfer.WeightTransferClient`]. Only the student is
@@ -68,6 +81,10 @@ class WeightTransferClient:
         weight_update_info: dict,
         weight_sync_timeout: int = 1800,
     ):
+        # [FUNCTION DOC]
+        # Stores the client, timeout and update info; on vLLM older than 0.28.0 copies the info with packed set to True.
+        # Inputs: vllm_client, weight_update_info (dict), weight_sync_timeout (int, default 1800).
+        # Outputs: none. Exceptions: ImportError if vLLM is not installed. Side effects: sets attributes, model_update_group None.
         if not is_vllm_available():
             raise ImportError("vLLM is required to use WeightTransferClient. Install it with: pip install vllm")
         self.vllm = vllm_client
@@ -78,6 +95,17 @@ class WeightTransferClient:
         self.model_update_group = None
 
     def init_weight_transfer(self) -> None:
+        # [FUNCTION DOC]
+        # Sets up the NCCL group with the server.
+        # Behavior: waits for server readiness, queries its world size; total world size = server world size + 1; picks this
+        # host's IP and a free port; builds init_info (master_address, master_port, rank_offset 1, world_size, plus packed
+        # True on new vLLM). Starts a daemon thread running the trainer-side init (new or legacy API) storing the group in
+        # model_update_group and capturing any exception; meanwhile POSTs init_weight_transfer_engine with
+        # weight_sync_timeout, then joins the thread and re-raises a captured thread error.
+        # Inputs: none. Outputs: none.
+        # Exceptions: any failure is wrapped in RuntimeError with setup hints (VLLM_SERVER_DEV_MODE, nccl backend config);
+        # TimeoutError from wait_for_server_ready propagates unwrapped.
+        # Side effects: network calls, NCCL group creation, sets model_update_group, logs info.
         self.vllm.wait_for_server_ready()
         inference_world_size = self.vllm.get_world_size()
         world_size = inference_world_size + 1
@@ -95,6 +123,11 @@ class WeightTransferClient:
         error: list[BaseException] = []
 
         def trainer_init():
+            # [FUNCTION DOC]
+            # HELPER: Thread target creating the trainer NCCL endpoint (open_trainer_endpoint on new vLLM, else
+            # NCCLWeightTransferEngine.trainer_init) from the enclosing init_info.
+            # Inputs/Outputs: none. Exceptions: none raised; any BaseException is appended to the enclosing error list.
+            # Side effects: sets self.model_update_group.
             try:
                 if _HAS_STATEFUL_TRAINER_ENGINE:
                     self.model_update_group = open_trainer_endpoint(init_info)
@@ -120,6 +153,18 @@ class WeightTransferClient:
         logger.info("Initialised weight-transfer NCCL group with vLLM")
 
     def send_weights(self, iterator) -> None:
+        # [FUNCTION DOC]
+        # Streams one full set of weights to the server.
+        # Behavior: no-op if model_update_group is None. Calls start_weight_update (control timeout), then starts a daemon thread
+        # broadcasting the iterator from rank 0 (new vLLM: packed producer with post_iter_func taking the tensor as the second
+        # item of each pair; old vLLM: trainer_send_weights with packed=True), while POSTing update_weights with
+        # _weight_update_info; joins and re-raises thread errors. On success calls finish_weight_update and logs the duration
+        # at debug level.
+        # Inputs: iterator yielding (name, tensor) pairs matching weight_update_info.
+        # Outputs: none.
+        # Exceptions: on failure (start_weight_update errors are not wrapped) attempts finish_weight_update (errors suppressed)
+        # and raises RuntimeError with recovery hints chaining the cause.
+        # Side effects: HTTP calls, NCCL broadcast, logging.
         if self.model_update_group is None:
             return
         t0 = time.time()
@@ -129,6 +174,10 @@ class WeightTransferClient:
         error: list[BaseException] = []
 
         def trainer_send_weights():
+            # [FUNCTION DOC]
+            # HELPER: Thread target performing the NCCL broadcast of the enclosing iterator via the version-appropriate vLLM API.
+            # Inputs/Outputs: none. Exceptions: none raised; BaseException captured into the enclosing error list.
+            # Side effects: NCCL traffic.
             try:
                 if _HAS_STATEFUL_TRAINER_ENGINE:
                     packed_nccl_broadcast_producer(
@@ -163,16 +212,27 @@ class WeightTransferClient:
         logger.debug(f"[weight_sync] send_weights took {time.time() - t0:.1f}s")
 
     def pause(self) -> None:
+        # [FUNCTION DOC]
+        # Pauses server generation via VLLMClient.pause with _CONTROL_TIMEOUT; logs the HTTP duration at debug.
+        # Inputs/Outputs: none. Exceptions: propagates the client's request errors. Side effects: HTTP call, logging.
         t0 = time.time()
         self.vllm.pause(timeout=self._CONTROL_TIMEOUT)
         logger.debug(f"[weight_sync] pause HTTP took {time.time() - t0:.1f}s")
 
     def resume(self) -> None:
+        # [FUNCTION DOC]
+        # Resumes server generation via VLLMClient.resume with _CONTROL_TIMEOUT; logs the HTTP duration at debug.
+        # Inputs/Outputs: none. Exceptions: propagates the client's request errors. Side effects: HTTP call, logging.
         t0 = time.time()
         self.vllm.resume(timeout=self._CONTROL_TIMEOUT)
         logger.debug(f"[weight_sync] resume HTTP took {time.time() - t0:.1f}s")
 
     def destroy(self) -> None:
+        # [FUNCTION DOC]
+        # Drops the NCCL group: no-op if none; otherwise clears the group's store and socket references and sets
+        # model_update_group to None (no explicit communicator teardown).
+        # Inputs/Outputs: none. Exceptions: AttributeError if the group object lacks a group attribute.
+        # Side effects: mutates the group and self.
         if self.model_update_group is None:
             return
         self.model_update_group.group.store = None

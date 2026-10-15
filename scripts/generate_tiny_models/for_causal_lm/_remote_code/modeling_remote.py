@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# HELPER: Model classes for the remote-code tiny model: thin Llama subclasses bound to RemoteConfig (base model,
+# causal LM head and sequence-classification head). Uploaded verbatim to the Hub with the weights.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,17 +24,32 @@ from .configuration_remote import RemoteConfig
 
 
 class RemoteModel(LlamaModel):
+    # [CLASS DOC]
+    # HELPER: LlamaModel subclass with config_class set to RemoteConfig; no other changes.
     config_class = RemoteConfig
 
 
 class RemoteForCausalLM(LlamaForCausalLM):
+    # [CLASS DOC]
+    # HELPER: LlamaForCausalLM subclass with config_class set to RemoteConfig; no other changes.
     config_class = RemoteConfig
 
 
 class RemoteForSequenceClassification(LlamaForSequenceClassification):
+    # [CLASS DOC]
+    # HELPER: LlamaForSequenceClassification subclass with config_class set to RemoteConfig. Overrides __init__ so the
+    # backbone is a RemoteModel built directly instead of through AutoModel.from_config (which would re-trigger the
+    # trust_remote_code prompt).
     config_class = RemoteConfig
 
     def __init__(self, config):
+        # [FUNCTION DOC]
+        # HELPER: Builds the classifier without calling the Llama parent initializers.
+        # Behavior: calls LlamaPreTrainedModel initializer directly (skipping LlamaForSequenceClassification's), stores
+        # num_labels from config, creates self.model as RemoteModel(config) and self.score as a bias-free linear layer from
+        # hidden_size to num_labels, then calls post_init to initialize weights.
+        # Inputs: config (RemoteConfig). Outputs: none. Exceptions: none raised here.
+        # Side effects: registers submodules and initializes their weights.
         # The parent's MRO calls `AutoModel.from_config(config)`, which would re-trigger the
         # trust_remote_code prompt for `RemoteConfig`. Wire `RemoteModel` in directly instead.
         LlamaPreTrainedModel.__init__(self, config)

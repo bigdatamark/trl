@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Script that builds a tiny randomly initialized MuseGlimmerForConditionalGeneration mirroring meta-models/Muse-Glimmer-30B and pushes it to trl-internal-testing/tiny-MuseGlimmerForConditionalGeneration.
+# Behavior (all at import time, run as a module): checks pinned transformers 5.15.0 is installed exactly, seeds RNGs, loads the reference AutoProcessor and GenerationConfig,
+# builds a scaled-down config (mostly 2 layers, hidden size 8-16, intermediate size 32), instantiates the model in bfloat16, re-initializes weights via init_weights_tiny_model,
+# runs smoke_test, check_dtype_pattern and print_config_diff against the reference, then calls push_to_hub.
+# Details: Text: one sliding (rope theta 5e5) and one full attention layer without rope. Vision: one window and one full attention layer. out_hidden_size 64 (vision hidden times merge size squared) and projector hidden 32. Weights re-initialized.
+# Inputs: CLI flags --create-pr / --full-diff (parsed by _common). Outputs: none returned.
+# Exceptions: RuntimeError on transformers version mismatch or failed smoke test; Hub/network errors propagate.
+# Side effects: downloads reference tokenizer/config from the Hub, prints diagnostics, creates/updates a Hub repo (or skips if it exists).
+#
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

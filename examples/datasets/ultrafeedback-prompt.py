@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Dataset preparation script: extracts conversational prompt-only data from openbmb/UltraFeedback, drops prompts longer
+# than 512 characters, splits 5% test (seed 42) and optionally pushes with a dataset card.
+# Main contents: ScriptArguments, to_unpaired_preference, drop_long_prompt, model_card.
+# Import-time side effects: builds the ModelCard.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +27,10 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI options parsed by HfArgumentParser: push_to_hub (default False), repo_id (target Hub
+    # dataset repo), dataset_num_proc (worker count for map/filter, default None). No methods; plain data holder.
+    # Side effects: none.
     r"""
     Arguments for the script.
 
@@ -48,11 +58,17 @@ class ScriptArguments:
 
 
 def to_unpaired_preference(example):
+    # [FUNCTION DOC]
+    # Behavior: wraps the "instruction" into a single user message (name is historical; only a prompt is produced).
+    # Inputs: example with "instruction". Outputs: dict with "prompt". Exceptions: KeyError if missing. Side effects: none.
     prompt = [{"role": "user", "content": example["instruction"]}]
     return {"prompt": prompt}
 
 
 def drop_long_prompt(example):
+    # [FUNCTION DOC]
+    # HELPER: Filter predicate returning False when the first prompt message content exceeds 512 characters, else True.
+    # Inputs: example with "prompt". Outputs: bool. Exceptions: IndexError/KeyError on malformed prompts. Side effects: none.
     if len(example["prompt"][0]["content"]) > 512:
         return False
     else:

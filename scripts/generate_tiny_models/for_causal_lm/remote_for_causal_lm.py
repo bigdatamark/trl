@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Script that builds a tiny RemoteForCausalLM (Llama 3.2 architecture under model_type "remote") and pushes it to
+# trl-internal-testing/tiny-RemoteForCausalLM so tests can exercise the trust_remote_code loading path.
+# Behavior (import time): checks the transformers floor version, seeds RNGs, loads the Llama-3.2-1B-Instruct tokenizer
+# and generation config, registers RemoteConfig / RemoteModel / RemoteForCausalLM / RemoteForSequenceClassification
+# for their auto classes (so their source files are saved), builds a 2-layer hidden-size-8 config with tied embeddings
+# and llama3 rope scaling, adds auto_map entries for AutoModel and AutoModelForSequenceClassification, instantiates
+# in bfloat16, re-initializes weights, runs smoke_test and print_config_diff (no dtype check), then push_to_hub.
+# Inputs: --create-pr / --full-diff CLI flags. Outputs: none.
+# Exceptions: RuntimeError on version mismatch or smoke-test failure; Hub errors propagate.
+# Side effects: Hub downloads, printing, Hub repo creation/upload including the remote-code python files.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Dataset preparation script: downloads OpenAI's filtered Reddit TL;DR JSONL splits (train/validation/test) and
+# converts them to standard prompt-completion format, optionally pushing with a dataset card.
+# Main contents: ScriptArguments, to_prompt_completion, model_card. Import-time side effects: builds the ModelCard.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +26,10 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI options parsed by HfArgumentParser: push_to_hub (default False), repo_id (target Hub
+    # dataset repo), dataset_num_proc (worker count for map/filter, default None). No methods; plain data holder.
+    # Side effects: none.
     r"""
     Arguments for the script.
 
@@ -48,6 +57,11 @@ class ScriptArguments:
 
 
 def to_prompt_completion(example):
+    # [FUNCTION DOC]
+    # Behavior: formats the prompt as "SUBREDDIT: r/<subreddit>", "TITLE: <title>", "POST: <post>" sections separated by
+    # blank lines and ending with "TL;DR:"; completion is the summary prefixed with a space.
+    # Inputs: example with "subreddit", "title", "post", "summary". Outputs: dict with "prompt" and "completion".
+    # Exceptions: KeyError on missing columns. Side effects: none.
     tldr_format_str = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
     prompt = tldr_format_str.format(subreddit=example["subreddit"], title=example["title"], post=example["post"])
     completion = " " + example["summary"]  # Add a space to separate the prompt from the completion

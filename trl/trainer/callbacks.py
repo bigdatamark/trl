@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# TrainerCallback implementations shipped with TRL: SyncRefModelCallback (periodic soft/hard sync of a
+# reference model, TR-DPO style), RichProgressCallback (Rich live progress and metric tables),
+# LogCompletionsCallback (periodic generation logged to W&B / Comet), WeaveCallback (generation traces and
+# optional scores to W&B Weave at evaluation), BEMACallback (bias-corrected EMA of weights saved at the end),
+# plus the _generate_completions helper.
+# Import-time side effects: conditionally imports rich, wandb and weave when available; creates a module
+# logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -70,6 +79,17 @@ def _generate_completions(
     batch_size: int = 1,
     gradient_checkpointing_kwargs: dict | None = None,
 ) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Generates text completions for already-formatted prompts.
+    # Behavior: inside unwrap_model_for_generation (handles DeepSpeed/FSDP gathering and gradient checkpointing),
+    # processes prompts in chunks of batch_size: tokenizes with padding and truncation to model.device, calls
+    # generate with generation_config, strips the prompt-length prefix from each output (relies on left padding so
+    # all prompts in the batch share the padded length) and decodes skipping special tokens.
+    # Inputs: prompts (list of str), model, tokenizer, accelerator, generation_config (or None for the model
+    # default), batch_size (default 1), gradient_checkpointing_kwargs (optional).
+    # Outputs: list of str, one per prompt, in order.
+    # Exceptions: generation/tokenizer errors propagate.
+    # Side effects: temporary model unwrapping (may gather sharded params).
     """
     Generates completions for a list of pre-formatted prompts from the given model.
 
@@ -114,6 +134,10 @@ def _generate_completions(
 
 
 class SyncRefModelCallback(TrainerCallback):
+    # [CLASS DOC]
+    # Callback that blends the policy into a reference model every args.ref_model_sync_steps steps using
+    # args.ref_model_mixup_alpha (ref = (1 - alpha) * ref + alpha * policy, parameter-wise). State: ref_model,
+    # accelerator (used to unwrap the policy). Supports DeepSpeed ZeRO-3 by gathering parameters first.
     """
     Callback to synchronize the model with a reference model.
     """
@@ -123,16 +147,30 @@ class SyncRefModelCallback(TrainerCallback):
         ref_model: PreTrainedModel | torch.nn.Module,
         accelerator: Accelerator | None,
     ):
+        # [FUNCTION DOC]
+        # Stores ref_model and accelerator (may be None). Inputs: ref_model, accelerator. Outputs: none.
+        # Exceptions: none. Side effects: sets attributes.
         self.accelerator = accelerator
         self.ref_model = ref_model
 
     @staticmethod
     def _sync_target_model(model, target_model, alpha):
+        # [FUNCTION DOC]
+        # HELPER: In place, for each pair of parameters (zipped strictly in order), scales the target by 1 - alpha
+        # and adds alpha times the source.
+        # Inputs: model (source), target_model, alpha (float). Outputs: none.
+        # Exceptions: ValueError if parameter counts differ. Side effects: mutates target_model parameters.
         for target_param, copy_param in zip(target_model.parameters(), model.parameters(), strict=True):
             target_param.data.mul_(1.0 - alpha).add_(copy_param.data, alpha=alpha)
 
     @staticmethod
     def sync_target_model(model, target_model, alpha):
+        # [FUNCTION DOC]
+        # Behavior: if the DeepSpeed plugin uses ZeRO stage 3, gathers both models' parameters (modifier rank 0) and
+        # performs the blend on rank 0 only (changes are re-partitioned on exit); otherwise blends directly.
+        # Inputs: model, target_model, alpha. Outputs: none.
+        # Exceptions: as _sync_target_model. Side effects: mutates target parameters; collective communication under
+        # ZeRO-3.
         deepspeed_plugin = AcceleratorState().deepspeed_plugin
         if deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3:
             import deepspeed
@@ -146,6 +184,11 @@ class SyncRefModelCallback(TrainerCallback):
             SyncRefModelCallback._sync_target_model(model, target_model, alpha)
 
     def on_step_end(self, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: when ref_model exists and global_step is a multiple of args.ref_model_sync_steps, unwraps the
+        # model (if accelerator given) and syncs it into ref_model with args.ref_model_mixup_alpha.
+        # Inputs: args (must have ref_model_sync_steps, ref_model_mixup_alpha), state, control, kwargs["model"].
+        # Outputs: none. Exceptions: KeyError if model missing. Side effects: mutates ref_model.
         model: PreTrainedModel = kwargs["model"]
 
         if self.ref_model is not None and state.global_step % args.ref_model_sync_steps == 0:
@@ -155,11 +198,19 @@ class SyncRefModelCallback(TrainerCallback):
 
 
 class RichProgressCallback(TrainerCallback):
+    # [CLASS DOC]
+    # Callback rendering a Rich live panel with a training progress bar, an evaluation progress bar and a status
+    # area showing the latest logged metrics grouped by key prefix. All work happens on world process zero.
+    # State: training_bar, evaluation_bar (Progress), training_task, evaluation_task, rich_group (Live),
+    # rich_console, training_status, current_step; all None outside training.
     """
     A [`~transformers.TrainerCallback`] that displays the progress of training or evaluation using Rich.
     """
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Behavior: requires rich; initializes all state attributes to None.
+        # Inputs: none. Outputs: none. Exceptions: ImportError if rich missing. Side effects: sets attributes.
         if not is_rich_available():
             raise ImportError("RichProgressCallback requires the `rich` extra. To install, run `pip install rich`.")
 
@@ -173,6 +224,11 @@ class RichProgressCallback(TrainerCallback):
         self.current_step = None
 
     def on_train_begin(self, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior (main process only): creates the two Progress bars, a Console and a status line ("Nothing to log
+        # yet ..."), wraps them in a Live panel and starts it, adds a training task with total max_steps and sets
+        # current_step to 0.
+        # Inputs: callback args. Outputs: none. Exceptions: none expected. Side effects: starts terminal rendering.
         if not state.is_world_process_zero:
             return
 
@@ -186,6 +242,10 @@ class RichProgressCallback(TrainerCallback):
         self.current_step = 0
 
     def on_step_end(self, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior (main process only): advances the training bar by the steps since current_step and records
+        # global_step as current_step.
+        # Inputs: callback args. Outputs: none. Exceptions: none. Side effects: updates display/state.
         if not state.is_world_process_zero:
             return
 
@@ -193,6 +253,10 @@ class RichProgressCallback(TrainerCallback):
         self.current_step = state.global_step
 
     def on_prediction_step(self, args, state, control, eval_dataloader=None, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior (main process only): if the eval dataloader has a length, lazily creates the evaluation task
+        # (total = number of batches) and advances it by one.
+        # Inputs: callback args, eval_dataloader. Outputs: none. Exceptions: none. Side effects: updates display.
         if not state.is_world_process_zero:
             return
 
@@ -202,6 +266,9 @@ class RichProgressCallback(TrainerCallback):
             self.evaluation_bar.update(self.evaluation_task, advance=1, update=True)
 
     def on_evaluate(self, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior (main process only): removes the evaluation task if any and resets it to None.
+        # Inputs: callback args. Outputs: none. Exceptions: none. Side effects: updates display/state.
         if not state.is_world_process_zero:
             return
 
@@ -210,6 +277,9 @@ class RichProgressCallback(TrainerCallback):
             self.evaluation_task = None
 
     def on_predict(self, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior (main process only): same as on_evaluate, removing the evaluation task after prediction.
+        # Inputs: callback args. Outputs: none. Exceptions: none. Side effects: updates display/state.
         if not state.is_world_process_zero:
             return
 
@@ -218,6 +288,13 @@ class RichProgressCallback(TrainerCallback):
             self.evaluation_task = None
 
     def on_log(self, args, state, control, logs=None, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior (main process with an active training bar only): groups log keys by the part before the first "/"
+        # (keys without "/" go in an untitled group, keyed by full name), builds one Rich table per group with
+        # Metric/Value columns (numbers formatted to 3 decimals, others as str), lays the panels out in columns and
+        # updates the status area titled with the current step.
+        # Inputs: callback args, logs dict. Outputs: none.
+        # Exceptions: AttributeError if logs is None. Side effects: updates terminal display.
         if not (state.is_world_process_zero and self.training_bar):
             return
 
@@ -251,6 +328,9 @@ class RichProgressCallback(TrainerCallback):
         )
 
     def on_train_end(self, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior (main process only): stops the Live display and resets all state attributes to None.
+        # Inputs: callback args. Outputs: none. Exceptions: none. Side effects: stops rendering.
         if not state.is_world_process_zero:
             return
 
@@ -266,6 +346,11 @@ class RichProgressCallback(TrainerCallback):
 
 
 class LogCompletionsCallback(TrainerCallback):
+    # [CLASS DOC]
+    # Callback that, every freq steps (default state.eval_steps), generates completions for the eval dataset's
+    # "prompt" column across processes and logs an accumulating table (step, prompt, completion) to W&B
+    # ("completions") and/or Comet ("completions.csv"). State: trainer, generation_config, freq, eval_dataset
+    # (optionally truncated to num_prompts), table (accumulated rows), _last_logged_step.
     r"""
     A [`~transformers.TrainerCallback`] that logs completions to Weights & Biases and/or Comet.
 
@@ -296,6 +381,13 @@ class LogCompletionsCallback(TrainerCallback):
         num_prompts: int | None = None,
         freq: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores args, initializes an empty table and _last_logged_step -1, takes the trainer eval dataset
+        # and selects the first num_prompts rows when given.
+        # Inputs: trainer, generation_config, num_prompts, freq (all but trainer optional).
+        # Outputs: none.
+        # Exceptions: ValueError when the trainer has no eval dataset.
+        # Side effects: sets attributes.
         self.trainer = trainer
         self.generation_config = generation_config
         self.freq = freq
@@ -311,6 +403,16 @@ class LogCompletionsCallback(TrainerCallback):
             self.eval_dataset = self.eval_dataset.select(range(num_prompts))
 
     def on_step_end(self, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: skips if already logged at this step or global_step is not a multiple of freq (or eval_steps).
+        # Sets the processing class padding side to left, splits prompts across processes, applies the chat template
+        # if conversational, generates with _generate_completions (per-device eval batch size, gradient checkpointing
+        # kwargs), gathers prompts and completions. On the main process extends the table with rows for this step and
+        # logs the full table as a DataFrame to wandb and/or comet depending on args.report_to. Records the step.
+        # Inputs: args, state, control, kwargs["processing_class"].
+        # Outputs: none.
+        # Exceptions: KeyError if no processing_class; ZeroDivision/TypeError if both freq and eval_steps unset.
+        # Side effects: mutates tokenizer.padding_side permanently; generation; external logging; mutates table.
         # Only log once per step (this method may be called multiple times)
         if state.global_step == self._last_logged_step:
             return
@@ -359,6 +461,15 @@ class LogCompletionsCallback(TrainerCallback):
 
 
 class WeaveCallback(TrainerCallback):
+    # [CLASS DOC]
+    # Callback that, at each evaluation, generates completions for eval prompts and logs them via Weave
+    # EvaluationLogger. Tracing mode when scorers is empty; evaluation mode when scorers (name to function of
+    # prompt and completion) are given, which also logs per-prediction scores and a summary with averages.
+    # State: trainer, project_name, scorers, generation_config, dataset_name, model_name, eval_dataset,
+    # _last_logged_step, _weave_initialized, _eval_logger (unused), and after init _weave_client and
+    # _EvaluationLogger. Weave initialization is lazy (_initialize_weave).
+    # KNOWN ISSUE: the class docstring usage examples and an error message refer to "WeaveTraceCallback", which
+    # does not exist; the class is WeaveCallback.
     r"""
     A [`~transformers.TrainerCallback`] that logs traces and evaluations to W&B Weave. The callback uses
     https://weave-docs.wandb.ai/guides/evaluation/evaluation_logger/ to log traces and evaluations at each evaluation
@@ -432,6 +543,12 @@ class WeaveCallback(TrainerCallback):
         dataset_name: str = "eval_dataset",
         model_name: str | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores arguments (scorers defaults to an empty dict), initializes state, takes the eval dataset
+        # and optionally truncates it to num_prompts.
+        # Inputs: trainer, project_name, scorers, generation_config, num_prompts, dataset_name ("eval_dataset"),
+        # model_name. Outputs: none.
+        # Exceptions: ValueError when the trainer has no eval dataset. Side effects: sets attributes.
         self.trainer = trainer
         self.project_name = project_name
         self.scorers = scorers or {}
@@ -451,6 +568,16 @@ class WeaveCallback(TrainerCallback):
             self.eval_dataset = self.eval_dataset.select(range(num_prompts))
 
     def _initialize_weave(self):
+        # [FUNCTION DOC]
+        # HELPER: One-time Weave setup.
+        # Behavior: no-op if already initialized. If weave is not installed, logs a warning and returns (stays
+        # uninitialized). Reuses the current Weave client if one exists; otherwise derives project_name from the
+        # active wandb run ("entity/project") when not given, and calls weave.init. Sets model_name from the wrapped
+        # model config's _name_or_path (default "unknown_model") if unset, stores the EvaluationLogger class and
+        # marks initialized.
+        # Inputs: none. Outputs: none.
+        # Exceptions: ValueError when no client, no project_name and no wandb run.
+        # Side effects: may initialize a Weave client (network); logging; sets attributes.
         """Initialize Weave and EvaluationLogger if not already initialized."""
         if not self._weave_initialized:
             if not is_weave_available():
@@ -486,14 +613,31 @@ class WeaveCallback(TrainerCallback):
 
     @property
     def is_evaluation_mode(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True when any scorers were provided (evaluation mode), else False (tracing mode).
+        # Inputs: none. Outputs: bool. Exceptions: none. Side effects: none.
         """True if scorers are provided (evaluation mode), False for tracing mode."""
         return bool(self.scorers)
 
     def on_train_begin(self, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: initializes Weave at the start of training. Inputs: callback args. Outputs: none.
+        # Exceptions: as _initialize_weave. Side effects: as _initialize_weave.
         """Initialize Weave when training begins."""
         self._initialize_weave()
 
     def on_evaluate(self, args, state, control, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: skips if already logged at this step; initializes Weave and skips (debug log) if unavailable.
+        # Sets padding side left, splits prompts across processes, applies the chat template, generates and gathers
+        # prompts/completions. On the main process creates an EvaluationLogger with model, dataset and attributes
+        # (training_step, model_name, generation config dict). Logs each prediction; in evaluation mode applies each
+        # scorer, logs the score and collects values (scorer failures only warn). Prediction failures warn and are
+        # skipped. In evaluation mode with any scores, logs a summary (total_predictions, successful_predictions and
+        # avg_<scorer>); otherwise finishes the logger. Records the step.
+        # Inputs: args, state, control, kwargs["processing_class"]. Outputs: none.
+        # Exceptions: logging errors are caught and warned; generation errors propagate.
+        # Side effects: mutates tokenizer.padding_side; generation; network logging to Weave.
         if state.global_step == self._last_logged_step:
             return
 
@@ -589,6 +733,13 @@ class WeaveCallback(TrainerCallback):
 
 
 class BEMACallback(TrainerCallback):
+    # [CLASS DOC]
+    # Callback implementing BEMA (bias-corrected EMA of weights). State: hyperparameters (update_freq 400,
+    # ema_power 0.5 as kappa, bias_power 0.2 as eta, lag 10 as rho, update_after 0 as tau, multiplier 1.0 as
+    # gamma, min_ema_multiplier 0.0, device "cpu"); param_names and thetat_params (live trainable parameters),
+    # theta0_params and ema_params (buffers on device), running_model (a separate model copy on device holding
+    # BEMA weights). Flow: on_train_begin builds buffers; on_step_end snapshots at update_after and updates every
+    # update_freq steps after it; on_train_end saves running_model to output_dir/bema.
     # docstyle-ignore
     r"""
     A [`~transformers.TrainerCallback`] that implements [BEMA](https://huggingface.co/papers/2508.00180)
@@ -663,6 +814,10 @@ class BEMACallback(TrainerCallback):
         min_ema_multiplier: float = 0.0,
         device: str = "cpu",
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores hyperparameters and initializes empty buffer lists and running_model None.
+        # Inputs: the hyperparameters listed in the class block. Outputs: none. Exceptions: none.
+        # Side effects: sets attributes.
         # User-provided hyperparams
         self.update_freq = update_freq
         self.ema_power = ema_power
@@ -682,6 +837,10 @@ class BEMACallback(TrainerCallback):
 
     @staticmethod
     def _unwrap_model(model):
+        # [FUNCTION DOC]
+        # HELPER: Strips wrappers: returns model.module for DeepSpeed engines (has module and engine), the
+        # _fsdp_wrapped_module for FSDP, model.module for (D)DP, else the model itself.
+        # Inputs: model. Outputs: inner module. Exceptions: none. Side effects: none.
         """
         Helper function to unwrap model from various wrappers including DataParallel, DistributedDataParallel,
         DeepSpeed, and FSDP.
@@ -706,6 +865,13 @@ class BEMACallback(TrainerCallback):
     def on_train_begin(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, model: PreTrainedModel, **kwargs
     ):
+        # [FUNCTION DOC]
+        # Behavior (no grad): unwraps the model, constructs a fresh instance of the same class from its config on the
+        # BEMA device and loads the model state dict into it. For each trainable parameter (requires_grad) records
+        # its name and reference, and clones it to the device as theta0 and as the initial EMA.
+        # Inputs: args, state, control, model. Outputs: none.
+        # Exceptions: errors if the model class cannot be built from its config (e.g. PEFT wrappers).
+        # Side effects: allocates a full model copy and buffers on device.
         model = self._unwrap_model(model)
 
         # Create a new instance and load state_dict
@@ -725,15 +891,31 @@ class BEMACallback(TrainerCallback):
             self.ema_params.append(theta0.clone())  # initialize EMA with θ₀
 
     def _ema_beta(self, step: int) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Returns beta = (lag + multiplier times step) to the power of minus ema_power, floored at
+        # min_ema_multiplier. Inputs: step (int). Outputs: float. Exceptions: none. Side effects: none.
         """Compute the EMA decay factor βₜ = (ρ + γ·t)⁻ᵏᵃᵖᵖᵃ."""
         beta = (self.lag + self.multiplier * step) ** (-self.ema_power)
         return max(beta, self.min_ema_multiplier)
 
     def _bema_alpha(self, step: int) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Returns alpha = (lag + multiplier times step) to the power of minus bias_power.
+        # Inputs: step (int). Outputs: float. Exceptions: none. Side effects: none.
         """Compute the BEMA scaling factor αₜ = (ρ + γ·t)⁻ᵉᵗᵃ."""
         return (self.lag + self.multiplier * step) ** (-self.bias_power)
 
     def _update_bema_weights(self, step: int):
+        # [FUNCTION DOC]
+        # HELPER: For each tracked parameter: moves the live value to device, updates EMA in place as
+        # (1 - beta) times EMA plus beta times theta_t, and writes EMA plus alpha times (theta_t minus theta0) into the
+        # matching running_model parameter.
+        # Inputs: step (int). Outputs: none.
+        # Exceptions: ValueError from the strict zip when parameter counts differ.
+        # Side effects: mutates EMA buffers and running_model parameters.
+        # KNOWN ISSUE: running_model.parameters() includes all parameters while thetat_params only holds trainable
+        # ones, so with any frozen parameter the strict zip raises (or, if counts matched by chance, would pair the
+        # wrong tensors).
         beta = self._ema_beta(step)
         alpha = self._bema_alpha(step)
 
@@ -749,6 +931,12 @@ class BEMACallback(TrainerCallback):
     def on_step_end(
         self, args: TrainingArguments, state: TrainerState, control: TrainerControl, model: PreTrainedModel, **kwargs
     ):
+        # [FUNCTION DOC]
+        # Behavior (no grad): does nothing before update_after; at exactly update_after copies live parameters into
+        # theta0 and EMA buffers; afterwards, when (step - update_after) is a multiple of update_freq, updates BEMA
+        # weights (using the absolute global step in the schedules) and logs info.
+        # Inputs: args, state, control, model. Outputs: none. Exceptions: as _update_bema_weights.
+        # Side effects: mutates buffers / running_model.
         step = state.global_step
 
         # If we haven't reached the update_after step, skip the BEMA update
@@ -770,6 +958,10 @@ class BEMACallback(TrainerCallback):
 
     @torch.no_grad()
     def on_train_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: on world process zero saves running_model with save_pretrained to output_dir/bema and logs.
+        # Inputs: args, state, control. Outputs: none. Exceptions: I/O errors.
+        # Side effects: writes model files.
         if state.is_world_process_zero:
             save_directory = f"{args.output_dir}/bema"
             self.running_model.save_pretrained(save_directory)

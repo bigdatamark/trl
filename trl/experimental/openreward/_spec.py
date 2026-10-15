@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# User-facing OpenRewardSpec for plugging an OpenReward Standard (ORS) environment into GRPOTrainer.
+# Contents: small helpers normalizing SDK outputs (_tool_specs_from_session_list_tools, _to_spec), the default
+# outcome-only reward function, and OpenRewardSpec which lazily builds a training dataset, an environment factory
+# producing _RolloutEnvironment instances, and exposes the reward function.
+# Relies on environment.py for the lazy SDK import and rollout adapter. Import-time side effects: creates a logger;
+# the openreward SDK is not imported until a property is accessed.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +60,9 @@ logger = logging.getLogger(__name__)
 
 
 def _tool_specs_from_session_list_tools(out: Any) -> list[Any]:
+    # [FUNCTION DOC]
+    # HELPER: Converts the result of a list_tools call (an iterable of ToolSpec) to a plain list.
+    # Inputs: out (iterable). Outputs: list. Exceptions: TypeError if not iterable. Side effects: none.
     """Normalise ``session.list_tools()`` / ``environment.list_tools()`` to a flat list.
 
     The client SDK (``openreward.api``) returns ``list[ToolSpec]`` directly.
@@ -60,6 +71,9 @@ def _tool_specs_from_session_list_tools(out: Any) -> list[Any]:
 
 
 def _to_spec(task) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Returns a task's spec dict: the input itself when it is a dict, otherwise its task_spec attribute.
+    # Inputs: task (SDK Task or dict). Outputs: dict. Exceptions: AttributeError for other objects. Side effects: none.
     """Normalise an SDK ``Task`` (or already-a-dict) to its task_spec dict."""
     if isinstance(task, dict):
         return task
@@ -67,6 +81,11 @@ def _to_spec(task) -> dict[str, Any]:
 
 
 def _outcome_only_reward_func(environments, **_) -> list[float | None]:
+    # [FUNCTION DOC]
+    # HELPER: Default reward function: returns each environment's reward attribute (the last non-null step reward, or None
+    # when no step produced a reward, as maintained by _RolloutEnvironment).
+    # Inputs: environments (list of rollout environments), other keyword arguments ignored.
+    # Outputs: list of float or None, one per environment. Exceptions: none. Side effects: none.
     """Default reward function: last non-null reward in each rollout's trajectory.
 
     Suitable for sparse-outcome envs (e.g. SETA, where only `submit_solution` returns a non-null reward). Override by
@@ -77,6 +96,14 @@ def _outcome_only_reward_func(environments, **_) -> list[float | None]:
 
 
 class OpenRewardSpec:
+    # [CLASS DOC]
+    # Specification object holding an ORS target and options; the trainer-facing objects are derived lazily.
+    # State: private copies of constructor options plus _is_url (target contains "://"). Cached properties _sdk_client
+    # (OpenReward client) and _sdk_env (SDK Environment) are shared by train_dataset and environment_factory, so the SDK is
+    # contacted only once per spec.
+    # Flow: train_dataset lists tasks into rows; environment_factory discovers tools (_discovered_tool_specs) and returns a
+    # closure creating per-rollout environments; reward_funcs returns the module-level default reward function.
+    # No base class.
     """Single spec object that wires an ORS environment into a TRL trainer.
 
     Args:
@@ -127,6 +154,12 @@ class OpenRewardSpec:
         discover_task_tools: bool = True,
         task_tools_discovery_index: int | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores options without any network access.
+        # Inputs: target (catalog name or URL), keyword-only num_tasks, split ("train"), indices, api_key, secrets, env_name,
+        # include_metadata (True), discover_task_tools (True), task_tools_discovery_index.
+        # Outputs: none. Exceptions: ValueError when both num_tasks and indices are given.
+        # Side effects: sets private attributes.
         if num_tasks is not None and indices is not None:
             raise ValueError("Provide num_tasks or indices, not both.")
 
@@ -146,6 +179,15 @@ class OpenRewardSpec:
 
     @cached_property
     def train_dataset(self):
+        # [FUNCTION DOC]
+        # Cached property building a datasets.Dataset from the environment's tasks.
+        # Behavior: explicit indices fetch each task by index; num_tasks fetches the first min(num_tasks, total) tasks by index;
+        # otherwise list_tasks for the split, falling back to per-index fetches if listing raises. Rows have "prompt" (a single
+        # user message with empty content) and "task_index". With include_metadata, adds one column per key found in any dict
+        # spec (sorted, excluding reserved prompt/task_index), None where missing.
+        # Inputs: none. Outputs: Dataset.
+        # Exceptions: SDK/network errors; ImportError if openreward missing.
+        # Side effects: network calls; caches the result and the SDK client/env.
         """A `datasets.Dataset` derived from the env's task list.
 
         Plugs directly into TRL's ``train_dataset=`` slot. Built lazily on first access. Has at minimum:
@@ -200,6 +242,14 @@ class OpenRewardSpec:
 
     @cached_property
     def environment_factory(self) -> Callable[[], _RolloutEnvironment]:
+        # [FUNCTION DOC]
+        # Cached property returning a zero-argument factory of rollout environments.
+        # Behavior: discovers tool specs once, creates a fresh subclass of _RolloutEnvironment unique to this spec (named with
+        # the spec id) so bound tool methods of different specs do not collide, and prepares constructor kwargs: split,
+        # effective secrets, env_name, pre-built client, env and tool specs, plus base_url (URL target) or name and api_key
+        # (catalog target); None values are dropped.
+        # Inputs: none. Outputs: callable returning a new instance of that subclass.
+        # Exceptions: SDK/network errors during discovery. Side effects: network calls, caching.
         """Zero-arg callable that returns a fresh ``_RolloutEnvironment``.
 
         Plugs directly into TRL's ``environment_factory=`` slot. TRL calls this once per rollout at trainer
@@ -236,12 +286,19 @@ class OpenRewardSpec:
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
         def _make() -> _RolloutEnvironment:
+            # [FUNCTION DOC]
+            # HELPER: Factory closure: constructs a new instance of the per-spec rollout subclass with the prepared kwargs.
+            # Inputs: none. Outputs: a fresh rollout environment (binds tools on first construction; reuses client/env).
+            # Exceptions: those of the rollout constructor. Side effects: none beyond construction.
             return rollout_cls(**kwargs)
 
         return _make
 
     @property
     def reward_funcs(self) -> Callable[..., list[float | None]]:
+        # [FUNCTION DOC]
+        # Returns the module-level _outcome_only_reward_func (stable identity, picklable).
+        # Inputs: none. Outputs: the callable. Exceptions: none. Side effects: none.
         """Default outcome-only reward function (last non-null reward per rollout).
 
         Plugs directly into TRL's ``reward_funcs=`` slot. Stable identity — module-level function, picklable for
@@ -252,6 +309,11 @@ class OpenRewardSpec:
     # ── internals ───────────────────────────────────────────────────
 
     def _effective_secrets(self) -> dict[str, str] | None:
+        # [FUNCTION DOC]
+        # HELPER: Per-session secrets to forward. Returns user secrets if provided, or None/secrets for URL targets; for catalog
+        # targets without secrets, returns a dict with "api_key" set to the api_key option or OPENREWARD_API_KEY env var, or
+        # None if neither exists.
+        # Inputs: none. Outputs: dict or None. Exceptions: none. Side effects: reads environment variables.
         """Auto-forward ``OPENREWARD_API_KEY`` as the conventional ``api_key``
         per-session secret on platform mode (most envs need it)."""
         if self._secrets is not None or self._is_url:
@@ -260,6 +322,10 @@ class OpenRewardSpec:
         return {"api_key": key} if key else None
 
     def _task_tools_probe_indices(self) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Task indices for tool discovery: the explicit discovery index if set, else the sorted distinct indices option,
+        # else task 0.
+        # Inputs: none. Outputs: list of ints. Exceptions: none. Side effects: none.
         """Pick task indices for ``session.list_tools()`` discovery (ORS ``/task_tools``)."""
         if self._task_tools_discovery_index is not None:
             return [self._task_tools_discovery_index]
@@ -268,6 +334,16 @@ class OpenRewardSpec:
         return [0]
 
     def _discovered_tool_specs(self, env):
+        # [FUNCTION DOC]
+        # HELPER: Determines the tool specs to bind on rollout environments.
+        # Behavior: fetches shared tools; returns them when discovery is disabled, when num_tasks fails (warning) or is zero.
+        # Filters probe indices to the valid range (warning for dropped ones; shared tools if none remain). For each index,
+        # opens a short session with effective secrets, lists its tools, and merges by name keeping the first spec (warning if a
+        # later spec with the same name differs); failed probes are logged and skipped. Returns shared tools if every probe
+        # failed.
+        # Inputs: env (SDK Environment). Outputs: list of ToolSpec (or dict) objects.
+        # Exceptions: errors from the initial shared list_tools call propagate.
+        # Side effects: network calls, opens/closes sessions, warning logs.
         """Return ToolSpec list for binding on `_RolloutEnvironment`.
 
         Prefer ``session.list_tools()`` (ORS ``/task_tools``) so task-specific tools match what the OpenReward SDK
@@ -337,6 +413,11 @@ class OpenRewardSpec:
 
     @cached_property
     def _sdk_client(self):
+        # [FUNCTION DOC]
+        # HELPER: Cached OpenReward client. Passes api_key option, else OPENREWARD_API_KEY env var for catalog targets; passes
+        # base_url for URL targets.
+        # Inputs: none. Outputs: openreward.OpenReward instance. Exceptions: ImportError if SDK missing.
+        # Side effects: lazy SDK import; reads environment variables.
         """The shared ``openreward.OpenReward`` client used by `dataset` and `factory`."""
         openreward = _import_openreward()
         kwargs: dict[str, Any] = {}
@@ -350,6 +431,10 @@ class OpenRewardSpec:
 
     @cached_property
     def _sdk_env(self):
+        # [FUNCTION DOC]
+        # HELPER: Cached SDK Environment handle, looked up by env_name (or "env") for URL targets and by the catalog name
+        # otherwise.
+        # Inputs: none. Outputs: SDK Environment. Exceptions: SDK/network errors. Side effects: network call.
         """The shared SDK ``Environment`` handle."""
         if self._is_url:
             # Self-hosted single-env URL — pass any name; the SDK redirects.

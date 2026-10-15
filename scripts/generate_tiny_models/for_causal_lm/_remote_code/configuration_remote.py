@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# HELPER: Defines RemoteConfig, a LlamaConfig under the custom model_type "remote", used by the remote-code tiny model.
+# Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,4 +20,8 @@ from transformers import LlamaConfig
 
 
 class RemoteConfig(LlamaConfig):
+    # [CLASS DOC]
+    # HELPER: LlamaConfig subclass whose only change is the class attribute model_type set to "remote", so the
+    # saved config.json is not recognized by built-in transformers auto classes.
+    # Construction inputs: same as LlamaConfig. Methods: inherited. Side effects: none.
     model_type = "remote"

@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Example training script: Mixed Preference Optimization for vision-language models, i.e. DPOTrainer with several
+# loss types combined by weights (e.g. sigmoid, bco_pair and sft) given on the CLI, on an image preference dataset.
+# Behavior (only under the main guard): parses ScriptArguments, DPOConfig and ModelConfig; builds model kwargs
+# (revision, attention implementation, dtype resolved to torch dtype unless auto/None, quantization config only when
+# not None) and loads the model with AutoModelForImageTextToText; gets the optional PEFT config; loads the dataset
+# (name, config, streaming from script args), takes the train split and the test split only when eval_strategy is
+# not no; converts the first image of each row to RGB (map with dataset_num_proc); builds DPOTrainer, trains, saves,
+# optionally pushes to the Hub, calls end.
+# Inputs: CLI args / config file. Outputs: trained model in output_dir. Exceptions: propagated from loading/training.
+# Side effects: downloads, GPU training, file writes, optional Hub upload. Importing has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -92,6 +104,12 @@ if __name__ == "__main__":
     test_dataset = dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None
 
     def ensure_rgb(example):
+        # [FUNCTION DOC]
+        # HELPER: Map function normalizing a row's image list to one RGB image.
+        # Behavior: takes the first entry of images; if it is a PIL image, converts it to RGB when needed and replaces images
+        # with a single-element list containing it (any additional images are dropped). Non-PIL entries leave the row as is.
+        # Inputs: example (dict with images list). Outputs: the (mutated) example. Exceptions: IndexError on an empty list.
+        # Side effects: mutates the example dict.
         # Convert the image to RGB if it's not already
         image = example["images"][0]
         if isinstance(image, Image.Image):

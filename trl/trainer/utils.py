@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Shared helper utilities used by the TRL trainers (trl.trainer.*) and some experimental code.
+# Main contents: distributed env helpers (MASTER_ADDR/PORT), tensor helpers (pad, flush_left, nanstd, nanmin,
+# nanmax, split_tensor_dict, shuffle_sequence_dict, pixel-value split/unsplit for VLMs), log-prob/entropy helpers
+# (selective_log_softmax, entropy_from_logits, selective_log_softmax_and_entropy, with optional Triton kernels),
+# the fused LM head patch (add_fused_lm_head and FusedCausalLMOutput), samplers (RepeatSampler and its streaming
+# counterpart repeat_iterable_dataset), model/config helpers (create_model_from_path, get_quantization_config,
+# get_peft_config, get_config_model_id, hash_module, use_adapter, disable_dropout_in_model), logging helpers
+# (model cards, Comet/Trackio URLs, rich completion tables), async event-loop helpers and MFU/FLOPs estimation.
+# Import-time side effects: conditional imports of comet_ml, the Triton fused kernel, peft and rich when
+# available; creates a module logger; defines module constants (chunk size for the fused head, peak FLOPs table).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,6 +97,11 @@ logger = get_logger(__name__)
 
 
 def _is_port_free(port: int, host: str = "127.0.0.1") -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Checks whether a TCP port can be bound.
+    # Behavior: opens an IPv4 stream socket with SO_REUSEADDR and tries to bind host:port.
+    # Inputs: port, host (default 127.0.0.1). Outputs: True if bind succeeds, False on OSError.
+    # Exceptions: none (OSError swallowed). Side effects: briefly binds then closes a socket.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -95,6 +112,9 @@ def _is_port_free(port: int, host: str = "127.0.0.1") -> bool:
 
 
 def _find_free_port() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns a free port, preferring 29500, 23456, 12355, 12345 in that order, else an OS-assigned ephemeral port.
+    # Inputs: none. Outputs: int port. Exceptions: OSError if the ephemeral bind fails. Side effects: temporary sockets.
     candidates = (29500, 23456, 12355, 12345)
     for p in candidates:
         if _is_port_free(p):
@@ -105,6 +125,12 @@ def _find_free_port() -> int:
 
 
 def ensure_master_addr_port(addr: str | None = None, port: int | None = None) -> None:
+    # [FUNCTION DOC]
+    # Behavior: sets MASTER_ADDR to the existing env value, else addr, else "localhost". For the port: if port is None
+    # and MASTER_PORT env is set to something other than empty/"0"/"auto", parses it as int (ignored if not numeric).
+    # Then sets MASTER_PORT to a free port when port is None or 0, else to port.
+    # Inputs: addr, port (optional). Outputs: none.
+    # Exceptions: none. Side effects: mutates os.environ; probes sockets.
     """
     Ensure `MASTER_ADDR`/`MASTER_PORT` are set safely.
 
@@ -131,6 +157,13 @@ def pad(
     padding_side: str = "right",
     pad_to_multiple_of: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: stacks tensors of varying shapes into one tensor of shape (count, max shape per dim), filled with
+    # padding_value. The first dimension is rounded up to a multiple of pad_to_multiple_of when given. Each tensor is
+    # placed at the start (right padding) or end (left padding) along the first dimension and at the start along the
+    # others. Uses the first tensor's dtype and device.
+    # Inputs: tensors list, padding_value (0), padding_side ("right"), pad_to_multiple_of.
+    # Outputs: padded tensor. Exceptions: ValueError for an invalid padding_side. Side effects: none.
     """
     Pads a list of tensors to the same shape along the first dimension.
 
@@ -192,12 +225,21 @@ def pad(
 
 
 def disable_dropout_in_model(model: torch.nn.Module) -> None:
+    # [FUNCTION DOC]
+    # Behavior: sets p to 0 on every torch Dropout module in the model.
+    # Inputs: model. Outputs: none. Exceptions: none. Side effects: mutates the model's dropout modules.
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0
 
 
 def maybe_gather_lm_head_ctx(*params: torch.nn.Parameter):
+    # [FUNCTION DOC]
+    # Behavior: returns a nullcontext unless DeepSpeed ZeRO-3 is enabled; then deduplicates the given parameters by
+    # identity, drops None and already-available ones, and returns a deepspeed GatheredParameters context over the
+    # rest (nullcontext if none remain).
+    # Inputs: params (parameters or None). Outputs: a context manager.
+    # Exceptions: ImportError if deepspeed is missing under ZeRO-3. Side effects: gathering occurs when the context is entered.
     """
     Context manager that allgathers ZeRO-3 partitioned `lm_head` weight/bias for a fused loss.
 
@@ -234,6 +276,10 @@ def maybe_gather_lm_head_ctx(*params: torch.nn.Parameter):
 
 
 def get_callable_name(func: Callable) -> str:
+    # [FUNCTION DOC]
+    # Behavior: unwraps nested functools.partial objects and returns the function's name, or the class name for
+    # objects without a name attribute (callable instances).
+    # Inputs: func. Outputs: str. Exceptions: none. Side effects: none.
     """
     Return a display name for a callable, supporting the picklable reward forms: module-level functions,
     [`functools.partial`](https://docs.python.org/3/library/functools.html#functools.partial) (unwrapped to the wrapped
@@ -245,6 +291,9 @@ def get_callable_name(func: Callable) -> str:
 
 
 def is_async_callable(func: Callable) -> bool:
+    # [FUNCTION DOC]
+    # Behavior: unwraps partials, then returns true if the function or its call method is a coroutine function.
+    # Inputs: func. Outputs: bool. Exceptions: none. Side effects: none.
     """
     Return whether calling `func` returns a coroutine, for the same forms as [`get_callable_name`]: module-level
     functions, [`functools.partial`](https://docs.python.org/3/library/functools.html#functools.partial) (unwrapped to
@@ -259,6 +308,10 @@ def is_async_callable(func: Callable) -> bool:
 
 
 def get_quantization_config(model_args: ModelConfig) -> BitsAndBytesConfig | None:
+    # [FUNCTION DOC]
+    # Behavior: builds a BitsAndBytesConfig from ModelConfig: 4-bit (compute dtype = model dtype, quant type, nested
+    # quant, quant storage) when load_in_4bit; 8-bit when load_in_8bit; otherwise None.
+    # Inputs: model_args. Outputs: BitsAndBytesConfig or None. Exceptions: from BitsAndBytesConfig. Side effects: none.
     if model_args.load_in_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -278,6 +331,11 @@ def get_quantization_config(model_args: ModelConfig) -> BitsAndBytesConfig | Non
 
 
 def get_peft_config(model_args: ModelConfig) -> "PeftConfig | None":
+    # [FUNCTION DOC]
+    # Behavior: returns None if use_peft is False; requires peft; builds a LoraConfig from ModelConfig (task type, r,
+    # target modules, alpha, dropout, bias "none", rslora, dora, modules_to_save), passing target_parameters only when set.
+    # Inputs: model_args. Outputs: LoraConfig or None.
+    # Exceptions: ValueError when peft is not installed. Side effects: none.
     if model_args.use_peft is False:
         return None
 
@@ -323,6 +381,12 @@ def generate_model_card(
     paper_id: str | None = None,
     comet_url: str | None = None,
 ) -> ModelCard:
+    # [FUNCTION DOC]
+    # Behavior: builds ModelCardData (library transformers, tags prefixed with generated_from_trainer) and renders the
+    # template from trl/templates (default lm_model_card.md) with run URLs, trainer info, paper info and installed
+    # versions of trl, transformers, torch, datasets and tokenizers.
+    # Inputs: see signature. Outputs: huggingface_hub ModelCard.
+    # Exceptions: PackageNotFoundError if a version lookup fails; template errors. Side effects: reads the template file.
     """
     Generate a [`~huggingface_hub.ModelCard`] from a template.
 
@@ -391,6 +455,9 @@ def generate_model_card(
 
 
 def get_comet_experiment_url() -> str | None:
+    # [FUNCTION DOC]
+    # Behavior: returns the running Comet experiment URL, or None when comet is unavailable or no experiment runs.
+    # Inputs: none. Outputs: str or None. Exceptions: none. Side effects: none.
     """
     If Comet integration is enabled, return the URL of the current Comet experiment; otherwise, return `None`.
     """
@@ -404,6 +471,10 @@ def get_comet_experiment_url() -> str | None:
 
 
 def get_trackio_space_url() -> str | None:
+    # [FUNCTION DOC]
+    # Behavior: if trackio is installed and has a current run with a Space id, returns the Space URL (slash replaced
+    # by dash in the id) with project and run name query parameters; otherwise None.
+    # Inputs: none. Outputs: str or None. Exceptions: none. Side effects: none.
     """
     If Trackio integration is enabled, return the URL of the current Trackio Space; otherwise, return `None`.
     """
@@ -425,6 +496,10 @@ def get_trackio_space_url() -> str | None:
 
 
 def log_table_to_comet_experiment(name: str, table: pd.DataFrame) -> None:
+    # [FUNCTION DOC]
+    # Behavior: logs the DataFrame as a table file named name to the running Comet experiment, if one exists.
+    # Inputs: name, table. Outputs: none.
+    # Exceptions: ModuleNotFoundError if comet is not installed. Side effects: network logging to Comet.
     """
     If Comet integration is enabled logs a table to the Comet experiment if it is currently running.
 
@@ -443,6 +518,12 @@ def log_table_to_comet_experiment(name: str, table: pd.DataFrame) -> None:
 
 
 def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    # [FUNCTION DOC]
+    # Behavior: for 2-D mask and same-shape tensors, rotates each row left by the position of its first nonzero mask
+    # value (cyclic gather), then truncates all columns starting at the first column whose mask is zero in every row.
+    # Works on clones.
+    # Inputs: mask, tensors. Outputs: the flushed mask alone, or a tuple of mask and tensors.
+    # Exceptions: none. Side effects: none.
     """
     Shift non-zero elements in the mask and corresponding tensors to the left.
 
@@ -510,6 +591,12 @@ def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> torch.Tensor | tup
 def _supports_trl_loss_kernel(
     logits: torch.Tensor, index: torch.Tensor | None = None, row_mask: torch.Tensor | None = None
 ) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Decides whether the Triton log-prob/entropy kernel can handle the inputs.
+    # Behavior: true when logits are on cuda/xpu, fp16/bf16/fp32, 1 to 3 dims, contiguous last dim, nonempty vocab;
+    # if index is given it must match the logits leading shape, be int32/int64 and on the same device; if row_mask is
+    # given, index must exist and row_mask must match its shape, be bool/int32/int64 and on the same device.
+    # Inputs: logits, index, row_mask. Outputs: bool. Exceptions: none. Side effects: none.
     supported = (
         logits.device.type in ("cuda", "xpu")
         and logits.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -541,6 +628,13 @@ def selective_log_softmax(
     temperature: float = 1.0,
     row_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: gathers log-softmax values at index without materializing the full log-softmax when possible.
+    # Uses the fused Triton kernel when available and supported. Otherwise divides logits by temperature, unsqueezes
+    # an index of rank one less than logits, and for fp32/fp64 subtracts a per-row logsumexp from gathered logits;
+    # for other dtypes computes log_softmax row by row and gathers. Squeezes back and zeroes rows where row_mask is 0.
+    # Inputs: logits, index, temperature (1.0), row_mask. Outputs: tensor shaped like index.
+    # Exceptions: ValueError when temperature is not positive. Side effects: none.
     """
     A memory-efficient implementation of the common `log_softmax -> gather` operation.
 
@@ -602,6 +696,10 @@ def selective_log_softmax(
 
 
 def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 128) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: uses the Triton kernel (with a dummy zero index) when supported; otherwise flattens leading dims,
+    # computes entropy chunk by chunk (chunk_size rows) from log_softmax, and reshapes to the leading shape.
+    # Inputs: logits, chunk_size (128). Outputs: entropy tensor. Exceptions: none. Side effects: none.
     """
     Compute the Shannon entropy (in nats) for each row of *logits* in a memory-efficient way.
 
@@ -644,6 +742,10 @@ def entropy_from_logits(logits: torch.Tensor, chunk_size: int = 128) -> torch.Te
 
 
 def strip_images_from_messages(messages):
+    # [FUNCTION DOC]
+    # Behavior: returns non-list input unchanged; for a list of messages, replaces each image content block with a
+    # block holding only its type, copying modified messages (originals untouched).
+    # Inputs: messages. Outputs: stripped conversation. Exceptions: none. Side effects: none.
     """
     Drop the image objects from a conversation, keeping its structure.
 
@@ -676,6 +778,12 @@ def selective_log_softmax_and_entropy(
     temperature: float = 1.0,
     row_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: computes selected log-probs and entropy together. Triton path when supported (entropy detached if
+    # entropy_requires_grad is false). Otherwise scales by temperature, calls selective_log_softmax (with row_mask) and
+    # entropy_from_logits (under no_grad if gradients not required), zeroing entropy on masked rows.
+    # Inputs: logits, index, entropy_requires_grad (True), temperature (1.0), row_mask.
+    # Outputs: tuple of log-probs and entropy. Exceptions: ValueError for non-positive temperature. Side effects: none.
     """Compute selected log-probabilities and entropy in one pass over the logits.
 
     Args:
@@ -721,6 +829,12 @@ def print_prompt_completions_sample(
     num_samples: int = None,
     extra: dict[str, list] | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: prints a rich table inside a panel titled with the step: columns Prompt, Completion, one per reward,
+    # Advantage (if given), then extra columns. If num_samples is at least the count, shows all; if not positive,
+    # prints nothing; otherwise samples that many random rows. Rewards and advantages formatted with 2 decimals.
+    # Inputs: prompts, completions, rewards, advantages, step, num_samples, extra. Outputs: none.
+    # Exceptions: ImportError when rich is missing. Side effects: console output; uses Python random.
     """
     Print out a sample of model completions to the console with multiple reward metrics.
 
@@ -788,6 +902,11 @@ def print_prompt_completions_sample(
         table.add_column(extra_name, style="bright_white")
 
     def format_entry(entry) -> Text:
+        # [FUNCTION DOC]
+        # HELPER: Renders a cell. For a list of message dicts: role in upper case, reasoning_content/thinking in dim
+        # italics, content text (image blocks shown as [IMAGE]), and tool calls as name(arg=value, ...) with JSON-string
+        # arguments parsed; messages separated by blank lines. Anything else is rendered with str.
+        # Inputs: entry. Outputs: rich Text. Exceptions: JSON decode errors for malformed tool arguments. Side effects: none.
         t = Text()
         if isinstance(entry, list) and all(isinstance(m, dict) for m in entry):
             for j, msg in enumerate(entry):
@@ -857,6 +976,12 @@ def print_prompt_completions_sample(
 
 
 class RepeatSampler(Sampler):
+    # [CLASS DOC]
+    # torch Sampler yielding dataset indices so each prompt appears mini_repeat_count times consecutively, in batches
+    # of batch_size unique indices, each batch repeated repeat_count times. Incomplete trailing batches are dropped.
+    # State: data_source, mini_repeat_count, batch_size, repeat_count, num_samples, shuffle, seed, and a private
+    # torch Generator when shuffling (seeded if seed given). Used by GRPO/RLOO-style trainers to keep prompt groups
+    # together across processes.
     """
     Sampler that repeats the indices of a dataset in a structured manner.
 
@@ -914,6 +1039,11 @@ class RepeatSampler(Sampler):
         shuffle: bool = True,
         seed: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores the arguments, records the dataset length, and creates a local Generator (manually seeded when
+        # seed is given) if shuffle is true.
+        # Inputs: data_source, mini_repeat_count, batch_size (1), repeat_count (1), shuffle (True), seed.
+        # Outputs: none. Exceptions: TypeError if data_source has no length. Side effects: none.
         self.data_source = data_source
         self.mini_repeat_count = mini_repeat_count
         self.batch_size = batch_size
@@ -928,6 +1058,10 @@ class RepeatSampler(Sampler):
                 self.generator.manual_seed(seed)
 
     def __iter__(self):
+        # [FUNCTION DOC]
+        # Behavior: permutes indices with the generator (or keeps order), chunks into batch_size groups, drops a short last
+        # chunk, and for each chunk yields, repeat_count times, every index mini_repeat_count times in a row.
+        # Inputs: none. Outputs: generator of ints. Exceptions: none. Side effects: advances the generator state.
         if self.shuffle:
             # E.g., [2, 4, 3, 1, 0, 6, 5] (num_samples = 7)
             indexes = torch.randperm(self.num_samples, generator=self.generator).tolist()
@@ -949,12 +1083,21 @@ class RepeatSampler(Sampler):
                         yield index
 
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Behavior: full batches times batch_size times mini_repeat_count times repeat_count.
+        # Inputs: none. Outputs: int. Exceptions: none. Side effects: none.
         return (self.num_samples // self.batch_size) * self.batch_size * self.mini_repeat_count * self.repeat_count
 
 
 def repeat_iterable_dataset(
     dataset: IterableDataset, mini_repeat_count: int, batch_size: int = 1, repeat_count: int = 1
 ):
+    # [FUNCTION DOC]
+    # Behavior: streaming equivalent of RepeatSampler without shuffling: applies a batched map with batch_size records
+    # per batch that drops incomplete batches and emits each batch repeat_count times with every record repeated
+    # mini_repeat_count times consecutively (deep copies).
+    # Inputs: dataset, mini_repeat_count, batch_size (1), repeat_count (1). Outputs: mapped IterableDataset.
+    # Exceptions: none of its own. Side effects: none (lazy).
     """
     Streaming counterpart of [`RepeatSampler`] for [`~datasets.IterableDataset`].
 
@@ -999,6 +1142,10 @@ def repeat_iterable_dataset(
     """
 
     def repeat_batch(batch: dict) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Map function: given a column-to-list batch, returns empty columns if shorter than batch_size, otherwise
+        # the repeated records as described, transposed back to columns.
+        # Inputs: batch dict. Outputs: dict of lists. Exceptions: none. Side effects: none.
         # `batch` maps each column to a list of `batch_size` values (fewer for the trailing batch, which is dropped to
         # match RepeatSampler). Transpose it back to records, repeating them as RepeatSampler repeats indices. Records
         # are deep-copied so repeats stay independent, matching the map-style path where the dataset re-materializes a
@@ -1019,6 +1166,11 @@ def repeat_iterable_dataset(
 
 # torch.nanstd doesn't exist, so we define it here
 def nanstd(tensor: torch.Tensor, dim: int | tuple[int, ...] | None = None, keepdim: bool = False) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: NaN-ignoring sample standard deviation: nanmean, nanmean of squared deviations, Bessel correction
+    # count/(count-1) (NaN when count is at most 1), square root; then removes reduced dims unless keepdim (all dims
+    # squeezed when dim is None; negative dims normalized for tuples).
+    # Inputs: tensor, dim, keepdim. Outputs: tensor. Exceptions: none. Side effects: none.
     """
     Compute the standard deviation of a tensor, ignoring NaNs.
 
@@ -1057,6 +1209,16 @@ def nanstd(tensor: torch.Tensor, dim: int | tuple[int, ...] | None = None, keepd
 def split_tensor_dict(
     tensor_dict: dict[str, torch.Tensor | None], num_chunks: int
 ) -> list[dict[str, torch.Tensor | None]]:
+    # [FUNCTION DOC]
+    # Behavior: splits each value along the first dimension into num_chunks equal chunks of size (first non-None
+    # value length floor-divided by num_chunks); lists and tensors with dims are sliced, 0-d tensors are copied into
+    # every chunk, None stays None.
+    # Inputs: tensor_dict, num_chunks. Outputs: list of dicts.
+    # Exceptions: StopIteration if every value is None.
+    # Side effects: none.
+    # KNOWN ISSUE: the chunk size is read from the shape of the first non-None value, so a dict whose first non-None
+    # value is a list raises AttributeError although lists are otherwise supported; trailing rows are dropped when the
+    # length is not divisible by num_chunks.
     """
     Splits a dictionary of tensors along the first dimension into `num_chunks` equal parts.
 
@@ -1090,6 +1252,10 @@ def split_tensor_dict(
 
 
 def shuffle_sequence_dict(seq_dict: dict[str, Sequence | None]) -> dict[str, Sequence | None]:
+    # [FUNCTION DOC]
+    # Behavior: draws one random permutation (global torch RNG) of the length of the first non-None value and applies
+    # it to every tensor with at least one dim and every list; None and 0-d tensors pass through.
+    # Inputs: seq_dict. Outputs: new dict. Exceptions: StopIteration if all values are None. Side effects: consumes global RNG.
     """
     Shuffles all sequence-like values in a dictionary along the first dimension in unison.
 
@@ -1110,6 +1276,9 @@ def shuffle_sequence_dict(seq_dict: dict[str, Sequence | None]) -> dict[str, Seq
     permutation = torch.randperm(batch_size)
 
     def permute(v: Sequence | None) -> Sequence | None:
+        # [FUNCTION DOC]
+        # HELPER: Applies the shared permutation to one value (None and scalars unchanged, tensors indexed, sequences rebuilt as lists).
+        # Inputs: v. Outputs: permuted value. Exceptions: none. Side effects: none.
         if v is None:
             return None
         if isinstance(v, torch.Tensor) and v.ndim == 0:
@@ -1122,6 +1291,9 @@ def shuffle_sequence_dict(seq_dict: dict[str, Sequence | None]) -> dict[str, Seq
 
 
 def nanmin(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: minimum over non-NaN values of a 1-D tensor; a NaN scalar (same dtype/device) if all are NaN.
+    # Inputs: tensor. Outputs: 0-d tensor. Exceptions: RuntimeError on an empty tensor. Side effects: none.
     """
     Compute the minimum value of a tensor, ignoring NaNs. This function only supports 1D tensors.
 
@@ -1139,6 +1311,9 @@ def nanmin(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def nanmax(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: maximum over non-NaN values of a 1-D tensor; NaN if all are NaN.
+    # Inputs: tensor. Outputs: 0-d tensor. Exceptions: RuntimeError on an empty tensor. Side effects: none.
     """
     Compute the maximum value of a tensor, ignoring NaNs. This function only supports 1D tensors.
 
@@ -1156,11 +1331,25 @@ def nanmax(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def identity(x):
+    # [FUNCTION DOC]
+    # HELPER: Returns its argument unchanged; used as a no-op data collator.
+    # Inputs: x. Outputs: x. Exceptions: none. Side effects: none.
     """Do we really need docs for this?"""
     return x
 
 
 def split_pixel_values_by_grid(batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+    # [FUNCTION DOC]
+    # Behavior: if pixel_values and num_images are present, splits flat per-batch image tensors into per-sample lists
+    # so rows can be shuffled/split with their samples:
+    # - image_grid_thw: rows per image = product of grid dims (must sum to pixel row count); pixel_values split by
+    #   per-sample row sums and image_grid_thw split by num_images.
+    # - image_position_ids: pixel_values and position ids split by num_images.
+    # - spatial_shapes: pixel_values, pixel_attention_mask and spatial_shapes split by num_tiles.
+    # - num_tiles only: pixel_values split by num_tiles.
+    # - otherwise, if pixel rows equal total images, split pixel_values (and image_sizes) by num_images; else unchanged.
+    # Inputs: batch dict. Outputs: new dict (or the same batch).
+    # Exceptions: ValueError on a grid/row count mismatch. Side effects: none.
     """
     Splits `batch["pixel_values"]` into a list of tensors, one per sample, based on `batch["num_images"]`.
 
@@ -1227,6 +1416,10 @@ def split_pixel_values_by_grid(batch: dict[str, torch.Tensor]) -> dict[str, torc
 
 
 def unsplit_pixel_values_by_grid(batch: dict[str, torch.Tensor | list[torch.Tensor]]) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: concatenates along the first dim any of pixel_values, image_grid_thw, image_position_ids,
+    # pixel_attention_mask, spatial_shapes and image_sizes that are lists, returning a new dict.
+    # Inputs: batch. Outputs: dict. Exceptions: none. Side effects: none.
     """
     Opposite of `split_pixel_values_by_grid`. Merges a list of tensors in `batch["pixel_values"]` back into a single
     tensor along the first dimension.
@@ -1274,6 +1467,11 @@ TListOrMapping = TypeVar("TListOrMapping", list, Mapping)
 # function via `dataset = dataset.with_transform(remove_none_values)` before training to strip the spurious `None`
 # values. See the migration guide for more details.
 def remove_none_values(example: TListOrMapping) -> TListOrMapping:
+    # [FUNCTION DOC]
+    # Behavior: recursively drops None-valued keys from mappings; lists keep their None items but recurse into nested
+    # dicts/lists. Intended for users via with_transform, not used internally.
+    # Inputs: example (list or mapping). Outputs: cleaned structure.
+    # Exceptions: TypeError for other input types. Side effects: none.
     """
     Recursively removes entries with `None` values from a nested structure (list or dictionary).
 
@@ -1311,6 +1509,16 @@ def remove_none_values(example: TListOrMapping) -> TListOrMapping:
 def create_model_from_path(
     model_id: str, architecture: _BaseAutoModelClass | None = None, **kwargs
 ) -> PreTrainedModel:
+    # [FUNCTION DOC]
+    # Behavior: normalizes dtype (default "float32"; strings bfloat16/float16/float32 become torch dtypes; torch
+    # dtypes, "auto" and None pass); rejects use_kernels on transformers 5.2-5.3; defaults device_map to None on
+    # CPU/MPS and "auto" otherwise; infers the architecture class from the config's first architecture name in
+    # transformers, else from auto_map (image-text-to-text preferred over causal LM), else AutoModelForCausalLM; loads
+    # with from_pretrained; ties weights on transformers 5.3.0.
+    # Inputs: model_id, architecture (optional), kwargs for from_pretrained.
+    # Outputs: PreTrainedModel.
+    # Exceptions: ValueError for invalid dtype or the kernels/version combo; loading errors.
+    # Side effects: downloads config and weights; mutates kwargs.
     """
     Create a model from a given path using the specified initialization arguments.
 
@@ -1371,6 +1579,10 @@ def create_model_from_path(
 
 
 def hash_module(module: torch.nn.Module) -> str:
+    # [FUNCTION DOC]
+    # HELPER: SHA-256 over the module state dict in sorted key order, hashing each tensor's dtype string and raw
+    # bytes (bf16 and fp8 converted to fp32 first) on CPU.
+    # Inputs: module. Outputs: hex digest str. Exceptions: none. Side effects: copies tensors to CPU.
     h = hashlib.sha256()
     for _, tensor in sorted(module.state_dict().items()):
         tensor = tensor.cpu()
@@ -1382,6 +1594,9 @@ def hash_module(module: torch.nn.Module) -> str:
 
 
 def get_config_model_id(config: PretrainedConfig) -> str:
+    # [FUNCTION DOC]
+    # Behavior: returns the config's _name_or_path, or empty string if absent.
+    # Inputs: config. Outputs: str. Exceptions: none. Side effects: none.
     """
     Retrieve the model identifier from a given model configuration.
 
@@ -1398,6 +1613,10 @@ def get_config_model_id(config: PretrainedConfig) -> str:
 
 @contextmanager
 def global_then_local_main_first():
+    # [FUNCTION DOC]
+    # Behavior: context manager entering PartialState main_process_first and then local_main_process_first, so the
+    # global main runs first, then each node's local main, then the rest.
+    # Inputs: none. Outputs: yields None. Exceptions: none. Side effects: distributed barriers.
     """
     Context manager that lets the global main process run the block first, then the local main of each node, then
     everyone else. Both scopes of `PartialState.main_process_first`, one after the other.
@@ -1413,6 +1632,11 @@ def global_then_local_main_first():
 
 @contextmanager
 def use_adapter(model: "PeftModel", adapter_name: str | None):
+    # [FUNCTION DOC]
+    # Behavior: context manager; with adapter_name None disables all adapters for the block; otherwise sets the given
+    # adapter active and restores the previous active adapter afterwards (even on error).
+    # Inputs: model, adapter_name. Outputs: yields None.
+    # Exceptions: ImportError when peft is not installed. Side effects: temporarily changes model adapter state.
     """
     Context manager to temporarily set and reset the active adapter in a PEFT model.
 
@@ -1454,6 +1678,11 @@ def use_adapter(model: "PeftModel", adapter_name: str | None):
 def start_event_loop_in_daemon(
     name: str | None = None,
 ) -> tuple[threading.Thread, asyncio.AbstractEventLoop, threading.Event]:
+    # [FUNCTION DOC]
+    # Behavior: creates a new asyncio loop and a daemon thread that sets it as current, signals a ready Event and runs
+    # the loop forever; starts the thread.
+    # Inputs: name (thread name). Outputs: tuple of thread, loop, ready event.
+    # Exceptions: none. Side effects: starts a background thread.
     """
     This function creates a new daemon thread that runs the provided event loop.
 
@@ -1473,6 +1702,9 @@ def start_event_loop_in_daemon(
     loop_ready_event = threading.Event()
 
     def run_loop():
+        # [FUNCTION DOC]
+        # HELPER: Thread target: sets the loop as current, signals readiness, and runs the loop until stopped.
+        # Inputs: none (closure). Outputs: none. Exceptions: none. Side effects: blocks the thread running the loop.
         asyncio.set_event_loop(loop)
         loop_ready_event.set()
         loop.run_forever()
@@ -1486,6 +1718,9 @@ def shutdown_event_loop_in_daemon(
     thread: threading.Thread | None,
     loop: asyncio.AbstractEventLoop | None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: no-op if loop or thread is None; otherwise schedules loop stop thread-safely and joins the thread with a 5 s timeout.
+    # Inputs: thread, loop. Outputs: none. Exceptions: none. Side effects: stops the loop; the loop is not closed.
     """
     Shutdown an asyncio event loop running in a separate thread.
 
@@ -1508,6 +1743,10 @@ _CHUNKED_LOGPROB_CHUNK_SIZE = 32768
 
 @dataclass
 class FusedCausalLMOutput(ModelOutput):
+    # [CLASS DOC]
+    # ModelOutput dataclass returned by a model patched by add_fused_lm_head when called with fused_lm_head enabled.
+    # Fields (all default None): loss, log_probs, entropy, log_sum_sq_probs, mean_logits, is_top1, label_mask,
+    # aux_loss. Per-token fields are zero on ignored labels and None when not requested.
     """
     Output of a model given a fused LM head with [`add_fused_lm_head`] and called with `fused_lm_head=True`. Every
     per-token field is zero where the label is `-100`. Per-token fields not listed in `outputs` are `None`.
@@ -1551,6 +1790,14 @@ def add_fused_lm_head(
     cast_lm_head_to_fp32: bool = False,
     outputs: tuple[str, ...] = ("log_probs",),
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: patches model.forward (bound method, signature preserved for generate) so that with
+    # fused_lm_head enabled it computes per-token label statistics in chunks without full logits. Precomputes from
+    # the text config: final_logit_softcapping and a logit scale (logit_scale, else output_multiplier, else
+    # lm_head_multiplier, else logits_scaling inverted except for hyperclovax where it multiplies; default 1.0), and
+    # the backbone attribute ("model" for VLMs on transformers<5, else "base_model").
+    # Inputs: model, temperature (1.0), cast_lm_head_to_fp32 (False), outputs (which per-token fields to compute).
+    # Outputs: none. Exceptions: none at patch time. Side effects: replaces model.forward.
     """
     Add a fused LM head to `model`: `model(..., labels=labels, fused_lm_head=True)` returns per-token log-probabilities
     instead of logits, without materializing the `(batch, seq_len, vocab)` logits.
@@ -1599,6 +1846,21 @@ def add_fused_lm_head(
     def _fused_forward(
         self, *args, fused_lm_head=False, labels=None, shift_labels=None, num_items_in_batch=None, **kwargs
     ):
+        # [FUNCTION DOC]
+        # HELPER: Replacement forward.
+        # Behavior: without fused_lm_head, forwards labels/shift_labels/num_items_in_batch (if given) to the original
+        # forward. With it: disables cache, requests router logits if the config asks, runs the backbone, and aligns hidden
+        # states with labels (drop last position and first label, or use shift_labels as is). Moves both to the LM head
+        # device, builds the valid-label mask, optionally upcasts to fp32 with autocast disabled, materializes DTensor
+        # weights (FSDP2), and under the ZeRO-3 gather context runs the chunked log-prob autograd function (chunk size
+        # 32768) either on only valid positions (Triton devices) or on all positions with labels clamped to 0. Results are
+        # scattered/masked back to the label shape. loss = negative sum of log-probs divided by num_items_in_batch or the
+        # valid count (min 1). With router logits, adds the config's router_aux_loss_coef times the Mixtral
+        # load-balancing loss (expert counts from the model or text config depending on transformers version and gpt_oss
+        # workaround), using attention_mask when present.
+        # Inputs: self, args, fused_lm_head, labels, shift_labels, num_items_in_batch, kwargs.
+        # Outputs: original model output, or FusedCausalLMOutput.
+        # Exceptions: propagated from backbone. Side effects: none beyond computation.
         if not fused_lm_head:
             if labels is not None:
                 kwargs["labels"] = labels
@@ -1699,6 +1961,14 @@ def add_fused_lm_head(
 
 
 def compute_flops_per_token(config: PretrainedConfig, seq_len: int) -> int:
+    # [FUNCTION DOC]
+    # Behavior: estimates training FLOPs per token as 3 times forward FLOPs. Per layer: attention projections
+    # (2*h*(q + 2 kv) dims, output projection) plus non-causal attention score terms (4 * heads * head_dim * seq_len);
+    # dense MLP 6*h*intermediate; for MoE configs (num_experts_per_tok present) layers whose index is divisible by
+    # decoder_sparse_step use routed experts (6*h*moe_intermediate per active expert plus 2*h*num_experts router, with
+    # num_experts from num_local_experts on transformers>=5.1) and others use the dense MLP. Adds 2*V*h for the LM head.
+    # head_dim falls back to hidden size over heads.
+    # Inputs: config, seq_len. Outputs: int. Exceptions: AttributeError for configs missing fields. Side effects: none.
     """
     Estimate training FLOPs per token for a causal language model (forward + backward).
 
@@ -1789,6 +2059,10 @@ _PEAK_FLOPS_BY_DEVICE = (
 
 
 def get_peak_flops(device_name: str, dtype: str) -> float | None:
+    # [FUNCTION DOC]
+    # Behavior: case-insensitive whole-word search of the device name against the ordered peak-FLOPs table (specific
+    # names first); returns the dtype entry or None.
+    # Inputs: device_name, dtype. Outputs: float or None. Exceptions: none. Side effects: none.
     """
     Get the theoretical dense accelerator peak FLOPs for a device and dtype.
 
@@ -1809,6 +2083,11 @@ def get_peak_flops(device_name: str, dtype: str) -> float | None:
 
 
 def get_peak_flops_per_device(accelerator: Accelerator, dtype: str) -> float | None:
+    # [FUNCTION DOC]
+    # Behavior: reads the CUDA device name for the accelerator device and looks up peak FLOPs; logs an info message
+    # when unknown.
+    # Inputs: accelerator, dtype. Outputs: float or None.
+    # Exceptions: errors from torch.cuda on non-CUDA devices. Side effects: info log.
     """
     Resolve the theoretical dense peak FLOPs for the local training device.
 
@@ -1837,6 +2116,10 @@ def compute_mfu(
     world_size: int,
     peak_flops_per_device: float,
 ) -> float:
+    # [FUNCTION DOC]
+    # Behavior: returns 100 * flops_per_token * tokens_per_second / (peak_flops_per_device * world_size).
+    # Inputs: flops_per_token, tokens_per_second, world_size, peak_flops_per_device. Outputs: float percent.
+    # Exceptions: ZeroDivisionError if peak or world size is zero. Side effects: none.
     """
     Compute Model FLOPs Utilization (MFU) as a percentage.
 
@@ -1861,6 +2144,10 @@ def compute_mfu(
 
 
 def adjusted_mfu(mfu: float, config: PretrainedConfig, seq_len: int) -> float:
+    # [FUNCTION DOC]
+    # Behavior: removes half of the attention-score FLOPs (layers * 3 * 2 * heads * head_dim * seq_len) from the
+    # per-token total and rescales mfu by the ratio of corrected to full FLOPs.
+    # Inputs: mfu, config, seq_len. Outputs: float percent. Exceptions: none. Side effects: none.
     """
     Apply a causal-masking correction to an MFU computed with [`compute_flops_per_token`].
 

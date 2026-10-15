@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Script that builds the "zen-image" single-image conversational test dataset (Zen of Python Q&A, one random
+# image per example) in several TRL dataset formats and optionally pushes them to the Hub.
+# Contents: a module-level Message feature schema (list of role/content string dicts), ScriptArguments and main.
+# Inputs: CLI flags --test_size, --push_to_hub, --repo_id.
+# Outputs: none returned.
+# Exceptions: propagates HfArgumentParser and datasets/Hub errors.
+# Side effects: none at import time beyond defining the schema; network uploads when pushing. Images come from
+# numpy's global RNG, which is not seeded, so regenerated images differ between runs.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +34,10 @@ Message = [{"content": Value("string"), "role": Value("string")}]
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of command-line options: test_size (float, default 0.1) test-split fraction; push_to_hub (bool,
+    # default False) whether to upload; repo_id (str, default "trl-internal-testing/zen-image") target repo.
+    # No methods; parsed by HfArgumentParser in the __main__ block.
     r"""
     Arguments for the script.
 
@@ -51,6 +65,19 @@ class ScriptArguments:
 
 
 def main(test_size, push_to_hub, repo_id):
+    # [FUNCTION DOC]
+    # Builds six 19-example conversational vision datasets and optionally pushes each as a named config.
+    # Behavior: for each format draws 19 random (height, width) pairs in [32, 64) and creates matching random
+    # uint8 RGB images, stored in an image column. Formats, in order: conversational_language_modeling (messages),
+    # conversational_prompt_only (prompt), conversational_prompt_completion (prompt, completion),
+    # conversational_preference (prompt, chosen, rejected), conversational_implicit_prompt_preference (chosen,
+    # rejected) and conversational_unpaired_preference (prompt, completion, boolean label). Datasets are cast with
+    # explicit Features (Message lists plus Image), split train/test without shuffling using test_size, and pushed
+    # under their format name as config_name when push_to_hub.
+    # Inputs: test_size (float), push_to_hub (bool), repo_id (str).
+    # Outputs: None.
+    # Exceptions: propagates datasets / Hub errors.
+    # Side effects: consumes numpy global RNG; network uploads when push_to_hub is true.
     # fmt: off
     sizes = np.random.randint(32, 64, size=(19, 2))
     data = {

@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Hugging Face Jobs launcher for async_grpo_harbor.py: inside one container it starts an OpenEnv Harbor server
+# (CPU, capture proxy published over a gradio tunnel), a vLLM server on one GPU, optionally warms the sandbox
+# template, downloads the training script and runs it on a second GPU, forwarding unknown CLI args to it.
+# Main contents: module constants (TRAIN_SCRIPT_URL, DATA_ROOT from env DATA_ROOT default /data, pinned
+# OPENENV_REVISION), module state (_children list of spawned processes, _stopping event), process helpers, HTTP
+# probes, server/vLLM start and wait functions, a tunnel supervisor thread, parse_args and main.
+# Import-time side effects: reads DATA_ROOT env var; creates the module-level list and threading.Event.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -95,6 +104,14 @@ _stopping = threading.Event()
 
 
 def _spawn(cmd: list[str], log_path: pathlib.Path | None, env: dict[str, str] | None = None) -> subprocess.Popen:
+    # [FUNCTION DOC]
+    # HELPER: Starts a child process in its own session/process group.
+    # Behavior: creates the log file's parent directory if a log path is given; launches cmd with stdout redirected to
+    # the log file (or inherited when log_path is None) and stderr merged into stdout; environment is os.environ
+    # overlaid with env. Registers the process in _children and prints a short launcher line.
+    # Inputs: cmd list, log_path or None, optional env overrides. Outputs: the Popen object.
+    # Exceptions: OSError if the executable or log file cannot be opened.
+    # Side effects: spawns a process, creates directories/files, appends to _children, prints.
     """Start a child in a process group so cleanup also stops its workers."""
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +128,13 @@ def _spawn(cmd: list[str], log_path: pathlib.Path | None, env: dict[str, str] | 
 
 
 def _stop_process(proc: subprocess.Popen) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Gracefully terminates a child's process group.
+    # Behavior: no-op if already exited; otherwise sends SIGTERM to the group (ignoring missing processes), waits up to
+    # 30 s, and on timeout sends SIGKILL and waits up to 5 s more.
+    # Inputs: proc (Popen). Outputs: none.
+    # Exceptions: subprocess.TimeoutExpired if still alive 5 s after SIGKILL.
+    # Side effects: signals and reaps processes.
     if proc.poll() is not None:
         return
     try:
@@ -128,16 +152,27 @@ def _stop_process(proc: subprocess.Popen) -> None:
 
 
 def _cleanup() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Sets _stopping (stopping the supervisor) and stops every child in reverse spawn order.
+    # Inputs: none. Outputs: none. Exceptions: as _stop_process. Side effects: kills child processes.
     _stopping.set()
     for proc in reversed(list(_children)):
         _stop_process(proc)
 
 
 def _handle_signal(signum: int, _frame: object) -> None:
+    # [FUNCTION DOC]
+    # HELPER: SIGTERM/SIGINT handler that raises SystemExit with code 128 plus the signal number, so the finally
+    # block in the entry point runs _cleanup.
+    # Inputs: signum, unused frame. Outputs: never returns. Exceptions: SystemExit always. Side effects: none.
     raise SystemExit(128 + signum)
 
 
 def _http_ok(url: str, timeout: float = 5.0) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if a GET to url answers with a 2xx status within timeout (default 5 s), False on URL or
+    # OS errors. Inputs: url, timeout. Outputs: bool. Exceptions: none caught beyond those (HTTP errors are URLError).
+    # Side effects: network request.
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             return 200 <= resp.status < 300
@@ -146,6 +181,10 @@ def _http_ok(url: str, timeout: float = 5.0) -> bool:
 
 
 def _http_json_has(url: str, key: str, timeout: float = 15.0) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: GETs url (timeout default 15 s), parses the body as JSON and returns whether key is in it; returns
+    # False on URL, OS or JSON decode errors.
+    # Inputs: url, key, timeout. Outputs: bool. Exceptions: none expected. Side effects: network request.
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             import json
@@ -156,6 +195,12 @@ def _http_json_has(url: str, key: str, timeout: float = 15.0) -> bool:
 
 
 def wait_for_public_proxy(log: pathlib.Path, capture_port: int, deadline_s: float = 420.0) -> str:
+    # [FUNCTION DOC]
+    # Behavior: polls every 5 s until deadline_s (default 420 s): reads the latest published capture URL from the server
+    # log, announcing when it changes; returns the URL once its /health JSON contains "status".
+    # Inputs: log path, capture_port, deadline_s. Outputs: public proxy URL string.
+    # Exceptions: RuntimeError on timeout, including the last 1500 chars of the log.
+    # Side effects: network probes, file reads, prints, sleeps.
     """Return the public URL after its health endpoint reaches the capture proxy."""
     started = time.monotonic()
     url: str | None = None
@@ -173,6 +218,9 @@ def wait_for_public_proxy(log: pathlib.Path, capture_port: int, deadline_s: floa
 
 
 def _serve_cmd(args: argparse.Namespace) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Builds the argv for "openenv harbor serve" with the dataset split, server port, capture port and gradio
+    # exposure. Inputs: args namespace. Outputs: list of strings. Exceptions: none. Side effects: none.
     return [
         "openenv", "harbor", "serve",
         "--dataset", args.split,
@@ -183,6 +231,11 @@ def _serve_cmd(args: argparse.Namespace) -> list[str]:
 
 
 def start_harbor_server(args: argparse.Namespace, log: pathlib.Path) -> str:
+    # [FUNCTION DOC]
+    # Behavior: spawns the Harbor server logging to log with MAX_CONCURRENT_ENVS set to max_inflight plus one (an
+    # extra metadata connection), then waits for and returns the verified public proxy URL.
+    # Inputs: args, log path. Outputs: URL string.
+    # Exceptions: RuntimeError from wait_for_public_proxy. Side effects: spawns a process, network probes.
     """Start the server and return its verified public proxy URL."""
     # The factory keeps one metadata connection in addition to its rollout sessions.
     _spawn(_serve_cmd(args), log, env={"MAX_CONCURRENT_ENVS": str(args.max_inflight + 1)})
@@ -190,6 +243,14 @@ def start_harbor_server(args: argparse.Namespace, log: pathlib.Path) -> str:
 
 
 def supervise_tunnel(args: argparse.Namespace, log: pathlib.Path, interval_s: float) -> None:
+    # [FUNCTION DOC]
+    # Behavior: background loop (returns immediately if interval_s is not positive). Every interval_s until _stopping is
+    # set, probes the published URL's /health; success resets the failure counter. After two consecutive failures,
+    # stops and removes every child whose args start with "openenv harbor serve", then (unless stopping) restarts the
+    # server via start_harbor_server and resets the counter; a RuntimeError is printed as a warning and the loop continues.
+    # Inputs: args, server log path, interval_s. Outputs: none.
+    # Exceptions: none propagated from restart failures.
+    # Side effects: kills/spawns server processes, mutates _children, network probes, prints.
     """Restart after two failed public health checks. Existing sessions may be lost."""
     if interval_s <= 0:
         return
@@ -219,6 +280,11 @@ def supervise_tunnel(args: argparse.Namespace, log: pathlib.Path, interval_s: fl
 
 
 def _published_url(log: pathlib.Path, capture_port: int) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns the last capture URL published in the server log or None.
+    # Behavior: None if the log does not exist; strips ANSI color codes, finds all "capture :<port> -> https://..." matches
+    # for capture_port and returns the last with trailing period/comma removed.
+    # Inputs: log path, capture_port. Outputs: str or None. Exceptions: none expected. Side effects: file read.
     """The most recent published URL in the server log, or None."""
     if not log.exists():
         return None
@@ -228,6 +294,11 @@ def _published_url(log: pathlib.Path, capture_port: int) -> str | None:
 
 
 def wait_for_vllm(url: str, proc: subprocess.Popen, log: pathlib.Path, deadline_s: float = 1200.0) -> None:
+    # [FUNCTION DOC]
+    # Behavior: polls every 5 s up to deadline_s (default 1200 s); if proc exited, raises with its return code and the
+    # last 2000 chars of the log; returns once /health answers 2xx (printing readiness).
+    # Inputs: base url, vLLM process, log path, deadline_s. Outputs: none.
+    # Exceptions: RuntimeError on process death or timeout. Side effects: network probes, prints, sleeps.
     """Block until vLLM answers /health, failing fast with its log if it died instead."""
     started = time.monotonic()
     while time.monotonic() - started < deadline_s:
@@ -243,6 +314,12 @@ def wait_for_vllm(url: str, proc: subprocess.Popen, log: pathlib.Path, deadline_
 
 
 def warm_sandbox_template(args: argparse.Namespace, vllm_url: str, logs: pathlib.Path) -> None:
+    # [FUNCTION DOC]
+    # Behavior: runs one serial "openenv harbor rollout" on task index 0 (n 1) with the model, split, harness and sandbox
+    # so the sandbox image is built before concurrent rollouts; waits for it, logging to logs/warm-template.log. A
+    # non-zero exit only prints warnings plus the last 800 chars of the log; success prints the elapsed time.
+    # Inputs: args, vllm_url, logs directory. Outputs: none.
+    # Exceptions: OSError on spawn failure. Side effects: spawns a process, sandbox usage, file writes, prints.
     """Warm task 0's sandbox image before concurrent rollouts can race its first build."""
     cmd = [
         "openenv", "harbor", "rollout",
@@ -268,6 +345,12 @@ def warm_sandbox_template(args: argparse.Namespace, vllm_url: str, logs: pathlib
 
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
+    # [FUNCTION DOC]
+    # Behavior: parses known launcher options (model, split, harness, sandbox, max in-flight, server/capture/vLLM ports,
+    # vLLM and train GPU devices, max model length, tool-call and reasoning parsers, training script URL, data root,
+    # --skip-warm, tunnel check interval with 0 disabling it) and returns leftover args for forwarding.
+    # Inputs: command line. Outputs: (Namespace, list of forwarded strings).
+    # Exceptions: SystemExit on bad args/--help. Side effects: may print usage.
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="Qwen/Qwen3.5-2B")
     p.add_argument("--split", default="AdithyaSK/data_agent_rl_environment_train")
@@ -290,6 +373,21 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: installs signal handlers; picks data_root (falls back to ./out with warnings if not a directory), creates
+    # logs dir and sets HF_HOME to data_root/hf-cache when mounted. Verifies openenv, vllm and git are on PATH, that
+    # E2B_API_KEY is set for the e2b sandbox, and that nvidia-smi reports at least 2 GPUs. Shallow-fetches the pinned
+    # OpenEnv revision into a fresh data_root/openenv-<uuid> checkout and builds a PYTHONPATH with its envs directory
+    # (prepended to any existing one). Starts the Harbor server and, if enabled, a daemon supervise_tunnel thread.
+    # Spawns vLLM serve (dev mode, tool calling, reasoning parser, thinking disabled, token ids, processed logprobs,
+    # NCCL weight transfer) on the vLLM device and waits for it; warms the template unless skipped; downloads the
+    # training script to ./async_grpo_harbor.py; builds a run name from HF_JOB_ID/JOB_ID/"local" plus a random suffix;
+    # runs the training script on the train device with server/vLLM/model/split/harness/sandbox/in-flight/run-name/
+    # output-dir args plus forwarded args; exits with its return code.
+    # Inputs: command line, environment. Outputs: none (process exits).
+    # Exceptions: RuntimeError on missing tools, credentials, GPUs, download failure, or server/vLLM startup failure;
+    # CalledProcessError from git; SystemExit always at the end.
+    # Side effects: spawns processes and threads, git clone, network downloads, file writes, environment mutation, prints.
     args, forwarded = parse_args()
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)

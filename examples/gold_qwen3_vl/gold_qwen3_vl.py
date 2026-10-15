@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Example script: GOLD distillation of a vision-language student (default Qwen3-VL-2B) from a VLM teacher (default
+# Qwen3-VL-8B) on GEOQA_R1V geometry questions whose answers are angles in degrees. Under the main guard: parses CLI
+# args (student/teacher names, lmbda 0.5, ULD toggle, vLLM toggle default on, vLLM mode colocate), loads both models
+# in bf16, freezes student params outside "language_model", uses a LoRA config on language-model q/k/v projections,
+# filters images to under 512x512, converts to RGB, builds prompt/completion conversations, holds out 5% for eval,
+# configures GOLDConfig (run name encodes student/teacher/loss, 100 steps, eval every 25, wandb reporting), trains,
+# saves and calls trainer.end().
+# Main contents: SYSTEM_PROMPT and helpers normalize_solution, make_conversation, filter_big_images, convert_to_rgb.
+# Import-time side effects: none beyond imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +63,10 @@ SYSTEM_PROMPT = "Answer with a single number followed by the ° symbol."
 
 
 def normalize_solution(solution):
+    # [FUNCTION DOC]
+    # HELPER: Converts the solution to a string, removes answer tags, strips whitespace and appends a degree sign when
+    # the result is non-empty and lacks one.
+    # Inputs: solution (any). Outputs: string. Exceptions: none. Side effects: none.
     solution = str(solution).replace("<answer>", "").replace("</answer>", "").strip()
     if solution and not solution.endswith("°"):
         solution = f"{solution}°"
@@ -59,6 +74,11 @@ def normalize_solution(solution):
 
 
 def make_conversation(example):
+    # [FUNCTION DOC]
+    # Behavior: builds a "prompt" of a system message (SYSTEM_PROMPT text) and a user message (image placeholder then the
+    # problem text), a "completion" with one assistant text message holding the normalized solution, and passes "image".
+    # Inputs: example with "problem", "solution", "image". Outputs: dict with "prompt", "completion", "image".
+    # Exceptions: KeyError on missing columns. Side effects: none.
     """Convert GEOQA_R1V row into the chat format expected by TRL VLM trainers."""
     return {
         "prompt": [
@@ -85,11 +105,18 @@ def make_conversation(example):
 
 
 def filter_big_images(example):
+    # [FUNCTION DOC]
+    # HELPER: Filter predicate keeping rows whose image width and height are both strictly less than 512.
+    # Inputs: example with a PIL "image". Outputs: bool. Exceptions: none expected. Side effects: none.
     image = example["image"]
     return image.size[0] < 512 and image.size[1] < 512
 
 
 def convert_to_rgb(example):
+    # [FUNCTION DOC]
+    # HELPER: Converts the example's image to RGB mode when it is not already, storing it back.
+    # Inputs: example with PIL "image". Outputs: the same example dict. Exceptions: none expected.
+    # Side effects: mutates the input dict.
     image = example["image"]
     if image.mode != "RGB":
         image = image.convert("RGB")

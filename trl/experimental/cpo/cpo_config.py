@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental CPO trainer (CPO, SimPO, AlphaPO and related preference losses).
+# Main content: CPOConfig. Used by cpo_trainer.CPOTrainer. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +24,14 @@ from ...trainer.base_config import _BaseConfig
 
 @dataclass
 class CPOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Training-arguments dataclass extending trl's _BaseConfig (itself TrainingArguments-based) with CPO fields.
+    # Key fields and defaults: learning_rate 1e-6, max_length 1024, max_completion_length None, beta 0.1,
+    # label_smoothing 0.0, loss_type "sigmoid" (also hinge, ipo, simpo, alphapo), disable_dropout True, cpo_alpha 1.0
+    # (weight of the NLL/BC term), simpo_gamma 0.5 (target reward margin), alpha 0.0 (AlphaPO reward-shaping exponent),
+    # generate_during_eval False, is_encoder_decoder None, model_init_kwargs None, trust_remote_code False,
+    # dataset_num_proc None.
+    # Consumed by CPOTrainer for loss computation, tokenization and model loading.
     r"""
     Configuration class for the [`experimental.cpo.CPOTrainer`].
 
@@ -173,6 +185,12 @@ class CPOConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: AlphaPO shorthand: when loss_type is "alphapo", rewrite it to "simpo" and set cpo_alpha to 0.0; then run
+        # the parent post-init.
+        # Inputs: none. Outputs: none.
+        # Exceptions: those of the parent validation.
+        # Side effects: mutates loss_type and cpo_alpha.
         # Syntactic sugar for AlphaPO: set loss_type to "simpo" and cpo_alpha to 0.0
         if self.loss_type == "alphapo":
             self.loss_type = "simpo"

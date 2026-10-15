@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Pytest conftest shared by the whole test suite: process-wide hooks and autouse fixtures that keep tests
+# isolated (memory cleanup, environment restoration, model-revision overrides, CPU fallback).
+# Contents: _DropLoadReport log filter, pytest_runtest_makereport hook, MODEL_REVISIONS dict and autouse fixtures
+# apply_model_revisions, force_use_cpu_without_accelerator, restore_mixed_precision_env, cleanup_gpu,
+# cleanup_vllm_dist_env, undo_liger_kernel_patching.
+# Inputs: none. Outputs: none.
+# Exceptions: none at import.
+# Side effects at import: attaches a _DropLoadReport filter to the transformers.modeling_utils,
+# transformers.modeling_layers and transformers.integrations.peft loggers; imports torch and transformers.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,7 +43,14 @@ from transformers.utils import is_liger_kernel_available, is_peft_available, is_
 # this fires on nearly every model load and floods the test output. It is emitted through `logging` at WARNING
 # level from three loggers; we drop only these records, keeping all other warnings visible.
 class _DropLoadReport(logging.Filter):
+    # [CLASS DOC]
+    # HELPER: logging.Filter subclass that suppresses transformers "LOAD REPORT" warning records.
+    # State: none. Construction: no arguments. Used by attaching an instance to specific transformers loggers.
     def filter(self, record):
+        # [FUNCTION DOC]
+        # HELPER: Decide whether a log record is emitted.
+        # Inputs: record (logging.LogRecord). Outputs: False if the formatted message contains "LOAD REPORT", else True.
+        # Exceptions: none. Side effects: none.
         return "LOAD REPORT" not in record.getMessage()
 
 
@@ -42,6 +60,14 @@ for _logger_name in ("transformers.modeling_utils", "transformers.modeling_layer
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
+    # [FUNCTION DOC]
+    # Hookwrapper around report creation that frees memory held by failed-test tracebacks.
+    # Behavior: yields to let the report be built; afterwards, only for the "call" phase with an exception, clears
+    # frame locals of the main traceback, then walks the exception graph (depth-first over __context__ and
+    # __cause__, skipping None and already-seen ids) clearing each traceback's frames and setting __traceback__ to None.
+    # Inputs: item (pytest Item), call (CallInfo).
+    # Outputs: none. Exceptions: none raised.
+    # Side effects: mutates exception objects (drops tracebacks and frame locals) so later gc can release CUDA memory.
     """Clear traceback frame locals after a failed test to release CUDA tensor references.
 
     When a test fails (especially with OOM), the exception traceback holds references to every local variable in every
@@ -94,6 +120,15 @@ MODEL_REVISIONS = {
 
 @pytest.fixture(autouse=True)
 def apply_model_revisions(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture that injects a Hub revision for model ids listed in MODEL_REVISIONS.
+    # Behavior: no-op when MODEL_REVISIONS is empty (the default). Otherwise monkeypatches from_pretrained on
+    # AutoConfig, AutoModelForCausalLM, AutoModelForSequenceClassification, AutoProcessor, AutoTokenizer and the
+    # base config/model/tokenizer/processor classes with wrappers that add the revision kwarg; when PEFT is
+    # installed also patches AutoPeftModelForCausalLM.from_pretrained, PeftModel.from_pretrained (adapter id is the
+    # second argument) and PeftModel.load_adapter (instance method).
+    # Inputs: monkeypatch fixture. Outputs: none (fixture value None).
+    # Exceptions: none. Side effects: patches are undone by monkeypatch at test teardown.
     """Auto-inject revision parameter for models defined in MODEL_REVISIONS."""
     if not MODEL_REVISIONS:
         return
@@ -111,11 +146,20 @@ def apply_model_revisions(monkeypatch):
     )
 
     def create_classmethod_wrapper(original_classmethod):
+        # [FUNCTION DOC]
+        # HELPER: Build a classmethod replacement for a from_pretrained classmethod.
+        # Inputs: original_classmethod (bound classmethod). Outputs: a new classmethod whose wrapper, when the model id
+        # is in MODEL_REVISIONS and no revision kwarg is given, sets revision and removes any _commit_hash kwarg before
+        # calling the original function. Exceptions: none. Side effects: none.
         # Extract the underlying function from the classmethod
         original_func = original_classmethod.__func__
 
         @wraps(original_func)
         def wrapper(cls, pretrained_model_name_or_path, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Wrapped from_pretrained; injects the overridden revision (and drops _commit_hash) for listed ids, then
+            # delegates. Inputs: cls, pretrained_model_name_or_path, extra args/kwargs. Outputs: the original's return
+            # value. Exceptions: whatever the original raises. Side effects: mutates its kwargs dict only.
             # Direct lookup: only inject if model_id is in the override dict
             if pretrained_model_name_or_path in MODEL_REVISIONS:
                 if "revision" not in kwargs:
@@ -132,8 +176,15 @@ def apply_model_revisions(monkeypatch):
         return classmethod(wrapper)
 
     def create_method_wrapper(original_method):
+        # [FUNCTION DOC]
+        # HELPER: Build a wrapper for an instance method taking a model id (used for PeftModel.load_adapter).
+        # Inputs: original_method. Outputs: wrapper function that injects revision for listed ids when absent.
+        # Exceptions: none. Side effects: none.
         @wraps(original_method)
         def wrapper(self, model_id, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Injects revision from MODEL_REVISIONS for listed model_id when not given, then calls the original.
+            # Inputs: self, model_id, args/kwargs. Outputs: original return value. Exceptions: propagated. Side effects: none.
             if model_id in MODEL_REVISIONS and "revision" not in kwargs:
                 kwargs["revision"] = MODEL_REVISIONS[model_id]
             return original_method(self, model_id, *args, **kwargs)
@@ -157,10 +208,18 @@ def apply_model_revisions(monkeypatch):
         monkeypatch.setattr(cls, "from_pretrained", create_classmethod_wrapper(cls.from_pretrained))
 
     def create_peft_classmethod_wrapper(original_classmethod):
+        # [FUNCTION DOC]
+        # HELPER: Build a classmethod wrapper for PeftModel.from_pretrained, whose adapter id is the second positional
+        # argument after the base model. Inputs: original_classmethod. Outputs: new classmethod.
+        # Exceptions: none. Side effects: none.
         original_func = original_classmethod.__func__
 
         @wraps(original_func)
         def wrapper(cls, model, model_id, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Injects revision for listed model_id when absent and delegates to the original function.
+            # Inputs: cls, model (base model), model_id, args/kwargs. Outputs: original return value.
+            # Exceptions: propagated. Side effects: none.
             if model_id in MODEL_REVISIONS and "revision" not in kwargs:
                 kwargs["revision"] = MODEL_REVISIONS[model_id]
             return original_func(cls, model, model_id, *args, **kwargs)
@@ -184,6 +243,13 @@ def apply_model_revisions(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def force_use_cpu_without_accelerator(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture forcing use_cpu on every TRL config when no accelerator exists.
+    # Behavior: returns immediately if transformers' torch_device is set and not "cpu". Otherwise monkeypatches
+    # _BaseConfig.__post_init__ with a version that sets use_cpu to True before calling the original, avoiding the
+    # bf16-unsupported error raised by TrainingArguments validation.
+    # Inputs: monkeypatch. Outputs: none. Exceptions: none.
+    # Side effects: class-level patch, reverted at teardown.
     """Force `use_cpu=True` on all TRL configs when no accelerator is available.
 
     TRL configs default `bf16` to `True` (see `_BaseConfig.__post_init__`), which makes
@@ -202,6 +268,9 @@ def force_use_cpu_without_accelerator(monkeypatch):
     original_post_init = _BaseConfig.__post_init__
 
     def patched_post_init(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets use_cpu to True on the config instance and then runs the original _BaseConfig.__post_init__.
+        # Inputs: self (config). Outputs: None. Exceptions: those of the original. Side effects: mutates self.
         self.use_cpu = True
         original_post_init(self)
 
@@ -210,6 +279,10 @@ def force_use_cpu_without_accelerator(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def restore_mixed_precision_env(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture that sets ACCELERATE_MIXED_PRECISION to its current value (or "no" when unset) via
+    # monkeypatch so that any value leaked by TrainingArguments during the test is restored at teardown.
+    # Inputs: monkeypatch. Outputs: none. Exceptions: none. Side effects: env var set for the test, restored after.
     """
     Restore the mixed precision that `transformers.TrainingArguments` publishes process-wide.
 
@@ -230,6 +303,10 @@ def restore_mixed_precision_env(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def cleanup_gpu():
+    # [FUNCTION DOC]
+    # HELPER: Autouse generator fixture that, after each test, runs gc.collect and, when CUDA or XPU is available,
+    # synchronizes the device and empties its memory cache.
+    # Inputs: none. Outputs: yields None. Exceptions: none expected. Side effects: frees cached accelerator memory.
     """
     Automatically cleanup accelerator memory after each test.
 
@@ -249,6 +326,14 @@ def cleanup_gpu():
 
 @pytest.fixture(autouse=True)
 def cleanup_vllm_dist_env():
+    # [FUNCTION DOC]
+    # HELPER: Autouse generator fixture that tears down distributed state left by vLLM colocate mode.
+    # Behavior: before the test snapshots RANK, LOCAL_RANK, WORLD_SIZE, MASTER_ADDR, MASTER_PORT (None if unset);
+    # after the test, if torch.distributed is initialized, calls vLLM's cleanup_dist_env_and_memory (imported
+    # lazily, so vLLM must be installed in that case); then restores each env var, removing it if it was unset.
+    # Inputs: none. Outputs: yields None.
+    # Exceptions: ImportError if a process group exists but vLLM is not installed.
+    # Side effects: destroys process groups and mutates os.environ.
     """
     Destroy the torch.distributed process group left behind by vLLM colocate mode after each test.
 
@@ -280,6 +365,16 @@ def cleanup_vllm_dist_env():
 
 @pytest.fixture(autouse=True)
 def undo_liger_kernel_patching(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Autouse generator fixture that reverts module-level rebinding performed by Liger Kernel.
+    # Behavior: if liger_kernel is not available just yields. Otherwise wraps
+    # liger_kernel.transformers._apply_liger_kernel_to_instance (via monkeypatch) so that, on each call, every
+    # already-imported transformers.models.*.modeling_* module has its namespace dict snapshotted once (first
+    # snapshot wins) before delegating. After the test, updates each snapshotted module's namespace with the saved
+    # values, restoring the original names.
+    # Inputs: monkeypatch. Outputs: yields None. Exceptions: none.
+    # Side effects: mutates transformers modeling module globals at teardown. Names newly added by Liger are not
+    # removed, only overwritten ones are restored.
     """
     Restore the transformers modeling modules that Liger Kernel patches process-wide.
 
@@ -307,6 +402,10 @@ def undo_liger_kernel_patching(monkeypatch):
     snapshots = {}
 
     def apply_to_instance_and_snapshot(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Snapshot transformers modeling modules then call the original Liger apply function.
+        # Inputs: args/kwargs forwarded unchanged. Outputs: original return value.
+        # Exceptions: propagated. Side effects: adds entries to the enclosing snapshots dict.
         # Liger imports the modeling modules it patches inside the patch function, but a module can only be patched
         # if the model being patched already uses it, so it is imported by now.
         for name, module in list(sys.modules.items()):

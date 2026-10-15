@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental Online DPO trainer.
+# Defines OnlineDPOConfig, a _BaseConfig (TrainingArguments-derived) subclass adding generation, loss, reward-model and
+# vLLM settings. Parsed by HfArgumentParser for CLI use. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +26,17 @@ from ...trainer.base_config import _BaseConfig
 
 @dataclass
 class OnlineDPOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass of Online DPO hyperparameters consumed by OnlineDPOTrainer.
+    # Key groups: loss (beta, loss_type sigmoid/ipo, missing_eos_penalty, disable_dropout), lengths (max_new_tokens 64,
+    # max_length 512), sampling (temperature 0.9, top_p, top_k, min_p, repetition_penalty, cache_implementation,
+    # generation_kwargs), vLLM (use_vllm, vllm_mode colocate/server, server address/timeout/group port, colocate memory and
+    # TP size, sleep mode, structured outputs regex, model impl), model loading (model_init_kwargs, trust_remote_code),
+    # reward_model_path and reward_weights, ds3_gather_for_generation.
+    # Overrides TrainingArguments defaults for learning_rate (5e-7) and remove_unused_columns (False); other overridden
+    # defaults listed in the docstring come from _BaseConfig. model_init_kwargs is added to _VALID_DICT_FIELDS so it can be
+    # given as a JSON string.
+    # Note: beta is declared as a list defaulting to [0.1] and becomes a float after __post_init__ when one value is given.
     r"""
     Configuration class for the [`experimental.online_dpo.OnlineDPOTrainer`].
 
@@ -376,6 +392,14 @@ class OnlineDPOConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs base post-init, then normalizes and sanity-checks fields.
+        # Behavior: if beta has a length of exactly 1, replaces it by its single float element (longer lists stay as per-epoch
+        # schedules); warns (stacklevel 3) when max_new_tokens is greater than or equal to max_length, since prompts would be
+        # truncated away in the forward pass.
+        # Inputs: none. Outputs: none.
+        # Exceptions: those raised by the base post-init.
+        # Side effects: mutates beta; may emit a UserWarning.
         super().__post_init__()
 
         if hasattr(self.beta, "__len__") and len(self.beta) == 1:

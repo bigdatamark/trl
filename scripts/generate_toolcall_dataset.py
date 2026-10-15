@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Script that builds the small "toolcall" test dataset of tool-calling conversations and optionally pushes it to the Hub.
+# Contents: ScriptArguments (CLI options) and main (builds two dataset configs); run as a script, parsing CLI args
+# with HfArgumentParser.
+# Inputs: CLI flags --test_size, --push_to_hub, --repo_id.
+# Outputs: none returned; datasets are pushed only when push_to_hub is set.
+# Exceptions: propagates HfArgumentParser and datasets/Hub errors.
+# Side effects: none at import time (main runs only under the __main__ guard); network upload when pushing.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +30,13 @@ from transformers.utils import get_json_schema
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of command-line options for this script, parsed with HfArgumentParser.
+    # Attributes: test_size (float, default 0.1) fraction placed in the test split; push_to_hub (bool, default False)
+    # whether to upload; repo_id (str, default "trl-internal-testing/toolcall") target dataset repo.
+    # No methods; no inheritance beyond object.
+    # KNOWN ISSUE: the docstring says repo_id defaults to "trl-internal-testing/zen", but the field default is
+    # "trl-internal-testing/toolcall".
     r"""
     Arguments for the script.
 
@@ -48,8 +64,24 @@ class ScriptArguments:
 
 
 def main(test_size, push_to_hub, repo_id):
+    # [FUNCTION DOC]
+    # Builds the 8-example tool-calling datasets and optionally pushes them.
+    # Behavior: defines eight fictitious tool functions (timer, current time, air quality, music, weather forecast,
+    # light control, reminder, wind) and replaces each with its JSON schema from transformers get_json_schema.
+    # Builds a "language_modeling" dataset with a messages column (user turn, assistant tool call, tool result,
+    # final assistant answer) and a tools column (list of schemas available per example), and a "preference"
+    # dataset with prompt (user turn), chosen (correct tool call and answer), rejected (wrong argument, no tool
+    # call, wrong tool or wrong answer) and tools columns. Both use mixed-type JSON encoding, are split into
+    # train/test without shuffling using test_size, and each is pushed as its own config to repo_id if push_to_hub.
+    # Inputs: test_size (float), push_to_hub (bool), repo_id (str).
+    # Outputs: None.
+    # Exceptions: propagates datasets / Hub errors.
+    # Side effects: network upload to the Hub when push_to_hub is true.
     # Fictitious functions to simulate tool calls
     def start_timer(duration: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Fictitious tool used only for its signature/docstring to produce a JSON schema; returns duration unchanged.
+        # Inputs: duration (int seconds). Outputs: the same int. Exceptions: none. Side effects: none.
         """
         Starts a timer for the specified duration in seconds.
 
@@ -62,6 +94,9 @@ def main(test_size, push_to_hub, repo_id):
         return duration
 
     def get_current_time(location: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Fictitious tool for schema generation; ignores location and returns the fixed string "06:22:48".
+        # Inputs: location (str). Outputs: str. Exceptions: none. Side effects: none.
         """
         Returns the current time in the specified location.
 
@@ -74,6 +109,9 @@ def main(test_size, push_to_hub, repo_id):
         return "06:22:48"
 
     def get_air_quality_index(location: str) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Fictitious tool for schema generation; ignores location and returns the constant 53.
+        # Inputs: location (str). Outputs: int. Exceptions: none. Side effects: none.
         """
         Returns the air quality index for the specified location.
 
@@ -86,6 +124,9 @@ def main(test_size, push_to_hub, repo_id):
         return 53
 
     def play_music(title: str, artist: str) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Fictitious tool for schema generation; ignores its inputs and returns a dict with status "Playing".
+        # Inputs: title (str), artist (str). Outputs: dict. Exceptions: none. Side effects: none.
         """
         Plays music by the specified title and artist.
 
@@ -99,6 +140,10 @@ def main(test_size, push_to_hub, repo_id):
         return {"status": "Playing"}
 
     def get_weather_forecast(city: str, date: str) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Fictitious tool for schema generation; returns a fixed forecast dict (temperature 22, condition
+        # "partly cloudy") regardless of inputs.
+        # Inputs: city (str), date (str). Outputs: dict. Exceptions: none. Side effects: none.
         """
         Returns the weather forecast for the specified city and date.
 
@@ -112,6 +157,9 @@ def main(test_size, push_to_hub, repo_id):
         return {"temperature": 22, "condition": "partly cloudy"}
 
     def control_light(room: str, state: str) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Fictitious tool for schema generation; returns a dict whose state key echoes the requested state.
+        # Inputs: room (str, ignored), state (str). Outputs: dict. Exceptions: none. Side effects: none.
         """
         Controls the light in the specified room.
 
@@ -125,6 +173,9 @@ def main(test_size, push_to_hub, repo_id):
         return {"state": state}
 
     def create_reminder(time: str, note: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Fictitious tool for schema generation; returns a fixed confirmation sentence about calling mom at 7 PM.
+        # Inputs: time (str), note (str), both ignored. Outputs: str. Exceptions: none. Side effects: none.
         """
         Creates a reminder for the specified time and note.
 
@@ -138,6 +189,9 @@ def main(test_size, push_to_hub, repo_id):
         return "I'll remind you to call mom at 7 PM."
 
     def get_wind_conditions(city: str, unit: str) -> tuple[int, str]:
+        # [FUNCTION DOC]
+        # HELPER: Fictitious tool for schema generation; returns the fixed pair 14 and "NW".
+        # Inputs: city (str), unit (str), both ignored. Outputs: tuple of int and str. Exceptions: none. Side effects: none.
         """
         Returns the wind conditions for the specified city.
 

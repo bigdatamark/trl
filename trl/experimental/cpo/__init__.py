@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Experimental CPO (Contrastive Preference Optimization) package.
+# Exports CPOConfig and CPOTrainer, imported eagerly from cpo_config and cpo_trainer.
+# No lazy-import behavior; no side effects beyond submodule imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

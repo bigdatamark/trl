@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Dataset preparation script: converts Anthropic/hh-rlhf (helpful-base subset, all splits) from raw "Human:/Assistant:"
+# transcripts into TRL's conversational preference format (prompt, chosen, rejected) and optionally pushes it with a
+# dataset card (default trl-lib/hh-rlhf-helpful-base). Original columns are kept and overwritten where names match.
+# Main contents: ScriptArguments, common_start, extract_dialogue, model_card. Import-time side effects: builds the
+# ModelCard object.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +29,10 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI options parsed by HfArgumentParser: push_to_hub (default False), repo_id (target Hub
+    # dataset repo), dataset_num_proc (worker count for map/filter, default None). No methods; plain data holder.
+    # Side effects: none.
     r"""
     Arguments for the script.
 
@@ -47,6 +58,14 @@ class ScriptArguments:
 
 
 def common_start(str1: str, str2: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the longest common prefix of two strings by walking them in lockstep until characters differ.
+    # Inputs: str1, str2. Outputs: prefix string.
+    # Exceptions: ValueError from strict zip if the strings have different lengths and one is a prefix of the other
+    # (the loop reaches the end of the shorter string without a mismatch).
+    # KNOWN ISSUE: strict zipping makes the function raise instead of returning the shorter string when one input is a
+    # prefix of the other (or when they only differ in length after full agreement).
+    # Side effects: none.
     # Zip the two strings and iterate over them together
     common_chars = []
     for c1, c2 in zip(str1, str2, strict=True):
@@ -59,6 +78,16 @@ def common_start(str1: str, str2: str) -> str:
 
 
 def extract_dialogue(example: str) -> list[dict[str, str]]:
+    # [FUNCTION DOC]
+    # Behavior: computes the common prefix of chosen and rejected; if it does not end with the assistant marker
+    # (two newlines then "Assistant: "), truncates it at the last such marker and re-appends the marker. Chosen/rejected
+    # replies are the remainders after the prefix. Removes the trailing marker from the prefix, splits it on
+    # Human/Assistant markers (keeping delimiters), drops the leading empty piece, and pairs marker/content into messages
+    # (user for Human, assistant otherwise). Chosen and rejected become single assistant messages.
+    # Inputs: example dict with "chosen" and "rejected" strings (annotated as str, but actually a dict row).
+    # Outputs: dict with "prompt" (list of messages), "chosen", "rejected".
+    # Exceptions: ValueError via common_start (see above); IndexError on malformed transcripts.
+    # Side effects: none.
     # Extract the prompt, which corresponds to the common start of the chosen and rejected dialogues
     prompt_text = common_start(example["chosen"], example["rejected"])
 

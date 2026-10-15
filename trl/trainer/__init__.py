@@ -1,3 +1,12 @@
+# [PACKAGE DOC]
+# Package trl.trainer: the stable TRL trainers and their configs (SFT, DPO, GRPO, KTO, Reward, RLOO,
+# Distillation), ModelConfig, training callbacks (BEMACallback, LogCompletionsCallback, RichProgressCallback,
+# SyncRefModelCallback, WeaveCallback) and a few utilities (add_fused_lm_head, disable_dropout_in_model,
+# ensure_master_addr_port, get_peft_config, get_quantization_config).
+# Lazy imports: outside TYPE_CHECKING the package's sys.modules entry is replaced with a _LazyModule over
+# _import_structure, so each submodule (and torch/transformers-heavy deps) loads only on first attribute
+# access. Side effects on import: replaces its own sys.modules entry.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

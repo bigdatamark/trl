@@ -1,3 +1,20 @@
+# [MODULE DOC]
+# Script that builds and publishes a tiny randomly initialized Qwen2_5_VLForConditionalGeneration checkpoint for tests.
+# Reference checkpoint: Qwen/Qwen2.5-VL-3B-Instruct.
+# Behavior: loads the reference processor and generation config; builds a config with a 2-layer, hidden size 16,
+# 4-head (2 KV-head) text model with default mrope rope_scaling (sections 1,1,0) and layer_types cleared, a
+# 2-block vision tower (hidden 16, 4 heads, full attention at block 1, out_hidden_size 16), and also sets the
+# root-level rope_scaling, num_hidden_layers, hidden_size and num_attention_heads; instantiates the model in
+# bfloat16, runs the shared smoke test, dtype-pattern check and config diff, then pushes as the tiny variant.
+# Inputs: none programmatic; command-line flags are parsed inside the shared push_to_hub helper of the
+# _common module (e.g. --create-pr). Requires network access to the Hugging Face Hub and write credentials.
+# Outputs: none returned; prints a config diff vs the reference checkpoint and status messages.
+# Exceptions: propagates errors from the version check, Hub downloads, the smoke test and the dtype check.
+# Side effects (all at import/run time, since the whole script is top-level code): checks the installed
+# transformers version, seeds RNGs, downloads the reference config/processor from the Hub, and uploads
+# the tiny model to the trl-internal-testing organization unless the repo already exists.
+# Contents: no functions or classes; meant to be run as a module (python -m) from the generate_tiny_models package.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

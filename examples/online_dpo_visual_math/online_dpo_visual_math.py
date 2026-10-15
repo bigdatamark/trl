@@ -1,3 +1,18 @@
+# [MODULE DOC]
+# Example training script: experimental Online DPO for vision-language models on lmms-lab/multimodal-open-r1-8k-verified,
+# judging pairs of sampled completions with think_format_reward and accuracy_reward instead of a reward model.
+# Behavior (only under the main guard): parses ScriptArguments, OnlineDPOConfig and ModelConfig; forces reentrant
+# gradient checkpointing; builds model kwargs (revision, attention implementation, dtype, use_cache disabled when
+# gradient checkpointing, quantization only when set); resolves the model class from the first entry of
+# config.architectures in transformers and loads it; reward model/processor are set to None (the
+# reward_model_path CLI arg is ignored); loads the processor and sets its tokenizer to left padding with eos as pad
+# when missing; builds the dataset like the GRPO visual example (100-row test split with seed 42, system+user
+# prompt plus image column, drop images 512 pixels or larger, convert to RGB); builds OnlineDPOTrainer with the
+# processor and optional PEFT; when eval is enabled, adds a LogCompletionsCallback over 8 prompts with a sampling
+# GenerationConfig (max_new_tokens, temperature from args); trains, saves, optionally pushes, calls end.
+# Inputs: CLI args. Outputs: trained model in output_dir. Exceptions: propagated. Side effects: downloads, training,
+# file writes, optional Hub upload, optional vLLM usage. Importing has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -144,6 +159,10 @@ if __name__ == "__main__":
     )
 
     def make_conversation(example):
+        # [FUNCTION DOC]
+        # HELPER: Map function building a system+user conversational prompt from problem and passing through image.
+        # Inputs: example (dict with problem, image). Outputs: dict with prompt and image. Exceptions: KeyError if missing.
+        # Side effects: none.
         # Create conversational format that OnlineDPOTrainer expects
         prompt = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -155,12 +174,19 @@ if __name__ == "__main__":
 
     # Filter big images (from GRPO pattern)
     def filter_big_images(example):
+        # [FUNCTION DOC]
+        # HELPER: Filter predicate keeping rows whose image width and height are both under 512 pixels.
+        # Inputs: example (dict with PIL image). Outputs: bool. Exceptions: none expected. Side effects: none.
         image = example["image"]
         return image.size[0] < 512 and image.size[1] < 512
 
     dataset = dataset.filter(filter_big_images)
 
     def convert_to_rgb(example):
+        # [FUNCTION DOC]
+        # HELPER: Map function converting the row's image to RGB mode when needed.
+        # Inputs: example. Outputs: the same example with image replaced. Exceptions: PIL errors propagate.
+        # Side effects: mutates the example dict.
         image = example["image"]
         if image.mode != "RGB":
             image = image.convert("RGB")

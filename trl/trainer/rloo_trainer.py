@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Implements RLOOTrainer, the online RL trainer for REINFORCE Leave-One-Out (RLOO) on causal LMs and VLMs.
+# Main contents: the RewardFunc type alias (model id string, PreTrainedModel, or callable returning a list of
+# floats or None) and the RLOOTrainer class (a transformers.Trainer subclass via _BaseTrainer) that samples
+# num_generations completions per prompt, scores them with reward functions, computes leave-one-out
+# baselines/advantages (optionally with a sequence-level KL penalty against a reference model), and optimizes a
+# clipped sequence-level policy-gradient loss.
+# Generation backends: vLLM (colocate or server, via VLLMGeneration), transformers continuous batching, or plain
+# transformers generate.
+# Fits in the package alongside GRPOTrainer; much logic is deliberately duplicated with GRPO (see repo guidance).
+# Import-time side effects: optional imports of peft, trackio and wandb when available; creates a module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -109,6 +121,20 @@ RewardFunc = str | PreTrainedModel | Callable[..., list[float | None]]
 
 
 class RLOOTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer for RLOO (https://huggingface.co/papers/2402.14740). Inherits _BaseTrainer (model-card helper) ->
+    # transformers.Trainer.
+    # Key state: reward_funcs / reward_func_names / reward_processing_classes / reward_weights; ref_model (None when
+    # beta is 0 or when PEFT, where the adapter is disabled or a "ref" adapter is used); generation settings
+    # (temperature, top_p, top_k, min_p, repetition_penalty, eos_token_ids, generation_config/generation_kwargs or
+    # vllm_generation); epsilon_low/epsilon_high for clipping; _step (micro-step counter); _buffered_inputs (cached
+    # generation batch split into steps_per_generation slices); _metrics per mode; _logs deques for completion tables;
+    # _pending_extra_logs / _pending_metrics filled by reward functions.
+    # Flow: get_train_dataloader yields a generation batch (per-device batch * steps_per_generation) with prompts
+    # repeated num_generations times by RepeatSampler; _prepare_inputs generates and scores once every
+    # steps_per_generation * num_iterations steps via _generate_and_score_completions, buffers slices, and returns
+    # one slice per step; compute_loss/_compute_loss evaluates the clipped loss; log averages and emits metrics and
+    # completion tables.
     """
     Trainer for the Reinforce Leave One Out (RLOO) method. This algorithm was initially proposed in the paper [Back to
     Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in
@@ -255,6 +281,57 @@ class RLOOTrainer(_BaseTrainer):
         quantization_config: "BitsAndBytesConfig | None" = None,
         peft_config: "PeftConfig | None" = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: builds the full trainer state. Steps:
+        # 1. If args is None, creates RLOOConfig with output dir "<model-name>-RLOO". Seeds with args.seed before model creation.
+        # 2. Model: if a string, loads with create_model_from_path using a copy of model_init_kwargs plus
+        #    quantization_config (error if given in both places), device_map None under MULTI_GPU/DEEPSPEED, and
+        #    trust_remote_code default; records revision. If an instance, warns that model_init_kwargs/quantization_config
+        #    are ignored. Detects quantized models via is_loaded_in_4bit/8bit.
+        # 3. Processing class: defaults to AutoProcessor with left padding/truncation. Continuous batching is rejected for
+        #    processors (multimodal). Sets _tokenizer and _is_vlm (TypeError for other types). For VLMs enables
+        #    ddp_find_unused_parameters unless set or reentrant checkpointing. Pad token defaults to eos; mirrors pad id
+        #    onto model config and generation config. eos_token_ids = tokenizer eos plus all eos ids from the model
+        #    generation config.
+        # 4. PEFT: with peft_config, requires peft installed, a PeftConfig, and a non-PEFT model; under ZeRO-3 with a
+        #    non-quantized model disables adapter dtype autocast; rejects prefix tuning with peft<=0.17.1 and a device
+        #    map; wraps with get_peft_model. With an existing PEFT model, copies the "default" adapter into a frozen "ref"
+        #    adapter, except for LoRA target_parameters on 0.17<=peft<0.20 (warns; base model used as reference).
+        #    PEFT + ZeRO-3 + gradient checkpointing forces use_reentrant True (warns if user set False). PEFT + gradient
+        #    checkpointing enables input grads. Quantized models cast trainable non-DoRA-magnitude params to bf16.
+        # 5. Reward functions: wraps a single one in a list; string entries are loaded as
+        #    AutoModelForSequenceClassification with num_labels 1; names come from the model id or callable name. If any
+        #    is async, starts a daemon event loop thread and registers its shutdown at exit. reward_weights must match the
+        #    count (else ValueError), default ones. Reward processing classes default per model to AutoTokenizer with
+        #    pad=eos; pad id copied into reward model config; count mismatch raises ValueError.
+        # 6. Copies generation/training args; continuous batching requires transformers>=5.8.0 (ImportError) and builds
+        #    ContinuousBatchingConfig with max_memory_percent default 0.5.
+        # 7. Datasets: train_dataset required and must be Dataset/IterableDataset. Iterable datasets require
+        #    dispatch_batches False (forced, error if explicitly True); iterable train forces dataloader_num_workers 0 with a warning.
+        # 8. num_iterations, epsilon_low/high (high defaults to epsilon). MoE aux loss: coefficient from args or model
+        #    config; ValueError if set on a non-MoE model; aux_loss_enabled when the config has output_router_logits and
+        #    coef is nonzero. Rejects a PEFT adapter on lm_head. Initializes _step and _buffered_inputs. For
+        #    transformers<5 defaults use_reentrant False.
+        # 9. Calls Trainer.__init__ with an identity collator. Rejects n_gpu>1 (DataParallel).
+        # 10. Reference model: None if beta is 0 or PEFT; otherwise loaded from the policy's model id with the policy dtype
+        #     and attention implementation. Optionally disables dropout. Deprecated use_liger_kernel warns and forces
+        #     fused_linear_cross_entropy False (ValueError if requested). Installs the fused LM head (log_probs and
+        #     entropy outputs, temperature-scaled) on the policy base model and the ref model.
+        # 11. Metrics/log buffers sized to generation_batch_size; device-specific seeding.
+        # 12. Generation: vLLM builds VLLMGeneration (no logprobs) and sets _last_loaded_step -1; otherwise builds a
+        #     sampling GenerationConfig (suppressing the image token for processors, merged with args.generation_kwargs).
+        # 13. Creates DistributedBackend, tags the model, prepares ref model for DeepSpeed/FSDP/plain, adds
+        #     SyncRefModelCallback when sync_ref_model (ValueError if beta 0, NotImplementedError with PEFT), and prepares
+        #     reward models on device.
+        # Inputs: model, reward_funcs, args, train_dataset, eval_dataset, processing_class, reward_processing_classes,
+        # callbacks, optimizers, quantization_config, peft_config.
+        # Outputs: none.
+        # Exceptions: ValueError, TypeError, ImportError, NotImplementedError as listed above.
+        # Side effects: downloads/loads models and tokenizers, mutates args (dispatch_batches, dataloader_num_workers,
+        # gradient_checkpointing_kwargs, ddp_find_unused_parameters, liger_kernel_config), sets global seeds, may start a
+        # background thread, may start vLLM, logs warnings.
+        # KNOWN ISSUE: when loading string reward models, model_init_kwargs is not copied from args.model_init_kwargs, so
+        # setting device_map/trust_remote_code mutates the user's config dict (the policy path copies it).
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
@@ -848,6 +925,10 @@ class RLOOTrainer(_BaseTrainer):
                     )
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets the columns kept by Trainer when remove_unused_columns is true.
+        # Behavior: if _signature_columns is unset, sets it to prompt, image, images.
+        # Inputs: self. Outputs: none. Exceptions: none. Side effects: sets self._signature_columns.
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs (usually, "input_ids"
         # and "attention_mask"). In RLOOTrainer, we preprocess data, so using the model's signature columns doesn't
@@ -863,6 +944,14 @@ class RLOOTrainer(_BaseTrainer):
     # Maintenance note: this method is a copy-paste of the original `Trainer.get_train_dataloader` with two changes: the
     # batch size is multiplied by `steps_per_generation`, and iterable datasets are wrapped (see `repeat_iterable_dataset`).
     def get_train_dataloader(self):
+        # [FUNCTION DOC]
+        # Behavior: returns the training DataLoader whose batch size is the train batch size times steps_per_generation
+        # (a whole generation batch). For an IterableDataset, optionally shuffles (buffered, seed args.seed) and wraps
+        # it with repeat_iterable_dataset (each prompt repeated num_generations times, groups of
+        # generation_batch_size / num_generations prompts, each group repeated num_iterations * steps_per_generation
+        # times) to mimic RepeatSampler. Map-style datasets use _get_train_sampler.
+        # Inputs: self. Outputs: a DataLoader built by Trainer._get_dataloader.
+        # Exceptions: none of its own. Side effects: none beyond dataloader creation.
         dataset = self.train_dataset
         if isinstance(dataset, IterableDataset):
             # Iterable datasets can't be indexed, so RepeatSampler can't be attached. Reproduce its ordering by
@@ -885,6 +974,12 @@ class RLOOTrainer(_BaseTrainer):
         )
 
     def _get_train_sampler(self, dataset: Dataset | None = None) -> Sampler:
+        # [FUNCTION DOC]
+        # HELPER: Builds the RepeatSampler for training.
+        # Behavior: uses dataset or train_dataset; each index repeated num_generations times consecutively, batches of
+        # generation_batch_size / num_generations unique prompts, each batch repeated num_iterations *
+        # steps_per_generation times, shuffled per shuffle_dataset with args.seed (same across processes so groups align).
+        # Inputs: dataset (optional). Outputs: RepeatSampler. Exceptions: none. Side effects: none.
         # Returns a sampler that
         # 1. ensures each prompt is repeated across multiple processes. This guarantees that identical prompts are
         #    distributed to different GPUs, allowing rewards to be computed and normalized correctly within each prompt
@@ -923,6 +1018,9 @@ class RLOOTrainer(_BaseTrainer):
         )
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
+        # [FUNCTION DOC]
+        # HELPER: Builds the evaluation RepeatSampler repeating each prompt num_generations_eval times, seeded with args.seed.
+        # Inputs: eval_dataset. Outputs: RepeatSampler. Exceptions: none. Side effects: none.
         # See _get_train_sampler for an explanation of the sampler.
         return RepeatSampler(
             data_source=eval_dataset,
@@ -937,6 +1035,14 @@ class RLOOTrainer(_BaseTrainer):
     # Maintenance note: this method is a copy-paste of the original `Trainer.get_eval_dataloader`, with the iterable
     # wrapping as the only addition.
     def get_eval_dataloader(self, eval_dataset: str | Dataset | IterableDataset | None = None) -> DataLoader:
+        # [FUNCTION DOC]
+        # Behavior: copy of Trainer.get_eval_dataloader. Raises if no eval dataset; returns a cached persistent-worker
+        # loader when available; resolves a string key into self.eval_dataset. For an IterableDataset: requires
+        # dispatch_batches False (sets it on the accelerator), shuffles with the seed, repeats each prompt
+        # num_generations_eval times, and temporarily forces dataloader_num_workers 0 (restored in a finally block).
+        # Inputs: eval_dataset (name, dataset or None). Outputs: DataLoader.
+        # Exceptions: ValueError when there is no eval dataset or dispatch_batches is True for iterable data.
+        # Side effects: mutates accelerator dataloader config; temporarily mutates args.dataloader_num_workers.
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
@@ -1005,6 +1111,21 @@ class RLOOTrainer(_BaseTrainer):
         mm_token_type_ids=None,
         image_position_ids=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        # [FUNCTION DOC]
+        # Behavior: runs the model in chunks of batch_size rows (default whole batch) and returns per-token
+        # log-probabilities of the completion tokens, optional entropies and optional MoE aux loss.
+        # For each chunk: builds model inputs, slicing multimodal tensors per chunk: image-indexed via cumulative
+        # num_images; Qwen-style pixel_values sliced by rows per sample derived from image_grid_thw products;
+        # image_position_ids path; LFM2-VL tile-indexed (spatial_shapes, pixel_attention_mask via num_tiles); InternVL
+        # tile-indexed via num_tiles; pixel_values per image if count equals total images, otherwise per row.
+        # pixel_attention_mask per row when not LFM2-VL; image_sizes per image; token_type_ids and mm_token_type_ids per
+        # row. Sets output_router_logits when compute_aux_loss. Labels are input ids with padding and all but the last
+        # logits_to_keep positions set to -100; calls the model under autocast with fused_lm_head enabled and keeps the
+        # last logits_to_keep positions of log_probs (and entropy).
+        # Inputs: model, input_ids and attention_mask (B, P+C), logits_to_keep (C), batch_size, flags, optional
+        # multimodal tensors and num_images/num_tiles lists.
+        # Outputs: tuple of logps (B, C), entropies (B, C) or None, aux loss scalar (mean over chunks) or None.
+        # Exceptions: none of its own. Side effects: none (wrapped by profiling_decorator for timing).
         """Compute log-probs, (optionally) entropies, and (optionally) the MoE load-balancing aux loss."""
         batch_size = batch_size or input_ids.size(0)  # Chunk inputs into smaller batches to reduce memory peak
         all_logps = []
@@ -1077,6 +1198,11 @@ class RLOOTrainer(_BaseTrainer):
         return logps, entropies, aux_loss
 
     def training_step(self, model, inputs, num_items_in_batch):
+        # [FUNCTION DOC]
+        # Behavior: wraps Trainer.training_step, increments _step, accumulates wall time, and every
+        # current_gradient_accumulation_steps micro-steps appends the accumulated time to train metric step_time and resets it.
+        # Inputs: model, inputs, num_items_in_batch. Outputs: the loss tensor from the parent.
+        # Exceptions: none of its own. Side effects: updates _step, _current_train_step_time, _metrics.
         time_before = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
         self._step += 1
@@ -1089,6 +1215,14 @@ class RLOOTrainer(_BaseTrainer):
 
     @profiling_decorator
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
+        # [FUNCTION DOC]
+        # Behavior: in train mode, when _step is a multiple of steps_per_generation * num_iterations (or no buffer
+        # exists, e.g. after resume) generates and scores the generation batch, splits pixel values by grid, shuffles
+        # rows, splits into steps_per_generation slices (re-merging pixel values) and stores them in _buffered_inputs;
+        # returns the slice indexed by _step modulo steps_per_generation. In eval mode, generates and scores the batch
+        # directly with no buffering.
+        # Inputs: generation_batch (list of dataset rows). Outputs: dict of tensors for one micro-batch.
+        # Exceptions: propagated from generation/scoring. Side effects: sets _buffered_inputs.
         # Prepares inputs for model training/evaluation by managing completion generation and batch handling.
         # During training:
         #   - Receives the local generation batch (Per-GPU batch size × steps per generation)
@@ -1120,6 +1254,9 @@ class RLOOTrainer(_BaseTrainer):
         return inputs
 
     def _log_completion_extra(self, column: str, values: list):
+        # [FUNCTION DOC]
+        # HELPER: Callback passed to reward functions as log_extra; appends values to _pending_extra_logs under column.
+        # Inputs: column name, list of per-sample values. Outputs: none. Exceptions: none. Side effects: mutates _pending_extra_logs.
         """
         Log extra columns to the completions table. Called from reward functions via the `log_extra` kwarg.
 
@@ -1132,6 +1269,9 @@ class RLOOTrainer(_BaseTrainer):
         self._pending_extra_logs[column].extend(values)
 
     def _log_metric(self, name: str, value: float):
+        # [FUNCTION DOC]
+        # HELPER: Callback passed to reward functions as log_metric; appends a scalar to _pending_metrics under name.
+        # Inputs: name, value. Outputs: none. Exceptions: none. Side effects: mutates _pending_metrics.
         """
         Log a scalar metric from a reward function. Called via the `log_metric` kwarg. Values are averaged over each
         logging step and reported alongside built-in metrics like `kl` and `entropy`.
@@ -1146,6 +1286,18 @@ class RLOOTrainer(_BaseTrainer):
 
     @profiling_decorator
     def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+        # [FUNCTION DOC]
+        # Behavior: computes a (local batch, num reward funcs) reward matrix then gathers it across processes.
+        # Reward kwargs: every input column except prompt/completion/completion_ids as lists, plus trainer_state,
+        # log_extra and log_metric callbacks. For nn.Module rewards: builds prompt+completion texts (chat template for
+        # conversational prompts), tokenizes right-padded without special tokens, and takes the first logit under
+        # inference mode. Async callables are collected and run concurrently on the background loop. Sync callables are
+        # called with prompts, completions, completion_ids and kwargs; None becomes NaN. Warns with the offending row's
+        # kwargs if any row has NaN for every function.
+        # Inputs: inputs (rows), prompts, completions, completion_ids_list.
+        # Outputs: gathered float tensor (global batch, num funcs).
+        # Exceptions: ValueError if a reward function returns the wrong number of rewards.
+        # Side effects: profiling timings, warning log, reward functions may log via callbacks.
         device = self.accelerator.device
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
@@ -1205,6 +1357,10 @@ class RLOOTrainer(_BaseTrainer):
         if async_funcs_info:
 
             async def _invoke_async(index, func, func_name):
+                # [FUNCTION DOC]
+                # HELPER: Awaits one async reward function with the shared arguments, converts None to NaN and checks length.
+                # Inputs: index, func, func_name. Outputs: tuple of index and reward list.
+                # Exceptions: ValueError on length mismatch. Side effects: profiling timing.
                 with profiling_context(self, func_name):
                     output = await func(
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
@@ -1219,6 +1375,9 @@ class RLOOTrainer(_BaseTrainer):
                     return index, output
 
             async def _run_async_funcs():
+                # [FUNCTION DOC]
+                # HELPER: Gathers _invoke_async for every collected async reward function concurrently.
+                # Inputs: none (closure). Outputs: list of (index, rewards). Exceptions: propagated. Side effects: none.
                 coros = [_invoke_async(i, func, func_name) for (i, func, func_name) in async_funcs_info]
                 return await asyncio.gather(*coros)
 
@@ -1247,6 +1406,14 @@ class RLOOTrainer(_BaseTrainer):
         return rewards_per_func
 
     def _tokenize_prompts(self, prompts: list):
+        # [FUNCTION DOC]
+        # Behavior: for conversational prompts, collects image parts from message contents (per-prompt list or None;
+        # images None if none at all) and tokenizes with the processor's chat template with a generation prompt and
+        # chat_template_kwargs; on transformers 5.3.x pads and then strips padding using the attention mask (workaround);
+        # extra processor outputs besides input_ids/attention_mask are returned as multimodal fields. For plain-text
+        # prompts, tokenizes text with no images or fields.
+        # Inputs: prompts list. Outputs: tuple of prompt_ids (list of int lists), images or None, multimodal_fields dict.
+        # Exceptions: none of its own. Side effects: none.
         """Tokenize prompts and extract images/multimodal fields for generation."""
         if is_conversational({"prompt": prompts[0]}):
             # Extract images from messages for VLM support
@@ -1292,6 +1459,17 @@ class RLOOTrainer(_BaseTrainer):
         return prompt_ids, images, multimodal_fields
 
     def _generate_single_turn(self, prompt_ids, images, multimodal_fields):
+        # [FUNCTION DOC]
+        # Behavior: generates completion token ids for already-tokenized prompts.
+        # - vLLM: syncs weights when global_step differs from _last_loaded_step, then generates num_generations (train)
+        #   or num_generations_eval (eval) per prompt; logprobs are discarded.
+        # - Continuous batching: unwraps the model for generation, casts to bf16/fp16 per args, calls generate_batch,
+        #   restores train mode, and collects generated tokens.
+        # - Otherwise: left-pads ids and attention mask (respecting pad_to_multiple_of), adds multimodal fields as tensors
+        #   (per-token list fields left-padded), runs generate on the unwrapped model, drops prompt positions, and
+        #   truncates each completion after its first eos id (keeping the eos).
+        # Inputs: prompt_ids, images, multimodal_fields. Outputs: list of completion id lists.
+        # Exceptions: propagated from backends. Side effects: weight sync to vLLM, sets _last_loaded_step, profiling.
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -1402,6 +1580,16 @@ class RLOOTrainer(_BaseTrainer):
         return completion_ids
 
     def _generate(self, prompts: list):
+        # [FUNCTION DOC]
+        # Behavior: deep-copies prompts, tokenizes, generates, and decodes completions (skipping special tokens; wrapped
+        # as a single assistant message for conversational prompts). Gathers prompt and completion lengths across
+        # processes; raises if nothing was generated. In train mode adds total tokens to state.num_input_tokens_seen.
+        # Logs num_tokens, completions mean/min/max length, clipped_ratio (last token not eos or pad), and
+        # mean/min/max length of terminated completions (zero if none).
+        # Inputs: prompts list. Outputs: tuple of prompt_ids, completion_ids, decoded completions.
+        # Exceptions: RuntimeError when no completions were returned.
+        # Side effects: updates state.num_input_tokens_seen and _metrics.
+        # KNOWN ISSUE: the comment says parse_response is used when possible to handle tool calls, but decoding always uses batch_decode.
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -1458,6 +1646,30 @@ class RLOOTrainer(_BaseTrainer):
     def _generate_and_score_completions(
         self, inputs: list[dict[str, torch.Tensor | Any]]
     ) -> dict[str, torch.Tensor | Any]:
+        # [FUNCTION DOC]
+        # Behavior: produces a training-ready batch for a local list of rows.
+        # 1. Extracts prompts and images (images column or single image column; all-empty lists treated as none). With
+        #    images, prompts must be conversational (else ValueError) and are converted to multimodal messages.
+        # 2. Generates via _generate, pads prompts left and completions right into tensors with masks (pad_to_multiple_of).
+        #    With mask_truncated_completions, zeroes masks of completions not ending in eos/pad.
+        # 3. Builds multimodal forward kwargs by running the processor on chat-templated prompt text with images;
+        #    recovers per-sample tile counts for LFM2-VL (rows*cols plus thumbnail) and InternVL (num_patches); extends
+        #    token_type_ids / mm_token_type_ids with zeros for completions (left-padding first under pad_to_multiple_of).
+        # 4. Under no_grad with checkpointing disabled, computes old per-token logps of the policy (summed over the mask
+        #    into old_logps) and, if beta is nonzero, reference logps via ref_model or the PEFT "ref"/disabled adapter.
+        # 5. Rewards: gathered per-function rewards; rows where all are NaN are unscorable. Weighted nansum, unscorable
+        #    set to NaN, optional clamp to reward_clip_range. If beta is nonzero, subtracts beta times the gathered
+        #    sequence KL (sum over completion tokens of policy minus reference logps).
+        # 6. Groups rewards by num_generations; leave-one-out baseline = (group nansum minus own reward) divided by
+        #    (scorable count minus 1); advantage = reward minus baseline (zero when group size 1). Optional global
+        #    normalization (subtract nanmean, divide by nanstd + 1e-4). NaN advantages become 0. Keeps this process's slice.
+        # 7. Metrics: kl (masked mean), per-function reward mean/std, reward, reward_std, frac_reward_zero_std; logs
+        #    prompts, completions, rewards, advantages, gathered extra columns (sorted keys) and averaged user metrics,
+        #    and images when log_multimodal.
+        # Inputs: inputs (rows). Outputs: dict with prompt_ids, prompt_mask, completion_ids, completion_mask, old_logps,
+        # advantages, plus any multimodal tensors present and num_images/num_tiles.
+        # Exceptions: ValueError for non-conversational multimodal inputs; propagated errors.
+        # Side effects: collective gathers, metric and log buffers updated, pending logs cleared.
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -1787,11 +1999,22 @@ class RLOOTrainer(_BaseTrainer):
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Behavior: delegates to _compute_loss. Inputs: model, inputs, return_outputs, num_items_in_batch (unused).
+        # Outputs: scalar loss. Exceptions: ValueError if return_outputs is true. Side effects: see _compute_loss.
         if return_outputs:
             raise ValueError("The RLOOTrainer does not support returning outputs")
         return self._compute_loss(model, inputs)
 
     def _compute_loss(self, model, inputs):
+        # [FUNCTION DOC]
+        # Behavior: concatenates prompt and completion ids/masks, computes per-token logps and entropies (and aux loss
+        # when enabled) with multimodal inputs, sums masked logps per sequence, and forms ratio = exp(logps - old_logps).
+        # Loss = mean over sequences of the negative minimum of ratio*advantage and clamp(ratio, 1-epsilon_low,
+        # 1+epsilon_high)*advantage. Adds router_aux_loss_coef * aux_loss when enabled (logged as aux_loss).
+        # Logs entropy (masked mean across processes), clip_ratio low_mean/low_min, high_mean/high_max, region_mean.
+        # Inputs: model, inputs dict from _prepare_inputs. Outputs: scalar loss tensor.
+        # Exceptions: none of its own. Side effects: _metrics updated, collective gathers.
         # Compute the per-token log probabilities for the model
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -1863,6 +2086,10 @@ class RLOOTrainer(_BaseTrainer):
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and
     # returns logits. We override prediction_step to force compute_loss, because this trainer doesn't involve labels.
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Behavior: prepares (generates) inputs, computes the loss under no_grad and the loss context manager, and returns it.
+        # Inputs: model, inputs, prediction_loss_only, ignore_keys (unused). Outputs: tuple of detached mean loss, None, None.
+        # Exceptions: propagated. Side effects: generation and metrics as in _prepare_inputs.
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
             with self.compute_loss_context_manager():
@@ -1871,6 +2098,14 @@ class RLOOTrainer(_BaseTrainer):
         return loss, None, None
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: averages each metric of the current mode ignoring NaNs (None if no valid values), prefixes keys with
+        # "eval_" in eval mode, merges into logs, calls Trainer.log, and clears the mode's metrics. On the main process
+        # with log_completions: prints a rich sample table if rich is available and logs a completions table (step,
+        # prompt, completion with images stripped, rewards, extra columns, advantage, plus image column when images
+        # were logged) to wandb and/or trackio per report_to, deduplicating prompts when log_unique_prompts.
+        # Inputs: logs dict, start_time. Outputs: none.
+        # Exceptions: none of its own. Side effects: console output, logging backend calls, clears _metrics[mode].
         mode = "train" if self.model.training else "eval"
         # Average the metrics
         metrics = {}
@@ -1942,6 +2177,9 @@ class RLOOTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Behavior: derives a model name from output_dir or hub_model_id, writes a model card, then calls the parent checkpoint save.
+        # Inputs: model, trial. Outputs: none. Exceptions: propagated. Side effects: writes README and checkpoint files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:

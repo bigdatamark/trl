@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Script that builds the small trl-internal-testing/harmony dataset (Zen of Python Q&A with assistant "thinking" and
+# per-row chat_template_kwargs of reasoning_effort and model_identity, for gpt-oss Harmony chat templates) in three
+# configurations: language_modeling, prompt_completion and preference. Run as a script with HfArgumentParser.
+# Import-time side effects: none (main runs only under the main guard, which parses ScriptArguments and calls main).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +26,9 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI arguments: test_size (float, default 0.1), push_to_hub (bool, default False), repo_id (str,
+    # default trl-internal-testing/harmony). Parsed by HfArgumentParser; no methods.
     r"""
     Arguments for the script.
 
@@ -47,6 +56,15 @@ class ScriptArguments:
 
 
 def main(test_size, push_to_hub, repo_id):
+    # [FUNCTION DOC]
+    # Builds and optionally pushes the three dataset configurations.
+    # Behavior: creates a 19-row language_modeling Dataset (messages with user and assistant turns, assistant turns carry
+    # a thinking field, plus chat_template_kwargs cycling low/medium/high effort; mixed types stored as JSON), a
+    # prompt_completion Dataset (prompt user turn, completion assistant turn, same kwargs) and a preference Dataset
+    # (prompt, chosen, rejected, kwargs). Each is split with train_test_split using test_size and no shuffling and, when
+    # push_to_hub is true, pushed to repo_id under its config name.
+    # Inputs: test_size (float), push_to_hub (bool), repo_id (str). Outputs: none.
+    # Exceptions: datasets / Hub errors propagate. Side effects: network upload when push_to_hub is set.
     # fmt: off
     language_modeling_dataset = Dataset.from_dict({
         "messages": [

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Example script: LoRA AsyncGRPO on GSM8K with Qwen3-8B, vLLM on one GPU and the trainer on another; with a
+# LoRA-enabled vLLM server only adapter weights are synced. Main contents: format_sample and main.
+# Not part of the trl package. Import-time side effects: none beyond imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -54,6 +59,12 @@ from trl.rewards import accuracy_reward
 
 
 def format_sample(sample):
+    # [FUNCTION DOC]
+    # HELPER: Converts a GSM8K row into a prompt plus reference solution.
+    # Behavior: prompt is a single user message with the question; solution is the text after the last "####" marker
+    # in the answer, stripped.
+    # Inputs: sample with "question" and "answer". Outputs: dict with "prompt" and "solution".
+    # Exceptions: KeyError on missing columns. Side effects: none.
     return {
         "prompt": [{"role": "user", "content": sample["question"]}],
         "solution": sample["answer"].split("####")[-1].strip(),
@@ -61,6 +72,14 @@ def format_sample(sample):
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: loads and maps GSM8K train; builds AsyncGRPOConfig (output_dir async_grpo_lora_gsm8k, no saving, vLLM URL
+    # on localhost with port from env VLLM_PORT default 8000, bf16 weights, lr 1e-4, batch 8, grad accumulation 4,
+    # gradient checkpointing, completion length 1024, thinking disabled, 200 steps, trackio); trains AsyncGRPOTrainer on
+    # Qwen/Qwen3-8B with accuracy_reward and a LoRA config (r 32, alpha 64, all linear layers); calls trainer.end().
+    # Inputs: none (reads VLLM_PORT). Outputs: none.
+    # Exceptions: propagates download/connection/training errors.
+    # Side effects: network downloads, vLLM HTTP/NCCL traffic, trackio logging.
     dataset = load_dataset("openai/gsm8k", "main", split="train")
     dataset = dataset.map(format_sample, remove_columns=dataset.column_names)
 

@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Invariant (numerical regression) test suite: runs the trl CLI (sft/dpo) for NUM_STEPS 50 steps on
+# Qwen2.5-0.5B-Instruct at a pinned revision, with fixed seeds and full determinism, and checks that the per-step
+# loss and grad_norm trajectories of every config in an equivalence class match the class's recorded reference
+# JSON under references/ within per-field tolerances (max absolute diff and mean diff).
+# Main contents: constants (model, FA2 kernel pin, datasets, steps, seed, max length), env/commit snapshot helpers,
+# StepRecord/Trajectory/CorrectnessConfig dataclasses, run (subprocess CLI execution and trainer_state parsing),
+# save/load of reference JSON, compare_scalars, _build config factory, EQUIVALENCE_CLASSES (sft, sft_fa2, dpo), the
+# parametrized test_invariant (marked "invariant"), and a __main__ entry point that records the canonical member's
+# reference for selected classes (refusing on a dirty git tree unless --allow-dirty).
+# Import-time side effects: builds EQUIVALENCE_CLASSES and the flat _ALL parameter list; no I/O.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,6 +62,11 @@ MAX_LENGTH = 512
 
 
 def _trl_commit() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the git HEAD SHA of the checkout containing this file, suffixed "-dirty" if git status
+    # --porcelain reports any changes.
+    # Inputs: none. Outputs: str. Exceptions: subprocess.CalledProcessError if git fails (check=True); FileNotFoundError
+    # without git. Side effects: runs two git subprocesses.
     """Return the current trl commit SHA (with `-dirty` suffix if the working tree has uncommitted changes).
 
     Assumes the suite is run from a `pip install -e .` checkout — the only intended setup.
@@ -65,6 +82,10 @@ def _trl_commit() -> str:
 
 
 def env_snapshot() -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Returns a dict describing the environment for reference files: accelerate, torch and transformers
+    # versions, trl commit (via _trl_commit), Python version and the name of CUDA device 0 (or "cpu").
+    # Inputs: none. Outputs: dict of str. Exceptions: git errors propagate. Side effects: runs git subprocesses.
     return {
         "accelerate": accelerate.__version__,
         "torch": torch.__version__,
@@ -77,6 +98,8 @@ def env_snapshot() -> dict:
 
 @dataclass
 class StepRecord:
+    # [CLASS DOC]
+    # HELPER: Dataclass for one logged training step: step (int), loss (float), grad_norm (float). No methods.
     step: int
     loss: float
     grad_norm: float
@@ -84,6 +107,9 @@ class StepRecord:
 
 @dataclass
 class Trajectory:
+    # [CLASS DOC]
+    # HELPER: Dataclass for a full run: config (name/method/args dict), env (env_snapshot dict) and steps
+    # (list of StepRecord). Serialized to/from JSON by save/load.
     config: dict
     env: dict
     steps: list[StepRecord]
@@ -91,12 +117,18 @@ class Trajectory:
 
 @dataclass
 class CorrectnessConfig:
+    # [CLASS DOC]
+    # HELPER: Dataclass describing one CLI run: name, method ("sft" or "dpo"), args (CLI flag name to string value),
+    # num_processes (default 1). cli_args renders args as command-line flags.
     name: str
     method: str  # "sft" | "dpo"
     args: dict[str, str]
     num_processes: int = 1
 
     def cli_args(self) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Flattens args into a list alternating "--key" and value, in dict order.
+        # Inputs: none. Outputs: list of str. Exceptions/Side effects: none.
         out: list[str] = []
         for k, v in self.args.items():
             out.extend([f"--{k}", v])
@@ -104,6 +136,15 @@ class CorrectnessConfig:
 
 
 def run(config: CorrectnessConfig) -> Trajectory:
+    # [FUNCTION DOC]
+    # Executes one config via the trl CLI and returns its trajectory.
+    # Behavior: in a temporary dir, runs "trl <method> --num_processes N --output_dir <tmp> <args>" with
+    # CUDA_VISIBLE_DEVICES set to 0..N-1; finds the first trainer_state.json anywhere under the dir; keeps log_history
+    # entries containing "loss" (skipping eval/summary entries) as StepRecords; attaches config name/method/args and
+    # env_snapshot.
+    # Inputs: config - CorrectnessConfig. Outputs: Trajectory.
+    # Exceptions: CalledProcessError if the CLI fails; RuntimeError if no trainer_state.json; KeyError if a loss entry
+    # lacks step/grad_norm. Side effects: spawns a training subprocess using GPUs; temp dir removed afterwards.
     """Invoke the trl CLI as a subprocess; parse its trainer_state.json into a Trajectory."""
     with tempfile.TemporaryDirectory() as tmpdir:
         cmd = ["trl", config.method]
@@ -135,11 +176,17 @@ def run(config: CorrectnessConfig) -> Trajectory:
 
 
 def save(trajectory: Trajectory, path: Path) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Writes a Trajectory as indented JSON to path, creating parent directories.
+    # Inputs: trajectory, path. Outputs: none. Exceptions: OS errors. Side effects: writes a file.
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(trajectory), indent=2))
 
 
 def load(path: Path) -> Trajectory:
+    # [FUNCTION DOC]
+    # HELPER: Reads a Trajectory JSON file and rebuilds the dataclasses (steps as StepRecord).
+    # Inputs: path. Outputs: Trajectory. Exceptions: OS/JSON/KeyError on bad files. Side effects: reads a file.
     data = json.loads(path.read_text())
     return Trajectory(
         config=data["config"],
@@ -149,6 +196,16 @@ def load(path: Path) -> Trajectory:
 
 
 def compare_scalars(a: Trajectory, b: Trajectory, tol: dict[str, float], residual_tol: dict[str, float]) -> list[str]:
+    # [FUNCTION DOC]
+    # Compares the loss and grad_norm series of two trajectories.
+    # Behavior: if step counts differ, returns a single length-mismatch error. Otherwise for each field computes
+    # per-step differences (a minus b); if the max absolute diff exceeds tol[field], records an error naming the step of
+    # the worst diff with both values; if the absolute mean diff exceeds residual_tol[field], records a systematic
+    # drift error.
+    # Inputs: a, b - Trajectory; tol, residual_tol - dicts keyed "loss" and "grad_norm".
+    # Outputs: list of error strings (empty when equivalent).
+    # Exceptions: ValueError/ZeroDivisionError if both trajectories have zero steps; KeyError for missing tol keys.
+    # Side effects: none.
     """Compare scalar series (loss, grad_norm). `tol` and `residual_tol` are per-field dicts keyed by `'loss'` and
     `'grad_norm'`."""
     errors: list[str] = []
@@ -177,6 +234,13 @@ def compare_scalars(a: Trajectory, b: Trajectory, tol: dict[str, float], residua
 def _build(
     name: str, method: str, dataset: str, attn: str = "eager", num_processes: int = 1, **overrides
 ) -> CorrectnessConfig:
+    # [FUNCTION DOC]
+    # HELPER: Factory for CorrectnessConfig with the suite's fixed CLI args: model and revision, attn_implementation
+    # (default "eager"), dataset_name, max_steps NUM_STEPS, max_length MAX_LENGTH, logging every step, no reporting,
+    # seed and data_seed SEED, full_determinism True, bf16 False; then applies overrides with every value stringified
+    # (so None becomes the string "None", True becomes "True").
+    # Inputs: name, method, dataset, attn, num_processes, overrides (extra CLI args).
+    # Outputs: CorrectnessConfig. Exceptions/Side effects: none.
     args: dict[str, str] = {
         "model_name_or_path": MODEL,
         "model_revision": MODEL_REVISION,
@@ -262,6 +326,14 @@ _ALL = [(klass, c) for klass, ec in EQUIVALENCE_CLASSES.items() for c in ec["mem
 @pytest.mark.invariant
 @pytest.mark.parametrize("klass,config", _ALL, ids=[c.name for _, c in _ALL])
 def test_invariant(klass, config):
+    # [FUNCTION DOC]
+    # Parametrized over every (class name, member config) pair: runs the member and compares it with the class reference.
+    # Behavior: fails if the reference JSON for the class is missing (with a hint to record it); skips if more GPUs are
+    # needed than available, or if the config sets bf16 "True" and the device lacks bf16; then runs the config, loads
+    # the reference and asserts compare_scalars with the class tolerances returns no errors (errors joined in message).
+    # Inputs: klass - equivalence class name; config - CorrectnessConfig.
+    # Outputs: none. Exceptions: pytest fail/skip, assertion failure, subprocess errors from run.
+    # Side effects: runs a full CLI training subprocess on GPUs.
     ref_path = REFERENCES_DIR / f"{klass}.json"
     if not ref_path.exists():
         pytest.fail(f"no reference at {ref_path}; record it with `python {Path(__file__).name}`")

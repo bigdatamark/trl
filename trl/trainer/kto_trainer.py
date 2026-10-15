@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Implements Kahneman-Tversky Optimization (KTO) and the unpaired APO-zero variant: KTOTrainer
+# trains a causal LM (or VLM) on unpaired examples (prompt, completion, boolean label) against a
+# reference model, using a KL baseline estimated from mismatched prompt/completion pairs.
+# Contents: DataCollatorForUnpairedPreference (pre-tokenized text), DataCollatorForVision
+# UnpairedPreference (on-the-fly processing of image datasets) and KTOTrainer.
+# Import-time side effects: imports peft symbols only if available; creates the module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,6 +92,10 @@ logger = get_logger(__name__)
 
 @dataclass
 class DataCollatorForUnpairedPreference(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator (DataCollatorMixin) for tokenized unpaired preference data.
+    # Attributes: pad_token_id (required), max_length (None = no truncation), pad_to_multiple_of,
+    # return_tensors ("pt"). Side effects: none.
     """
     Data collator used for unpaired preference data. Inputs are dynamically padded to the maximum length of a batch.
 
@@ -159,6 +171,18 @@ class DataCollatorForUnpairedPreference(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Builds a right-padded batch for the main sequence and, if present, the KL sequence.
+        # Behavior: for prefix "" with completion_ids and prefix "KL_" with KL_completion_ids (skipped if
+        # the first example lacks the key): concatenate prompt_ids with the completion ids, build a
+        # completion mask (0 over the prompt, 1 over the completion), truncate both from the right to
+        # max_length, then pad ids with pad_token_id and masks with 0 (int64, optional multiple). Adds
+        # ref_logps / ref_KL_logps tensors when present in the first example, and always a label tensor.
+        # Inputs: examples (list of dicts with prompt_ids, completion_ids, label, optional
+        # KL_completion_ids, ref_logps, ref_KL_logps).
+        # Outputs: dict with input_ids, attention_mask, completion_mask (and KL_ variants), label, and
+        # optional ref tensors, each of batch size N.
+        # Exceptions: KeyError for missing keys. Side effects: none.
         output = {}
         for prefix, ids_key in [("", "completion_ids"), ("KL_", "KL_completion_ids")]:
             if ids_key not in examples[0]:
@@ -208,6 +232,11 @@ class DataCollatorForUnpairedPreference(DataCollatorMixin):
 
 @dataclass
 class DataCollatorForVisionUnpairedPreference(DataCollatorMixin):
+    # [CLASS DOC]
+    # Dataclass collator that tokenizes and processes images on the fly for vision KTO datasets.
+    # Attributes: processor (ProcessorMixin with a tokenizer), max_length, calculate_kl (True),
+    # pad_to_multiple_of (must be None), return_tensors ("pt").
+    # Side effects: none beyond mutating input examples in torch_call.
     """
     Data collator for vision unpaired-preference tasks.
 
@@ -302,6 +331,30 @@ class DataCollatorForVisionUnpairedPreference(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Builds a VLM batch with optional cycled KL sequences.
+        # Behavior:
+        # 1. Raises if pad_to_multiple_of is set. A single "image" key is moved into an "images" list. If
+        # every example has no images, images become None.
+        # 2. Conversational data: prompt messages get image placeholders, completions are normalized, and
+        # the chat template is applied to each example.
+        # 3. Prompts are processed with images, left-padded; completions text-only, right-padded; no
+        # special tokens added. Ids and masks are concatenated along the sequence dimension and the
+        # completion mask is zero over the prompt. token_type_ids (Gemma) are concatenated from both;
+        # mm_token_type_ids (Qwen-VL style) use zeros for the completion part.
+        # 4. flush_left removes leading padding columns jointly across the tensors; then right truncation
+        # to max_length.
+        # 5. Output starts from the processed prompt dict (keeping pixel_values etc.) and overrides ids,
+        # masks and token-type tensors.
+        # 6. If calculate_kl: completions are rotated by one (example i gets completion i-1, the first gets
+        # the last), processed and combined with the original (pre-flush) prompt tensors the same way,
+        # flushed, truncated, and stored under KL_input_ids, KL_attention_mask, KL_completion_mask and
+        # KL_ token-type keys.
+        # 7. Adds a label tensor.
+        # Inputs: examples (dicts with images/image, prompt, completion, label).
+        # Outputs: dict of tensors as described.
+        # Exceptions: NotImplementedError when pad_to_multiple_of is set; processor errors.
+        # Side effects: mutates the input example dicts (image key, prompt/completion messages).
         if self.pad_to_multiple_of is not None:
             raise NotImplementedError(
                 "Padding to a multiple of a value is not yet implemented for vision-language modeling and "
@@ -457,6 +510,20 @@ class DataCollatorForVisionUnpairedPreference(DataCollatorMixin):
 
 
 class KTOTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer (via _BaseTrainer) implementing KTO / APO-zero-unpaired.
+    # Construction (__init__) loads model, tokenizer/processor, PEFT, collators, datasets, reference
+    # model (separate model, PEFT "ref" adapter or disabled adapters, or precomputed log-probs),
+    # fused LM head, metrics and optional TR-DPO sync. Training: compute_loss wraps _compute_loss,
+    # which computes policy, reference and KL log-probs and the weighted losses, recording metrics in
+    # self._metrics[mode]; log() averages and flushes them. evaluate() prepares and optionally
+    # precomputes reference log-probs for datasets passed at call time. prediction_step forces loss
+    # computation. _get_train_sampler enforces sequential sampling for KL losses on older
+    # transformers.
+    # Key state: beta, loss_type, desirable_weight, undesirable_weight, calculate_KL,
+    # precompute_ref_logps, ref_model, _tokenizer, _is_vlm, _is_vision_dataset, router_aux_loss_coef,
+    # aux_loss_enabled, _metrics, _total_train_tokens, _tp_size, _precompute_model_hash,
+    # _precompute_engine, maybe_activation_offload_context.
     """
     Trainer for Kahneman-Tversky Optimization (KTO) method. This algorithm was initially proposed in the paper [KTO:
     Model Alignment as Prospect Theoretic Optimization](https://huggingface.co/papers/2402.01306). This class is a
@@ -584,6 +651,45 @@ class KTOTrainer(_BaseTrainer):
         quantization_config: "BitsAndBytesConfig | None" = None,
         peft_config: "PeftConfig | None" = None,
     ):
+        # [FUNCTION DOC]
+        # Builds a ready-to-train KTO trainer.
+        # Behavior:
+        # 1. args default to KTOConfig("<model basename>-KTO"); train_dataset required; IterableDataset
+        # forces dispatch_batches False; other types rejected.
+        # 2. set_seed; string model loaded with create_model_from_path from model_init_kwargs (quantization
+        # config injected, device_map None when distributed, trust_remote_code default); instance models
+        # warn on model_init_kwargs and reject quantization_config. ref_model must not be the same object.
+        # 3. processing_class defaults to AutoProcessor; a ProcessorMixin marks _is_vlm and uses its
+        # tokenizer; tokenizer pad defaults to eos; pad id mirrored to text and generation configs.
+        # 4. PEFT: validates availability/type/not already PEFT, ZeRO-3 autocast fix, old-peft prefix
+        # tuning check, wraps. If model is already PEFT with no ref_model, adds a "ref" adapter copied from
+        # "default" (skipped with a warning for LoRA target_parameters on peft 0.17 to 0.20).
+        # 5. PEFT+ZeRO-3+checkpointing forces reentrant; PEFT+checkpointing enables input grads; quantized
+        # models cast trainable non-DoRA params to bfloat16.
+        # 6. Vision detection from the first train sample ("image"/"images"): requires a processor,
+        # disallows precompute_ref_log_probs and paired chosen/rejected columns; VLMs default
+        # ddp_find_unused_parameters True unless reentrant checkpointing.
+        # 7. calculate_kl unless loss_type is apo_zero_unpaired; default collator chosen by vision flag.
+        # KL losses require train_sampling_strategy "sequential" and per-device batch size > 1. A PEFT
+        # adapter on the output embeddings is rejected (fused head bypasses it).
+        # 8. Text datasets prepared via _prepare_dataset; non-reentrant checkpointing default for
+        # transformers < 5.0.0; Trainer.__init__; rejects n_gpu > 1.
+        # 9. Activation offload context; MoE aux loss coefficient from args or text config (error if set
+        # for a non-MoE model); aux_loss_enabled when the config has output_router_logits and coef != 0.
+        # 10. Reference model: None when PEFT or (precompute and not FSDP); otherwise the given one or a
+        # fresh load of the same checkpoint with matching dtype and attention implementation.
+        # 11. Disable dropout; Liger kernel handling (FutureWarning, rejects fused linear cross entropy,
+        # forces it off); add_fused_lm_head on the policy (log_probs, entropy, mean_logits) and ref model.
+        # 12. Metrics, tp size, model tags, precompute hash; reference prepared with DeepSpeed, FSDP or
+        # accelerate eval mode; sync_ref_model adds SyncRefModelCallback (rejects PEFT and precompute).
+        # 13. If precomputing, runs _precompute_ref_logps on train and eval datasets (precompute batch size
+        # or per-device batch size), then frees the FSDP-only reference model.
+        # Inputs: model, ref_model, args, data_collator, train_dataset, eval_dataset, processing_class,
+        # compute_metrics, callbacks, optimizers, quantization_config, peft_config.
+        # Outputs: none.
+        # Exceptions: ValueError, TypeError, ImportError, NotImplementedError for the checks above.
+        # Side effects: seeds RNGs; mutates args, tokenizer, model configs and adapters; may download
+        # models; may run full reference forward passes and write dataset cache files.
         # Args
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
@@ -1048,6 +1154,25 @@ class KTOTrainer(_BaseTrainer):
         args: KTOConfig,
         dataset_name: str,
     ) -> Dataset | IterableDataset:
+        # [FUNCTION DOC]
+        # HELPER: Converts a text dataset into tokenized unpaired KTO examples.
+        # Behavior inside global_then_local_main_first:
+        # 1. If no "prompt" column, extract_prompt splits the shared prefix from chosen/rejected.
+        # 2. If chosen and rejected exist, unpair_preference_dataset turns each pair into two labeled rows.
+        # 3. Non-conversational: append tokenizer EOS to completion when missing.
+        # 4. Tokenize prompt (with generation prompt for chat) and prompt+completion (chat template with
+        # optional JSON-decoded tools and per-example chat_template_kwargs); the split point is the common
+        # prefix length; warns once if the prompt is not a prefix. Stores prompt_ids and completion_ids.
+        # 5. If max_length set, drop rows whose prompt_ids length >= max_length.
+        # 6. If calculate_KL, add KL_completion_ids by rotating completion_ids by one within consecutive
+        # chunks of per_device_train_batch_size.
+        # 7. For a map-style "train" dataset, compute desirable/undesirable counts (min 1) and warn if
+        # neither weight is within the range recommended by Eq. 8 of the KTO paper.
+        # Inputs: dataset, processing_class, args, dataset_name. Outputs: processed dataset.
+        # Exceptions: errors from mapping/tokenizing.
+        # Side effects: logs warnings; writes datasets cache files.
+        # KNOWN ISSUE: when there are no desirable examples, num_desirable is clamped to 1 before
+        # num_undesirable is computed as total minus num_desirable, so the undesirable count is one short.
         # Build the kwargs for the `map` function
         map_kwargs = {}
         if isinstance(dataset, Dataset):  # IterableDataset does not support num_proc
@@ -1075,6 +1200,9 @@ class KTOTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Adding EOS to {dataset_name} dataset"
 
                 def add_eos(example, eos_token):
+                    # [FUNCTION DOC]
+                    # HELPER: Appends eos_token to example completion if missing. Inputs: example, eos_token.
+                    # Outputs: the mutated example. Exceptions: none. Side effects: mutates example.
                     if not example["completion"].endswith(eos_token):
                         example["completion"] = example["completion"] + eos_token
                     return example
@@ -1086,6 +1214,11 @@ class KTOTrainer(_BaseTrainer):
                 map_kwargs["desc"] = f"Tokenizing {dataset_name} dataset"
 
             def tokenize_fn(example, processing_class):
+                # [FUNCTION DOC]
+                # HELPER: Tokenizes one example into prompt_ids and completion_ids as described in step 4 of the
+                # parent block. Inputs: example, processing_class. Outputs: dict with the two id lists.
+                # Exceptions: KeyError for missing prompt/completion; JSON errors for bad tools.
+                # Side effects: may log a one-time warning.
                 tools = example.get("tools")
                 tools = json.loads(tools) if isinstance(tools, str) else tools
                 apply_chat_template_kwargs = {"tools": tools, **example.get("chat_template_kwargs", {})}
@@ -1148,6 +1281,10 @@ class KTOTrainer(_BaseTrainer):
                     map_kwargs["desc"] = f"Extracting KL {dataset_name} dataset"
 
                 def add_kl_completion_ids(examples):
+                    # [FUNCTION DOC]
+                    # HELPER: Batched map function; KL_completion_ids is completion_ids rotated right by one (last
+                    # first). Inputs: examples (column dict). Outputs: the same dict with the new column.
+                    # Exceptions: none. Side effects: mutates examples.
                     examples["KL_completion_ids"] = [examples["completion_ids"][-1]] + examples["completion_ids"][:-1]
                     return examples
 
@@ -1184,6 +1321,11 @@ class KTOTrainer(_BaseTrainer):
         return dataset
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # Override keeping KTO columns when remove_unused_columns is on: for vision datasets prompt,
+        # completion, image, images, label, tools, chat_template_kwargs; otherwise prompt_ids,
+        # completion_ids, KL_completion_ids, label, ref_logps, ref_KL_logps.
+        # Inputs: self. Outputs: none. Exceptions: none. Side effects: sets _signature_columns.
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs (usually, "input_ids"
         # and "attention_mask").
@@ -1209,6 +1351,11 @@ class KTOTrainer(_BaseTrainer):
                 ]
 
     def _get_train_sampler(self, train_dataset: Dataset | None = None) -> Sampler | None:
+        # [FUNCTION DOC]
+        # Returns a SequentialSampler when calculate_KL and transformers < 5.2.0 (older Trainer ignores
+        # train_sampling_strategy), or None for datasets without length; else the parent sampler.
+        # Inputs: train_dataset (defaults to self.train_dataset). Outputs: Sampler or None.
+        # Exceptions: none. Side effects: none.
         if self.calculate_KL and Version(transformers.__version__) < Version("5.2.0"):
             if train_dataset is None:
                 train_dataset = self.train_dataset
@@ -1218,6 +1365,20 @@ class KTOTrainer(_BaseTrainer):
         return super()._get_train_sampler(train_dataset)
 
     def _precompute_ref_logps(self, dataset: Dataset, name: str, batch_size: int) -> Dataset:
+        # [FUNCTION DOC]
+        # HELPER: Computes and caches per-example reference log-probs for a map-style dataset.
+        # Behavior: rejects IterableDataset. Fingerprint = hash of dataset fingerprint, precompute model
+        # hash and calculate_KL, broadcast from rank 0; if the cache file exists, concatenate its columns
+        # to the dataset and return. Otherwise iterate an accelerate-prepared non-shuffled DataLoader
+        # (trainer collator, given batch size) with a progress bar; model is a cached DeepSpeed inference
+        # engine of the policy when no ref model and DeepSpeed, else ref_model or policy. For each batch
+        # call compute_ref_log_probs, gather across processes and collect on CPU. Main process writes a
+        # dataset of ref_logps (and ref_KL_logps) to the cache file via map; all ranks wait, then
+        # concatenate column-wise.
+        # Inputs: dataset, name (for progress text), batch_size. Outputs: dataset with ref columns.
+        # Exceptions: ValueError for IterableDataset.
+        # Side effects: GPU forward passes, cross-process communication, writes cache file, may set
+        # _precompute_engine.
         if isinstance(dataset, IterableDataset):
             raise ValueError(
                 "`precompute_ref_log_probs=True` is not supported with IterableDataset. Please use a map-style "
@@ -1275,6 +1436,10 @@ class KTOTrainer(_BaseTrainer):
         if self.accelerator.is_main_process:
 
             def add_ref_logps(batch, indices):
+                # [FUNCTION DOC]
+                # HELPER: Batched map function returning ref_logps (and ref_KL_logps when calculate_KL) for the
+                # given row indices from the gathered tensors. Inputs: batch (ignored), indices.
+                # Outputs: dict of new columns. Exceptions: none. Side effects: none.
                 result = {"ref_logps": ref_logps[indices]}
                 if self.calculate_KL:
                     result.update({"ref_KL_logps": ref_KL_logps[indices]})
@@ -1294,6 +1459,16 @@ class KTOTrainer(_BaseTrainer):
         return concatenate_datasets([dataset, Dataset.from_file(cache_file)], axis=1)
 
     def compute_ref_log_probs(self, model, inputs):
+        # [FUNCTION DOC]
+        # Computes summed completion log-probs (and KL log-probs) of the reference for one padded batch.
+        # Behavior: with no ref_model and a PEFT policy, uses the "ref" adapter if it exists, else the
+        # base model with adapters disabled. Under no_grad, disabled gradient checkpointing and autocast,
+        # labels are input ids with non-completion positions set to -100; the model's fused head returns
+        # per-token log-probs; same for the KL sequence when calculate_KL. Keeps the last
+        # (sequence length minus one) positions (dropping prompt-learning virtual tokens) and sums.
+        # Inputs: model, inputs (collator batch). Outputs: tuple (completion_logps shape (N,), KL_logps
+        # shape (N,) or None).
+        # Exceptions: none of its own. Side effects: none persistent.
         """Computes reference log probabilities for a single padded batch."""
         adapter_context = contextlib.nullcontext()
         if self.ref_model is None and is_peft_model(self.model):
@@ -1335,6 +1510,15 @@ class KTOTrainer(_BaseTrainer):
         return completion_logps, KL_logps
 
     def _compute_kl_logps(self, model, batch):
+        # [FUNCTION DOC]
+        # HELPER: Policy (or given model) KL log-probs for the mismatched sequences of a batch.
+        # Behavior: returns None unless calculate_KL. Builds model kwargs from batch minus main
+        # ids/masks, labels and ref keys, renames KL_input_ids / KL_attention_mask to the main names,
+        # use_cache False, overrides token-type tensors with the KL-specific ones; labels mask
+        # non-completion tokens; forward under no_grad with the fused head; sums the last (length minus
+        # one) per-token log-probs.
+        # Inputs: model, batch. Outputs: tensor (N,) or None. Exceptions: KeyError if KL keys missing.
+        # Side effects: none.
         """Compute KL log probabilities for a given batch."""
         KL_logps = None
         if self.calculate_KL:
@@ -1368,6 +1552,30 @@ class KTOTrainer(_BaseTrainer):
         return KL_logps
 
     def _compute_loss(self, model, inputs, return_outputs):
+        # [FUNCTION DOC]
+        # Computes the KTO / APO-zero-unpaired loss and metrics for a batch.
+        # Behavior:
+        # 1. Move tensors to device; count chosen (label True) and rejected; KL log-probs via
+        # _compute_kl_logps (no grad).
+        # 2. Policy forward with fused head (router logits when aux loss enabled), labels masking the
+        # prompt; summed completion log-probs; error if batch size differs from labels length. Split into
+        # chosen/rejected by label.
+        # 3. Reference: precomputed batch columns, or a no-grad forward of the ref model / ref adapter /
+        # disabled adapter, plus reference KL log-probs.
+        # 4. kl = mean of (policy KL logps minus ref KL logps), detached, gathered, averaged, clamped >= 0
+        # (zero if KL disabled).
+        # 5. kto: chosen loss 1 minus sigmoid(beta times (logratio minus kl)); rejected loss 1 minus
+        # sigmoid(beta times (kl minus logratio)). apo_zero_unpaired: chosen 1 minus sigmoid(beta times
+        # logratio); rejected sigmoid(beta times logratio). Rewards are beta times logratios. Empty groups
+        # give empty tensors. Losses concatenated after weighting by desirable/undesirable weights.
+        # 6. Metrics: kl, token-weighted entropy over completion tokens, num_tokens (train total divided by
+        # tp size), logits/chosen and logits/rejected (token averages of mean_logits), rewards/ and
+        # logps/ chosen and rejected (sums over global counts), rewards/margins, aux_loss.
+        # 7. loss = nanmean of losses, plus router_aux_loss_coef times aux loss when enabled.
+        # 8. If return_outputs: FutureWarning and an extra no-grad forward to get logits.
+        # Inputs: model, inputs, return_outputs. Outputs: loss or (loss, outputs).
+        # Exceptions: ValueError on size mismatch.
+        # Side effects: updates _metrics and _total_train_tokens; cross-process gathers.
         """Compute the KTO loss and other metrics for the given batch of inputs for train or test."""
         mode = "train" if self.model.training else "eval"
         batch = {k: (v.to(self.accelerator.device) if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
@@ -1573,6 +1781,14 @@ class KTOTrainer(_BaseTrainer):
         ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Override preparing datasets passed directly to evaluate.
+        # Behavior: for non-vision trainers with a non-string eval_dataset: if precomputing with no
+        # ref_model, no PEFT and global_step > 0, raise (reference no longer available); prepare datasets
+        # (per key for dicts); precompute ref log-probs if enabled; for dicts call Trainer.evaluate per
+        # split with prefix "<metric_key_prefix>_<name>" and merge metrics. Otherwise delegate.
+        # Inputs: eval_dataset, ignore_keys, metric_key_prefix. Outputs: metrics dict.
+        # Exceptions: ValueError as above. Side effects: evaluation logging, cache files.
         # When a dataset is passed directly to `evaluate` (e.g. a held-out test set), preprocess it the same way
         # `__init__` does, so that `evaluate` accepts the same dataset types as the trainer. `_prepare_dataset` is
         # idempotent: it skips datasets that are already tokenized. A `str` selects a dataset that was already prepared
@@ -1631,6 +1847,11 @@ class KTOTrainer(_BaseTrainer):
         )
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Calls _compute_loss and rewrites the processor error "Image features and image tokens do not
+        # match" into a clearer ValueError about max_length truncating image tokens (when max_length set).
+        # Inputs: model, inputs, return_outputs, num_items_in_batch (unused). Outputs: as _compute_loss.
+        # Exceptions: ValueError (rewritten or re-raised). Side effects: those of _compute_loss.
         try:
             return self._compute_loss(model, inputs, return_outputs)
         except ValueError as e:
@@ -1644,10 +1865,17 @@ class KTOTrainer(_BaseTrainer):
 
     # Override training step to add activation offloading context.
     def training_step(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Runs Trainer.training_step inside maybe_activation_offload_context. Inputs: passthrough.
+        # Outputs: the parent's loss. Exceptions: none of its own. Side effects: parent step.
         with self.maybe_activation_offload_context:
             return super().training_step(*args, **kwargs)
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Averages _metrics[mode], prefixes "eval_" in eval mode, merges into logs, calls the parent log,
+        # then clears _metrics[mode]. Inputs: logs, start_time. Outputs: none. Exceptions: none expected.
+        # Side effects: mutates logs and metric store.
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
@@ -1661,6 +1889,13 @@ class KTOTrainer(_BaseTrainer):
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and
     # returns logits. We override prediction_step to force compute_loss, because this trainer doesn't involve labels.
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Forces loss computation during evaluation (there are no label columns).
+        # Behavior: prepares inputs; under no_grad and the loss context, returns (loss, None, None) when
+        # prediction_loss_only, else (loss, outputs.logits, input_ids) using the deprecated
+        # return_outputs path.
+        # Inputs: model, inputs, prediction_loss_only, ignore_keys (unused). Outputs: tuple.
+        # Exceptions: those of compute_loss. Side effects: metric updates via compute_loss.
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad(), self.compute_loss_context_manager():
             if prediction_loss_only:
@@ -1673,6 +1908,10 @@ class KTOTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Creates a model card (name from hub_model_id last component or output_dir basename) before the
+        # parent checkpoint save. Inputs: model, trial. Outputs: none. Exceptions: I/O errors.
+        # Side effects: writes model card and checkpoint files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:

@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Script that builds the "zen" text test dataset (lines of the Zen of Python) in every TRL dataset format and
+# optionally pushes each format as a separate config of one Hub dataset repo.
+# Contents: ScriptArguments (CLI options) and main; run as a script, args parsed with HfArgumentParser.
+# Inputs: CLI flags --test_size, --push_to_hub, --repo_id.
+# Outputs: none returned.
+# Exceptions: propagates HfArgumentParser and datasets/Hub errors.
+# Side effects: none at import time; network uploads when pushing.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +29,10 @@ from transformers import HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of command-line options: test_size (float, default 0.1) test-split fraction; push_to_hub (bool,
+    # default False) whether to upload; repo_id (str, default "trl-internal-testing/zen") target dataset repo.
+    # No methods; parsed by HfArgumentParser in the __main__ block.
     r"""
     Arguments for the script.
 
@@ -47,6 +60,18 @@ class ScriptArguments:
 
 
 def main(test_size, push_to_hub, repo_id):
+    # [FUNCTION DOC]
+    # Builds twelve 19-example datasets from the Zen of Python and optionally pushes each as a named config.
+    # Behavior: for the standard (plain text) family builds, in order, language_modeling (text), prompt_only
+    # (prompt), prompt_completion (prompt, completion), preference (prompt, chosen, rejected),
+    # implicit_prompt_preference (chosen, rejected full sentences) and unpaired_preference (prompt, completion,
+    # boolean label). The conversational family repeats the same six formats using lists of role/content message
+    # dicts (question/answer turns) instead of strings. Each dataset is split into train/test without shuffling
+    # using test_size, and pushed with config_name "<family>_<format>" (e.g. standard_preference) when push_to_hub.
+    # Inputs: test_size (float), push_to_hub (bool), repo_id (str).
+    # Outputs: None.
+    # Exceptions: propagates datasets / Hub errors.
+    # Side effects: network uploads to repo_id when push_to_hub is true.
     # fmt: off
     standard_language_modeling_dataset = Dataset.from_dict({
         "text": [

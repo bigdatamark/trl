@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for the experimental A2PO trainer (two-stage: Stage 1 estimates an optimal value V* per prompt by
+# sampling, Stage 2 regresses on one on-policy generation), using the tiny Qwen2.5 causal LM and tiny
+# in-memory prompt datasets.
+# Contents: completion_parity_reward helper and TestA2POTrainer.
+# Side effects at import: none beyond imports; tests download tiny models from the Hub and write to temp dirs.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,12 +29,22 @@ from ..testing_utils import TrlTestCase
 
 
 def completion_parity_reward(completions, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Binary reward that varies by completion: 1.0 when the completion length is even, else 0.0.
+    # Inputs: completions (list), extra kwargs ignored. Outputs: list of float. Exceptions: none. Side effects: none.
     """Completion-dependent binary reward, so samples within a prompt vary (nonzero advantages)."""
     return [float(len(completion) % 2 == 0) for completion in completions]
 
 
 class TestA2POTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # Test class for A2POTrainer; inherits TrlTestCase, which provides a per-test temporary output dir (tmp_dir).
+    # Each test builds a real A2POConfig and A2POTrainer with report_to disabled.
     def test_trust_remote_code(self):
+        # [FUNCTION DOC]
+        # Checks remote-code gating: building the trainer from tiny-RemoteForCausalLM without trust_remote_code raises
+        # ValueError mentioning "custom code"; with trust_remote_code set it loads and the model class name is
+        # RemoteForCausalLM.
         dataset = Dataset.from_dict({"prompt": ["The capital of France is", "Two plus two equals"]})
         model_id = "trl-internal-testing/tiny-RemoteForCausalLM"
 
@@ -48,6 +65,10 @@ class TestA2POTrainer(TrlTestCase):
         assert type(trainer.model).__name__ == "RemoteForCausalLM"
 
     def test_train(self):
+        # [FUNCTION DOC]
+        # End-to-end smoke test: 4 prompts, lr 0.1, batch size 2, max completion length 8, 2 value samples, no
+        # all-incorrect filtering. Asserts the last log has train_loss, the cached _optimal_values has one entry per
+        # prompt, and every parameter changed compared with a pre-training clone.
         # Main two-stage smoke test: Stage 1 estimates V*, Stage 2 regresses on a single on-policy generation.
         dataset = Dataset.from_dict(
             {"prompt": ["The capital of France is", "Two plus two equals", "Water is made of", "The sky is"]}
@@ -81,6 +102,9 @@ class TestA2POTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("eval_dataset_type", ["dataset", "dataset_dict", "dict_of_dataset", "none"])
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over eval dataset forms (single Dataset, DatasetDict, plain dict of Datasets, None). Asserts the
+        # trainer keeps None as None, exposes dict forms with keys data1 and data2, and keeps a single Dataset by identity.
         train_dataset = Dataset.from_dict(
             {"prompt": ["The capital of France is", "Two plus two equals", "Water is made of", "The sky is"]}
         )
@@ -112,10 +136,17 @@ class TestA2POTrainer(TrlTestCase):
             assert trainer.eval_dataset is eval_dataset
 
     def test_reward_kwargs_are_forwarded(self):
+        # [FUNCTION DOC]
+        # Regression test: an extra dataset column (subject) must be forwarded to the reward function. Trains with a
+        # reward that records the received subject values and returns all ones; asserts something was received and
+        # every value belongs to the dataset's subject set.
         # Regression test: extra dataset columns must reach the reward function (e.g. a verifier needs `solution`).
         received_subjects = []
 
         def reward_using_extra_column(prompts, completions, subject, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Reward that appends the subject column values to the enclosing received_subjects list and returns 1.0
+            # per prompt. Side effects: mutates received_subjects.
             received_subjects.extend(subject)
             return [1.0] * len(prompts)
 
@@ -142,8 +173,14 @@ class TestA2POTrainer(TrlTestCase):
         assert set(received_subjects) <= {"math", "geo", "chem", "phys"}
 
     def test_filter_all_incorrect_drops_prompts(self):
+        # [FUNCTION DOC]
+        # Regression test for filter_all_incorrect: with a reward equal to a per-row target column (1, 0, 1), the
+        # prompt whose Stage 1 samples all score zero must be removed rather than causing a KeyError in Stage 2.
+        # Asserts training completes, the train dataset has 2 rows and "unsolvable" is absent.
         # Regression test: prompts whose reference samples all score zero must be dropped, not crash Stage 2.
         def reward_from_target(prompts, completions, target, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the target column values cast to float, ignoring prompts and completions. Side effects: none.
             return [float(t) for t in target]
 
         dataset = Dataset.from_dict({"prompt": ["solvable a", "unsolvable", "solvable b"], "target": [1, 0, 1]})
@@ -170,6 +207,9 @@ class TestA2POTrainer(TrlTestCase):
         assert "unsolvable" not in list(trainer.train_dataset["prompt"])
 
     def test_evaluate(self):
+        # [FUNCTION DOC]
+        # Regression test: calling evaluate without prior training works and computes V* for unseen eval prompts.
+        # Asserts eval_loss is in the metrics and both eval prompts (gamma, delta) are keys of _optimal_values.
         # Regression test: eval prompts (never seen in training) must also get a cached V*, and evaluating
         # without a preceding train() must not raise.
         train_dataset = Dataset.from_dict({"prompt": ["alpha", "beta"]})

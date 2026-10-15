@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Command-line training script for RewardTrainer (runnable directly, via "trl reward", or as a PEP 723 script).
+# Contents: main (builds kwargs, loads data, trains, saves/pushes) and make_parser (TrlParser over
+# ScriptArguments-style args, RewardConfig, ModelConfig, DatasetMixtureConfig).
+# Import-time side effects: imports argparse only (heavy
+# imports are deferred into main / make_parser); under __main__ it parses args/config and runs main.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +32,23 @@ import argparse
 
 
 def main(script_args, training_args, model_args, dataset_args):
+    # [FUNCTION DOC]
+    # Behavior:
+    # - Builds model_init_kwargs from model_args (model_revision as revision, attn_implementation, dtype) plus
+    #   training_args.trust_remote_code, overridden by any user model_init_kwargs, and writes it back to
+    #   training_args.model_init_kwargs.
+    # - Dataset: if dataset_args.datasets is set, uses get_dataset (warning that dataset_name is ignored when both
+    #   are set); else loads script_args.dataset_name with dataset_config and streaming; else error.
+    # - Instantiates RewardTrainer with the model id, train split dataset_train_split, eval split dataset_test_split only
+    #   when eval_strategy is not "no", quantization config from get_quantization_config and peft config from
+    #   get_peft_config.
+    # - Trains (resume_from_checkpoint), saves to output_dir, pushes to the Hub if push_to_hub (dataset_name as
+    #   model card dataset), and calls trainer.end() on transformers 5.18.0 or newer.
+    # Inputs: script_args, training_args (RewardConfig), model_args (ModelConfig), dataset_args (DatasetMixtureConfig).
+    # Outputs: none.
+    # Exceptions: ValueError when neither datasets nor dataset_name is given; loading/training errors propagate.
+    # Side effects: mutates training_args fields, downloads models/datasets, writes checkpoints and the final model
+    # to output_dir, may push to the Hub, prints status via accelerator.print, logs a warning.
     import transformers
     from accelerate.logging import get_logger
     from datasets import load_dataset
@@ -90,6 +114,12 @@ def main(script_args, training_args, model_args, dataset_args):
 
 
 def make_parser(subparsers: argparse._SubParsersAction | None = None, prog: str | None = None):
+    # [FUNCTION DOC]
+    # Behavior: builds the dataclass tuple (ScriptArguments, RewardConfig, ModelConfig, DatasetMixtureConfig); if subparsers is given,
+    # registers a "reward" subcommand on it (used by the trl CLI), otherwise creates a standalone TrlParser with prog.
+    # Inputs: subparsers (optional argparse subparsers action), prog (optional program name).
+    # Outputs: the parser / subparser.
+    # Exceptions: none expected. Side effects: registers a subcommand when subparsers is given.
     from trl import DatasetMixtureConfig, ModelConfig, RewardConfig, ScriptArguments, TrlParser
 
     dataclass_types = (ScriptArguments, RewardConfig, ModelConfig, DatasetMixtureConfig)

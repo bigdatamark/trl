@@ -1,3 +1,17 @@
+# [MODULE DOC]
+# Example training script: Triple Preference Optimization (experimental TPOTrainer) on a triple-preference dataset with
+# prompt, reference (gold), chosen and rejected completions; can build that schema from raw openbmb/UltraFeedback.
+# Contents: build_triple_preference_from_ultrafeedback, to_conversational, and the main-guard script body.
+# Main-guard behavior: parses ScriptArguments, TPOConfig and ModelConfig with HfArgumentParser (CLI only, no config
+# file); loads AutoModelForCausalLM with revision, attention, dtype (torch dtype unless auto/None) and quantization
+# only when set; loads the tokenizer and uses eos as pad when missing; loads the dataset; if the first train row has
+# completions and instruction columns, maps it through the UltraFeedback builder removing all original columns and
+# filters rows whose reference is None; if the (new) first row has all four keys and a string prompt, wraps rows in
+# conversational form; builds TPOTrainer (eval split only when eval enabled, optional PEFT); trains; when eval is
+# enabled runs a final evaluate and logs/saves eval metrics; saves, optionally pushes, calls end.
+# Inputs: CLI args. Outputs: trained model in output_dir. Exceptions: propagated. Side effects: downloads, training,
+# file writes, optional Hub upload. Importing has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -99,6 +113,14 @@ from trl.experimental.tpo import TPOConfig, TPOTrainer
 
 
 def build_triple_preference_from_ultrafeedback(example):
+    # [FUNCTION DOC]
+    # HELPER: Map function building one triple-preference example from an UltraFeedback row.
+    # Behavior: keeps completions that have a non-None overall_score and a non-empty response; if fewer than 3 remain,
+    # returns all four fields as None (filtered downstream). Otherwise sorts by overall_score descending and returns the
+    # instruction as a single user message prompt, and single assistant messages for reference (highest), chosen (second
+    # highest) and rejected (lowest).
+    # Inputs: example (dict with completions list and instruction). Outputs: dict with prompt, reference, chosen, rejected.
+    # Exceptions: KeyError if instruction or completions is missing. Side effects: none.
     """
     Build a TPO triple-preference example from a raw UltraFeedback row.
 
@@ -125,6 +147,11 @@ def build_triple_preference_from_ultrafeedback(example):
 
 
 def to_conversational(example):
+    # [FUNCTION DOC]
+    # HELPER: Map function wrapping plain-string prompt/reference/chosen/rejected into conversational messages (one user
+    # message for prompt, one assistant message for each completion).
+    # Inputs: example (dict with the four string fields). Outputs: dict with the four conversational fields.
+    # Exceptions: KeyError on missing fields. Side effects: none.
     """
     Wrap a standard-format triple-preference example (plain strings) in the *conversational* format, so that
     [`TPOTrainer`] applies the model's chat template automatically. This is the format expected by Instruct models; for

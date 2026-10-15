@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Deprecated "trl vllm-serve" command: translates TRL-style ScriptArguments into a "vllm serve" command line
+# with the settings TRL trainers need (NCCL weight transfer, processed logprobs, unlimited logprobs, scale-out
+# endpoints) and replaces the current process with it. Contents: ScriptArguments, build_command, main,
+# make_parser. Import-time side effects: imports trl.import_utils only; under __main__ parses args (unknown
+# args are forwarded to vllm) and execs the server.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +32,13 @@ from trl.import_utils import is_vllm_available
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of server options mirroring vllm serve flags: model (required), revision, tensor_parallel_size (1),
+    # data_parallel_size (1), host ("0.0.0.0"), port (8000), gpu_memory_utilization (0.9), dtype ("auto"),
+    # max_model_len, enable_prefix_caching (None means vLLM default), enforce_eager (False), kv_cache_dtype
+    # ("auto"), trust_remote_code (False), log_level ("info", for uvicorn), vllm_model_impl ("vllm"),
+    # distributed_executor_backend (e.g. "ray"), speculative_config (JSON string). Distinct from
+    # trl.scripts.utils.ScriptArguments. No methods.
     r"""
     Arguments for the script.
 
@@ -193,6 +207,16 @@ class ScriptArguments:
 
 
 def build_command(script_args: ScriptArguments, extra_args: list[str] | None = None) -> list[str]:
+    # [FUNCTION DOC]
+    # Behavior: builds the argv list: Python executable, "-m vllm.entrypoints.cli.main serve <model>", then host,
+    # port, tensor/data parallel sizes, gpu memory utilization, dtype, kv cache dtype, model impl and uvicorn log
+    # level. Conditionally appends revision, max model len, enable / no-enable prefix caching (only when not
+    # None), enforce eager, trust remote code, distributed executor backend, speculative config. Appends
+    # "--enable-scale-out" when vLLM 0.30.0 or newer is installed, then always the weight-transfer config JSON
+    # with backend nccl, logprobs mode processed_logprobs and max logprobs -1, then extra_args verbatim.
+    # Inputs: script_args (ScriptArguments), extra_args (optional list of str).
+    # Outputs: list of str.
+    # Exceptions: none expected. Side effects: none (checks installed vLLM version).
     """
     Build the `vllm serve` command line that serves `script_args` the way TRL trainers expect.
 
@@ -277,6 +301,13 @@ def build_command(script_args: ScriptArguments, extra_args: list[str] | None = N
 
 
 def main(script_args: ScriptArguments, extra_args: list[str] | None = None):
+    # [FUNCTION DOC]
+    # Behavior: builds the command, copies the environment with VLLM_SERVER_DEV_MODE set to "1" (needed for the
+    # weight-transfer and prefix-cache endpoints), emits a FutureWarning (deprecated, removal in v2.0.0) showing
+    # the equivalent shell-quoted "vllm serve ..." command, then execve's the Python executable with the command.
+    # Inputs: script_args, extra_args (optional). Outputs: never returns on success.
+    # Exceptions: OSError if exec fails.
+    # Side effects: warning; replaces the current process image.
     command = build_command(script_args, extra_args)
     env = os.environ.copy()
     # The weight-transfer and prefix-cache endpoints that trainers rely on live behind vLLM's dev mode.
@@ -294,6 +325,11 @@ def main(script_args: ScriptArguments, extra_args: list[str] | None = None):
 
 
 def make_parser(subparsers: argparse._SubParsersAction | None = None, prog: str | None = None):
+    # [FUNCTION DOC]
+    # Behavior: registers a "vllm-serve" subcommand with ScriptArguments when subparsers is given, else creates a
+    # TrlParser over ScriptArguments with prog.
+    # Inputs: subparsers (optional), prog (optional). Outputs: parser. Exceptions: none.
+    # Side effects: registers a subcommand when subparsers is given.
     from trl import TrlParser
 
     if subparsers is not None:

@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Tests for the vLLM client/server integration (trl.generation.vllm_client.VLLMClient, parse_logprobs and
+# trl.generation.vllm_generation.extract_logprobs).
+# Contents: offline unit tests with a patched client (connection pool sizing, reset_prefix_cache with empty body,
+# helpful errors for missing server settings), pure parsing tests for logprob extraction, and live server tests that
+# launch "vllm serve" in a subprocess on a separate accelerator (single GPU, base_url construction, tensor parallel
+# size 2, explicit communicator device, and a vision-language model).
+# Import-time side effects: imports requests and vllm when available; builds VLLM_SERVE_TRL_ARGS (NCCL weight
+# transfer, processed logprobs, unlimited max logprobs, plus --enable-scale-out on vLLM >= 0.30.0).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,8 +70,14 @@ if is_vllm_available(min_version="0.30.0"):
 
 @require_requests
 class TestConnectionPoolSize(TrlTestCase):
+    # [CLASS DOC]
+    # Tests that the client's HTTP session keeps enough pooled connections for concurrent generation. Requires requests.
     @pytest.mark.parametrize("scheme", ["http", "https"])
     def test_pool_capacity_covers_default_concurrency(self, scheme):
+        # [FUNCTION DOC]
+        # Builds a VLLMClient with availability/server checks and model listing patched out, then, for http and https
+        # (parametrized), asserts the session adapter's connection pool maxsize is at least _DEFAULT_GENERATION_CONCURRENCY.
+        # Inputs: scheme. Outputs: none. Exceptions: AssertionError on failure. Side effects: none.
         with (
             patch("trl.generation.vllm_client.is_vllm_available", return_value=True),
             patch.object(VLLMClient, "check_server"),
@@ -79,7 +95,13 @@ class TestConnectionPoolSize(TrlTestCase):
 
 @require_requests
 class TestResetPrefixCache(TrlTestCase):
+    # [CLASS DOC]
+    # Tests reset_prefix_cache against old vLLM servers that reply with an empty body. Requires requests.
     def test_empty_response_body(self):
+        # [FUNCTION DOC]
+        # Creates a patched client, forces the "legacy server" code path (_HAS_RESET_PREFIX_CACHE_SUCCESS False) and a 200
+        # response with empty content from session.post; asserts reset_prefix_cache does not raise.
+        # Inputs: none. Outputs: none. Exceptions: test fails on any raised error. Side effects: none.
         # Before vLLM 0.26.0 (vllm-project/vllm#46893), `/reset_prefix_cache` answers with an empty body.
         response = requests.Response()
         response.status_code = 200
@@ -100,8 +122,14 @@ class TestResetPrefixCache(TrlTestCase):
 
 @require_requests
 class TestMissingServerSettings(TrlTestCase):
+    # [CLASS DOC]
+    # Tests that the client explains which vllm serve settings are missing (dev mode, weight transfer config, scale-out).
+    # Provides static helpers to build a patched client and fake requests.Response objects. Requires requests.
     @staticmethod
     def make_client():
+        # [FUNCTION DOC]
+        # HELPER: Static method returning a VLLMClient for 127.0.0.1 constructed with availability check, server check and
+        # model listing patched. Inputs: none. Outputs: VLLMClient. Exceptions: none. Side effects: none.
         with (
             patch("trl.generation.vllm_client.is_vllm_available", return_value=True),
             patch.object(VLLMClient, "check_server"),
@@ -111,27 +139,41 @@ class TestMissingServerSettings(TrlTestCase):
 
     @staticmethod
     def make_response(status_code, body=None):
+        # [FUNCTION DOC]
+        # HELPER: Static method building a requests.Response with the given status code and JSON-encoded body (empty bytes
+        # when body is None). Inputs: status_code, body (optional). Outputs: Response. Exceptions: none. Side effects: none.
         response = requests.Response()
         response.status_code = status_code
         response._content = json.dumps(body).encode() if body is not None else b""
         return response
 
     def server_info(self, weight_transfer_config):
+        # [FUNCTION DOC]
+        # HELPER: Returns a 200 response whose body mimics the server info endpoint: vllm_config with the given
+        # weight_transfer_config. Inputs: weight_transfer_config (dict or None). Outputs: Response. Side effects: none.
         return self.make_response(200, {"vllm_config": {"weight_transfer_config": weight_transfer_config}})
 
     def test_get_server_info(self):
+        # [FUNCTION DOC]
+        # Patches session.get to return server info with an NCCL backend; asserts get_server_info returns the vllm_config dict.
         client = self.make_client()
         response = self.server_info(weight_transfer_config={"backend": "nccl"})
         with patch.object(client.session, "get", return_value=response):
             assert client.get_server_info() == {"weight_transfer_config": {"backend": "nccl"}}
 
     def test_init_communicator_without_dev_mode(self):
+        # [FUNCTION DOC]
+        # Patches session.get to return 404 (info endpoint missing); asserts init_communicator raises RuntimeError mentioning
+        # VLLM_SERVER_DEV_MODE=1.
         client = self.make_client()
         with patch.object(client.session, "get", return_value=self.make_response(404)):
             with pytest.raises(RuntimeError, match="VLLM_SERVER_DEV_MODE=1"):
                 client.init_communicator()
 
     def test_init_communicator_without_weight_transfer_config(self):
+        # [FUNCTION DOC]
+        # Patches server info with weight_transfer_config None; asserts init_communicator raises RuntimeError mentioning
+        # --weight-transfer-config.
         client = self.make_client()
         response = self.server_info(weight_transfer_config=None)
         with patch.object(client.session, "get", return_value=response):
@@ -140,6 +182,9 @@ class TestMissingServerSettings(TrlTestCase):
 
     @require_vision
     def test_image_features_without_scale_out(self):
+        # [FUNCTION DOC]
+        # Requires vision. Patches session.post to return 404; asserts image_features on one 8x8 image raises RuntimeError
+        # mentioning --enable-scale-out.
         from PIL import Image
 
         client = self.make_client()
@@ -149,7 +194,13 @@ class TestMissingServerSettings(TrlTestCase):
 
 
 class TestParseLogprobs(TrlTestCase):
+    # [CLASS DOC]
+    # Pure tests of parse_logprobs, which converts OpenAI-style logprob payloads (token strings "token_id:N") into
+    # per-sequence, per-position lists sorted by descending probability.
     def test_completion_logprobs_sorted_by_probability(self):
+        # [FUNCTION DOC]
+        # Completions-API format (tokens/token_logprobs/top_logprobs): asserts token ids and logprobs per position are
+        # sorted descending (99 before 11) and wrapped in one sequence.
         logprobs = {
             "tokens": ["token_id:11", "token_id:5"],
             "token_logprobs": [-0.2, -1.1],
@@ -162,6 +213,9 @@ class TestParseLogprobs(TrlTestCase):
         assert all_logprobs == [[[-0.1, -0.2], [-1.1]]]
 
     def test_chat_logprobs(self):
+        # [FUNCTION DOC]
+        # Chat-API format (content entries with top_logprobs): asserts the single position yields ids [3, 7] and logprobs
+        # [-0.4, -0.5].
         logprobs = {
             "content": [
                 {
@@ -181,11 +235,18 @@ class TestParseLogprobs(TrlTestCase):
         assert all_logprobs == [[[-0.4, -0.5]]]
 
     def test_returns_none_when_logprobs_missing(self):
+        # [FUNCTION DOC]
+        # Asserts parse_logprobs on a list containing None returns (None, None).
         assert parse_logprobs([None]) == (None, None)
 
 
 class TestExtractLogprobs(TrlTestCase):
+    # [CLASS DOC]
+    # Pure tests of extract_logprobs on vLLM RequestOutput-shaped objects (built with SimpleNamespace).
     def test_extract_logprobs_sorts_by_rank_and_replaces_nan(self):
+        # [FUNCTION DOC]
+        # Two requests with per-position dicts of token id to (rank, logprob); asserts entries are ordered by rank and NaN
+        # logprobs become None.
         all_outputs = [
             SimpleNamespace(
                 outputs=[
@@ -229,6 +290,8 @@ class TestExtractLogprobs(TrlTestCase):
         ]
 
     def test_extract_logprobs_returns_none_token_ids_when_logprobs_missing(self):
+        # [FUNCTION DOC]
+        # Asserts both returned values are None when an output has logprobs None.
         all_outputs = [SimpleNamespace(outputs=[SimpleNamespace(logprobs=None)])]
 
         all_logprobs, all_token_ids = extract_logprobs(all_outputs)
@@ -241,10 +304,18 @@ class TestExtractLogprobs(TrlTestCase):
 @require_vllm
 @pytest.mark.xdist_group("vllm_server")
 class TestVLLMClientServer(TrlTestCase):
+    # [CLASS DOC]
+    # Live tests against a vLLM server for Qwen/Qwen2.5-1.5B on accelerator 1, with a host-based client. Requires multiple accelerators and vLLM; grouped on one xdist worker. Server and client are shared class-wide (setup_class / teardown_class).
     model_id = "Qwen/Qwen2.5-1.5B"
 
     @classmethod
     def setup_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Class setup: copies the environment, restricts visible devices (accelerator 1) via CUDA_VISIBLE_DEVICES or
+        # ZE_AFFINITY_MASK on XPU, sets VLLM_SERVER_DEV_MODE=1, starts "vllm serve <model_id>"  with the TRL serve args
+        # as a subprocess, and creates a host-based VLLMClient with an initialized weight-sync communicator.
+        # Inputs: cls. Outputs: none. Exceptions: client connection timeout (240 s) errors.
+        # Side effects: spawns a server process; stores cls.server_process, cls.client.
         # We want the server to run on accelerator 1, so we set VISIBLE_DEVICES to "1"
         env = os.environ.copy()
         VISIBLE_DEVICES = "ZE_AFFINITY_MASK" if torch_device == "xpu" else "CUDA_VISIBLE_DEVICES"
@@ -259,6 +330,9 @@ class TestVLLMClientServer(TrlTestCase):
         cls.client.init_communicator()
 
     def test_generate(self):
+        # [FUNCTION DOC]
+        # Generates for two text prompts; asserts prompt_ids and completion_ids are lists with one entry per prompt and that
+        # every token is an int.
         prompts = ["Hello, AI!", "Tell me a joke"]
         outputs = self.client.generate(prompts)
         prompt_ids = outputs["prompt_ids"]
@@ -279,6 +353,8 @@ class TestVLLMClientServer(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
 
     def test_generate_with_logprobs_none(self):
+        # [FUNCTION DOC]
+        # Generates with logprobs=None; asserts id lists are returned and logprobs and logprob_token_ids are None.
         outputs = self.client.generate(["Hello, AI!"], logprobs=None)
 
         assert isinstance(outputs["prompt_ids"], list)
@@ -287,6 +363,8 @@ class TestVLLMClientServer(TrlTestCase):
         assert outputs["logprob_token_ids"] is None
 
     def test_chat(self):
+        # [FUNCTION DOC]
+        # Chats with two single-turn conversations; asserts one prompt/completion entry per conversation, all int tokens.
         messages = [[{"role": "user", "content": "Hello, AI!"}], [{"role": "user", "content": "Tell me a joke"}]]
         outputs = self.client.chat(messages)
         prompt_ids = outputs["prompt_ids"]
@@ -307,6 +385,8 @@ class TestVLLMClientServer(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
 
     def test_chat_with_logprobs_none(self):
+        # [FUNCTION DOC]
+        # Chats with logprobs=None; asserts id lists are returned and logprobs and logprob_token_ids are None.
         outputs = self.client.chat([[{"role": "user", "content": "Hello, AI!"}]], logprobs=None)
 
         assert isinstance(outputs["prompt_ids"], list)
@@ -315,7 +395,13 @@ class TestVLLMClientServer(TrlTestCase):
         assert outputs["logprob_token_ids"] is None
 
     def test_chat_with_tools(self):
+        # [FUNCTION DOC]
+        # Chats with a multiply tool function; decodes the returned prompt ids with the model tokenizer and asserts the tool's
+        # docstring description "Multiplies two integers." was rendered into the prompt.
         def multiply(a: int, b: int) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Dummy tool whose signature and docstring are converted into a tool schema; returns a times b.
+            # Inputs: a, b (int). Outputs: int. Exceptions: none. Side effects: none.
             """
             Multiplies two integers.
 
@@ -337,6 +423,8 @@ class TestVLLMClientServer(TrlTestCase):
         assert "Multiplies two integers." in decoded_prompt
 
     def test_generate_with_token_ids(self):
+        # [FUNCTION DOC]
+        # Generates from pre-tokenized prompts; asserts returned prompt_ids equal the input ids and all tokens are ints.
         tokenizer = AutoTokenizer.from_pretrained(self.model_id)
         prompts = ["Hello, AI!", "Tell me a joke"]
         prompt_token_ids = tokenizer(prompts)["input_ids"]
@@ -362,6 +450,9 @@ class TestVLLMClientServer(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
 
     def test_generate_with_params(self):
+        # [FUNCTION DOC]
+        # Generates with n=2, repetition_penalty 0.9, temperature 0.8, max_tokens 32; asserts 2 completions per prompt, int
+        # tokens, and each completion at most 32 tokens.
         prompts = ["Hello, AI!", "Tell me a joke"]
         completion_ids = self.client.generate(prompts, n=2, repetition_penalty=0.9, temperature=0.8, max_tokens=32)[
             "completion_ids"
@@ -382,15 +473,27 @@ class TestVLLMClientServer(TrlTestCase):
             assert len(seq) <= 32
 
     def test_update_model_params(self):
+        # [FUNCTION DOC]
+        # Loads the same model locally on the test device and pushes its weights to the server via update_model_params
+        # (passes if no error).
         model = AutoModelForCausalLM.from_pretrained(self.model_id, device_map=torch_device)
         self.client.update_model_params(model)
 
     def test_reset_prefix_cache(self):
+        # [FUNCTION DOC]
+        # Calls reset_prefix_cache on the live server (passes if no error).
         # Test resetting the prefix cache
         self.client.reset_prefix_cache()
 
     @pytest.mark.xfail(reason="Importing `bitsandbytes` causes issues, see vllm-project/vllm#32793")
     def test_logprobs_match_with_non_default_sampling(self):
+        # [FUNCTION DOC]
+        # Marked xfail (bitsandbytes import issue in vLLM). Generates from the server with temperature 0.7, repetition penalty
+        # 1.05, top_p 0.9, 8 tokens, 5 logprobs and seed 1234, then runs the same sampling with an in-process vLLM LLM
+        # (processed_logprobs mode, spawn multiprocessing). Asserts prompt/completion ids match, multiple logprobs per token,
+        # logprob token ids match and values match within 1e-6, logprobs at each position are sorted descending, and each
+        # sampled token appears among that position's logprob token ids.
+        # Side effects: sets VLLM_WORKER_MULTIPROC_METHOD=spawn in os.environ; allocates a second engine on the test device.
         prompts = ["Hello, AI!", "Tell me a joke"]
         # Use non-default sampling parameters (especially temperature) to ensure vLLM applies logprob processing. With
         # default sampling, raw and processed logprobs are identical, so mismatches would not be detected.
@@ -472,6 +575,9 @@ class TestVLLMClientServer(TrlTestCase):
 
     @classmethod
     def teardown_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Class teardown: closes the client communicator, then kills the server process tree with kill_process to avoid zombie processes.
+        # Inputs: cls. Outputs: none. Side effects: terminates processes.
         # Close the client
         cls.client.close_communicator()
 
@@ -485,10 +591,18 @@ class TestVLLMClientServer(TrlTestCase):
 @require_vllm
 @pytest.mark.xdist_group("vllm_server")
 class TestVLLMClientServerBaseURL(TrlTestCase):
+    # [CLASS DOC]
+    # Same live tests as TestVLLMClientServer, but the client is constructed from base_url instead of host. Requires multiple accelerators and vLLM.
     model_id = "Qwen/Qwen2.5-1.5B"
 
     @classmethod
     def setup_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Class setup: copies the environment, restricts visible devices (accelerator 1) via CUDA_VISIBLE_DEVICES or
+        # ZE_AFFINITY_MASK on XPU, sets VLLM_SERVER_DEV_MODE=1, starts "vllm serve <model_id>"  with the TRL serve args
+        # as a subprocess, and creates a VLLMClient from base_url http://localhost:8000 with an initialized communicator.
+        # Inputs: cls. Outputs: none. Exceptions: client connection timeout (240 s) errors.
+        # Side effects: spawns a server process; stores cls.server_process, cls.client.
         # We want the server to run on accelerator 1, so we set VISIBLE_DEVICES to "1"
         env = os.environ.copy()
         VISIBLE_DEVICES = "ZE_AFFINITY_MASK" if torch_device == "xpu" else "CUDA_VISIBLE_DEVICES"
@@ -503,6 +617,9 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
         cls.client.init_communicator()
 
     def test_generate(self):
+        # [FUNCTION DOC]
+        # Generates for two text prompts; asserts prompt_ids and completion_ids are lists with one entry per prompt and that
+        # every token is an int.
         prompts = ["Hello, AI!", "Tell me a joke"]
         outputs = self.client.generate(prompts)
         prompt_ids = outputs["prompt_ids"]
@@ -523,6 +640,8 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
 
     def test_generate_with_logprobs_none(self):
+        # [FUNCTION DOC]
+        # Generates with logprobs=None; asserts id lists are returned and logprobs and logprob_token_ids are None.
         outputs = self.client.generate(["Hello, AI!"], logprobs=None)
 
         assert isinstance(outputs["prompt_ids"], list)
@@ -531,6 +650,8 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
         assert outputs["logprob_token_ids"] is None
 
     def test_chat(self):
+        # [FUNCTION DOC]
+        # Chats with two single-turn conversations; asserts one prompt/completion entry per conversation, all int tokens.
         messages = [[{"role": "user", "content": "Hello, AI!"}], [{"role": "user", "content": "Tell me a joke"}]]
         outputs = self.client.chat(messages)
         prompt_ids = outputs["prompt_ids"]
@@ -551,6 +672,8 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
 
     def test_chat_with_logprobs_none(self):
+        # [FUNCTION DOC]
+        # Chats with logprobs=None; asserts id lists are returned and logprobs and logprob_token_ids are None.
         outputs = self.client.chat([[{"role": "user", "content": "Hello, AI!"}]], logprobs=None)
 
         assert isinstance(outputs["prompt_ids"], list)
@@ -559,7 +682,13 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
         assert outputs["logprob_token_ids"] is None
 
     def test_chat_with_tools(self):
+        # [FUNCTION DOC]
+        # Chats with a multiply tool function; decodes the returned prompt ids with the model tokenizer and asserts the tool's
+        # docstring description "Multiplies two integers." was rendered into the prompt.
         def multiply(a: int, b: int) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Dummy tool whose signature and docstring are converted into a tool schema; returns a times b.
+            # Inputs: a, b (int). Outputs: int. Exceptions: none. Side effects: none.
             """
             Multiplies two integers.
 
@@ -581,6 +710,8 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
         assert "Multiplies two integers." in decoded_prompt
 
     def test_generate_with_token_ids(self):
+        # [FUNCTION DOC]
+        # Generates from pre-tokenized prompts; asserts returned prompt_ids equal the input ids and all tokens are ints.
         tokenizer = AutoTokenizer.from_pretrained(self.model_id)
         prompts = ["Hello, AI!", "Tell me a joke"]
         prompt_token_ids = tokenizer(prompts)["input_ids"]
@@ -606,6 +737,9 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
 
     def test_generate_with_params(self):
+        # [FUNCTION DOC]
+        # Generates with n=2, repetition_penalty 0.9, temperature 0.8, max_tokens 32; asserts 2 completions per prompt, int
+        # tokens, and each completion at most 32 tokens.
         prompts = ["Hello, AI!", "Tell me a joke"]
         completion_ids = self.client.generate(prompts, n=2, repetition_penalty=0.9, temperature=0.8, max_tokens=32)[
             "completion_ids"
@@ -626,15 +760,23 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
             assert len(seq) <= 32
 
     def test_update_model_params(self):
+        # [FUNCTION DOC]
+        # Loads the same model locally on the test device and pushes its weights to the server via update_model_params
+        # (passes if no error).
         model = AutoModelForCausalLM.from_pretrained(self.model_id, device_map=torch_device)
         self.client.update_model_params(model)
 
     def test_reset_prefix_cache(self):
+        # [FUNCTION DOC]
+        # Calls reset_prefix_cache on the live server (passes if no error).
         # Test resetting the prefix cache
         self.client.reset_prefix_cache()
 
     @classmethod
     def teardown_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Class teardown: closes the client communicator, then kills the server process tree with kill_process to avoid zombie processes.
+        # Inputs: cls. Outputs: none. Side effects: terminates processes.
         # Close the client
         cls.client.close_communicator()
 
@@ -647,10 +789,18 @@ class TestVLLMClientServerBaseURL(TrlTestCase):
 @require_vllm
 @pytest.mark.xdist_group("vllm_server")
 class TestVLLMClientServerTP(TrlTestCase):
+    # [CLASS DOC]
+    # Same live tests as TestVLLMClientServer (minus logprob comparison) with the server using tensor parallelism across accelerators 1 and 2. Requires at least 3 accelerators and vLLM.
     model_id = "Qwen/Qwen2.5-1.5B"
 
     @classmethod
     def setup_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Class setup: copies the environment, restricts visible devices (accelerators 1 and 2) via CUDA_VISIBLE_DEVICES or
+        # ZE_AFFINITY_MASK on XPU, sets VLLM_SERVER_DEV_MODE=1, starts "vllm serve <model_id>" with tensor parallel size 2 with the TRL serve args
+        # as a subprocess, and creates a host-based VLLMClient with an initialized communicator.
+        # Inputs: cls. Outputs: none. Exceptions: client connection timeout (240 s) errors.
+        # Side effects: spawns a server process; stores cls.server_process, cls.client.
         # We want the server to run on accelerator 1 and 2, so we set VISIBLE_DEVICES to "1,2"
         env = os.environ.copy()
         VISIBLE_DEVICES = "ZE_AFFINITY_MASK" if torch_device == "xpu" else "CUDA_VISIBLE_DEVICES"
@@ -668,6 +818,9 @@ class TestVLLMClientServerTP(TrlTestCase):
         cls.client.init_communicator()
 
     def test_generate(self):
+        # [FUNCTION DOC]
+        # Generates for two text prompts; asserts prompt_ids and completion_ids are lists with one entry per prompt and that
+        # every token is an int.
         prompts = ["Hello, AI!", "Tell me a joke"]
         outputs = self.client.generate(prompts)
         prompt_ids = outputs["prompt_ids"]
@@ -688,6 +841,8 @@ class TestVLLMClientServerTP(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
 
     def test_generate_with_logprobs_none(self):
+        # [FUNCTION DOC]
+        # Generates with logprobs=None; asserts id lists are returned and logprobs and logprob_token_ids are None.
         outputs = self.client.generate(["Hello, AI!"], logprobs=None)
 
         assert isinstance(outputs["prompt_ids"], list)
@@ -696,6 +851,8 @@ class TestVLLMClientServerTP(TrlTestCase):
         assert outputs["logprob_token_ids"] is None
 
     def test_chat(self):
+        # [FUNCTION DOC]
+        # Chats with two single-turn conversations; asserts one prompt/completion entry per conversation, all int tokens.
         messages = [[{"role": "user", "content": "Hello, AI!"}], [{"role": "user", "content": "Tell me a joke"}]]
         outputs = self.client.chat(messages)
         prompt_ids = outputs["prompt_ids"]
@@ -716,6 +873,8 @@ class TestVLLMClientServerTP(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
 
     def test_chat_with_logprobs_none(self):
+        # [FUNCTION DOC]
+        # Chats with logprobs=None; asserts id lists are returned and logprobs and logprob_token_ids are None.
         outputs = self.client.chat([[{"role": "user", "content": "Hello, AI!"}]], logprobs=None)
 
         assert isinstance(outputs["prompt_ids"], list)
@@ -724,7 +883,13 @@ class TestVLLMClientServerTP(TrlTestCase):
         assert outputs["logprob_token_ids"] is None
 
     def test_chat_with_tools(self):
+        # [FUNCTION DOC]
+        # Chats with a multiply tool function; decodes the returned prompt ids with the model tokenizer and asserts the tool's
+        # docstring description "Multiplies two integers." was rendered into the prompt.
         def multiply(a: int, b: int) -> int:
+            # [FUNCTION DOC]
+            # HELPER: Dummy tool whose signature and docstring are converted into a tool schema; returns a times b.
+            # Inputs: a, b (int). Outputs: int. Exceptions: none. Side effects: none.
             """
             Multiplies two integers.
 
@@ -746,6 +911,8 @@ class TestVLLMClientServerTP(TrlTestCase):
         assert "Multiplies two integers." in decoded_prompt
 
     def test_generate_with_token_ids(self):
+        # [FUNCTION DOC]
+        # Generates from pre-tokenized prompts; asserts returned prompt_ids equal the input ids and all tokens are ints.
         tokenizer = AutoTokenizer.from_pretrained(self.model_id)
         prompts = ["Hello, AI!", "Tell me a joke"]
         prompt_token_ids = tokenizer(prompts)["input_ids"]
@@ -771,6 +938,9 @@ class TestVLLMClientServerTP(TrlTestCase):
             assert all(isinstance(tok, int) for tok in seq)
 
     def test_generate_with_params(self):
+        # [FUNCTION DOC]
+        # Generates with n=2, repetition_penalty 0.9, temperature 0.8, max_tokens 32; asserts 2 completions per prompt, int
+        # tokens, and each completion at most 32 tokens.
         prompts = ["Hello, AI!", "Tell me a joke"]
         completion_ids = self.client.generate(prompts, n=2, repetition_penalty=0.9, temperature=0.8, max_tokens=32)[
             "completion_ids"
@@ -791,15 +961,23 @@ class TestVLLMClientServerTP(TrlTestCase):
             assert len(seq) <= 32
 
     def test_update_model_params(self):
+        # [FUNCTION DOC]
+        # Loads the same model locally on the test device and pushes its weights to the server via update_model_params
+        # (passes if no error).
         model = AutoModelForCausalLM.from_pretrained(self.model_id, device_map=torch_device)
         self.client.update_model_params(model)
 
     def test_reset_prefix_cache(self):
+        # [FUNCTION DOC]
+        # Calls reset_prefix_cache on the live server (passes if no error).
         # Test resetting the prefix cache
         self.client.reset_prefix_cache()
 
     @classmethod
     def teardown_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Class teardown: closes the client communicator, then kills the server process tree with kill_process to avoid zombie processes.
+        # Inputs: cls. Outputs: none. Side effects: terminates processes.
         # Close the client
         cls.client.close_communicator()
 
@@ -812,12 +990,18 @@ class TestVLLMClientServerTP(TrlTestCase):
 @require_vllm
 @pytest.mark.xdist_group("vllm_server")
 class TestVLLMClientServerDeviceParameter(TrlTestCase):
+    # [CLASS DOC]
+    # Live tests of init_communicator's device argument (int, int again, torch.device) against a server on accelerator 1;
+    # each test creates and closes its own client. Requires multiple accelerators and vLLM.
     """Test the device parameter functionality in init_communicator."""
 
     model_id = "Qwen/Qwen2.5-1.5B"
 
     @classmethod
     def setup_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Restricts visible devices to accelerator 1, sets VLLM_SERVER_DEV_MODE=1, and starts the vllm serve subprocess
+        # (no client is created). Side effects: stores cls.server_process.
         # We want the server to run on accelerator 1, so we set VISIBLE_DEVICES to "1"
         env = os.environ.copy()
         VISIBLE_DEVICES = "ZE_AFFINITY_MASK" if torch_device == "xpu" else "CUDA_VISIBLE_DEVICES"
@@ -828,6 +1012,9 @@ class TestVLLMClientServerDeviceParameter(TrlTestCase):
         cls.server_process = subprocess.Popen(["vllm", "serve", cls.model_id, *VLLM_SERVE_TRL_ARGS], env=env)
 
     def test_init_communicator_with_device_int(self):
+        # [FUNCTION DOC]
+        # Initializes the communicator with device 0, generates for one prompt, asserts one prompt/completion entry each, and
+        # closes the communicator.
         """Test init_communicator with integer device parameter."""
         client = VLLMClient(connection_timeout=240, host="localhost")
         client.init_communicator(device=0)  # Explicitly specify device 0
@@ -845,6 +1032,11 @@ class TestVLLMClientServerDeviceParameter(TrlTestCase):
         client.close_communicator()
 
     def test_init_communicator_with_device_string(self):
+        # [FUNCTION DOC]
+        # Intended to test a string device: initializes the communicator, generates for one prompt, asserts one completion,
+        # and closes the communicator.
+        # KNOWN ISSUE: passes the integer 0 rather than a string, so the string-device path is not exercised (duplicate of
+        # the int test).
         """Test init_communicator with string device parameter."""
         client = VLLMClient(connection_timeout=240, host="localhost")
         client.init_communicator(device=0)  # Explicitly specify device as string
@@ -858,6 +1050,9 @@ class TestVLLMClientServerDeviceParameter(TrlTestCase):
         client.close_communicator()
 
     def test_init_communicator_with_torch_device(self):
+        # [FUNCTION DOC]
+        # Initializes the communicator with a torch.device for index 0, generates for one prompt, asserts one completion, and
+        # closes the communicator.
         """Test init_communicator with torch.device object."""
         import torch
 
@@ -875,6 +1070,8 @@ class TestVLLMClientServerDeviceParameter(TrlTestCase):
 
     @classmethod
     def teardown_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Kills the server process tree with kill_process.
         # vLLM x pytest (or Popen) seems not to handle process termination well. To avoid zombie processes, we need to
         # kill the server process and its children explicitly.
         kill_process(cls.server_process)
@@ -884,10 +1081,17 @@ class TestVLLMClientServerDeviceParameter(TrlTestCase):
 @require_vision
 @pytest.mark.xdist_group("vllm_server")
 class TestVLLMClientServerVLM(TrlTestCase):
+    # [CLASS DOC]
+    # Live tests with a vision-language model (Qwen/Qwen2.5-VL-3B-Instruct) served on the last visible accelerator,
+    # covering image feature extraction plus generation from token ids, and chat with images. Requires vLLM and vision.
     model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
 
     @classmethod
     def setup_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Restricts visible devices to the last accelerator, sets VLLM_SERVER_DEV_MODE=1, starts vllm serve as a
+        # subprocess, and creates a host-based client without a communicator (generation only).
+        # Side effects: stores cls.server_process and cls.client.
         # Run the server on the last visible accelerator, since the test process may hold memory on the first one
         env = os.environ.copy()
         VISIBLE_DEVICES = "ZE_AFFINITY_MASK" if torch_device == "xpu" else "CUDA_VISIBLE_DEVICES"
@@ -901,6 +1105,11 @@ class TestVLLMClientServerVLM(TrlTestCase):
         cls.client = VLLMClient(connection_timeout=240, host="localhost")
 
     def test_generate_from_token_ids_and_images(self):
+        # [FUNCTION DOC]
+        # Tokenizes an image+text conversation with the processor, fetches image features from the server, and generates 2
+        # completions from the token ids plus features; asserts 2 completions, prompt ids echoed, int tokens. Then appends the
+        # first completion and a new user-turn header to the prompt and generates again with the same features, asserting 2
+        # completions (mirrors the tool-calling loop).
         """Images alongside token IDs: process the images, then generate from the trainer's own tokenization."""
         from PIL import Image
 
@@ -933,6 +1142,9 @@ class TestVLLMClientServerVLM(TrlTestCase):
         assert len(outputs["completion_ids"]) == 2
 
     def test_generate_from_token_ids_without_images(self):
+        # [FUNCTION DOC]
+        # Builds one image prompt and one text-only prompt, requests features for [[image], None], and generates for both;
+        # asserts the text-only feature entry is None and two completions are returned.
         """`None` entries let a batch mix multimodal and text-only prompts."""
         from PIL import Image
 
@@ -954,6 +1166,8 @@ class TestVLLMClientServerVLM(TrlTestCase):
         assert len(outputs["completion_ids"]) == 2
 
     def test_chat_with_images(self):
+        # [FUNCTION DOC]
+        # Chats with two conversations (two images, one image); asserts two prompt/completion entries with int tokens.
         from PIL import Image
 
         image1 = Image.new("RGB", (64, 64), color="red")
@@ -990,6 +1204,8 @@ class TestVLLMClientServerVLM(TrlTestCase):
         assert all(isinstance(tok, int) for tok in completion_ids[0])
 
     def test_chat_with_mixed_images(self):
+        # [FUNCTION DOC]
+        # Chats with one image conversation and one text-only conversation; asserts two entries each with int tokens.
         """Test a batch where one prompt has an image and the other does not."""
         from PIL import Image
 
@@ -1021,4 +1237,6 @@ class TestVLLMClientServerVLM(TrlTestCase):
 
     @classmethod
     def teardown_class(cls):
+        # [FUNCTION DOC]
+        # HELPER: Kills the server process tree with kill_process.
         kill_process(cls.server_process)

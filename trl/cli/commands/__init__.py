@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Registry of TRL CLI subcommands. Exports Command (abstract base) and get_commands. Also imports EnvCommand,
+# TrainingCommand and VllmServeCommand. Side effects on import: none beyond importing those lightweight modules.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +23,10 @@ from .vllm_serve import VllmServeCommand
 
 
 def get_commands() -> list[Command]:
+    # [FUNCTION DOC]
+    # Returns fresh instances of all top-level commands, in help order: training commands distillation, dpo, then env,
+    # then training commands grpo, kto, reward, rloo, sft, then vllm-serve.
+    # Inputs: none. Outputs: list of Command. Exceptions: none. Side effects: none.
     """Return all registered top-level TRL CLI commands."""
     return [
         TrainingCommand("distillation"),

@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Experimental IW-OPD (importance-weighted on-policy distillation) package.
+# Exports IWOPDConfig and IWOPDTrainer, imported eagerly.
+# No lazy-import behavior; no side effects beyond submodule imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

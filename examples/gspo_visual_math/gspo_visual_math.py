@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Example training script: GSPO (GRPOTrainer with sequence-level importance sampling chosen via CLI flags) for
+# vision-language models on lmms-lab/multimodal-open-r1-8k-verified, rewarded by think_format_reward and
+# accuracy_reward.
+# Behavior (only under the main guard): parses ScriptArguments, GRPOConfig and ModelConfig; puts revision, attention
+# implementation and dtype into model_init_kwargs; loads the train split and splits off 100 test rows (seed 42); maps
+# rows to a system+user conversational prompt (the image column stays alongside); drops rows whose image is 512 pixels
+# or larger in either dimension; converts images to RGB; uses the test split for eval only when eval_strategy is not
+# no; builds the trainer with optional quantization and PEFT configs; trains, saves, optionally pushes, calls end.
+# Inputs: CLI arguments / config file. Outputs: trained model in output_dir.
+# Exceptions: propagated from parsing, data loading and training. Side effects: downloads, GPU training, file writes,
+# optional Hub upload. Importing the module has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -93,6 +106,10 @@ if __name__ == "__main__":
     )
 
     def make_conversation(example):
+        # [FUNCTION DOC]
+        # HELPER: Map function producing a prompt of a system message (SYSTEM_PROMPT) and a user message with the problem
+        # text. Inputs: example (dict with problem). Outputs: dict with key prompt. Exceptions: KeyError if problem missing.
+        # Side effects: none.
         prompt = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": example["problem"]},
@@ -103,12 +120,19 @@ if __name__ == "__main__":
 
     # Filter have big images
     def filter_big_images(example):
+        # [FUNCTION DOC]
+        # HELPER: Filter predicate keeping rows whose image width and height are both below 512 pixels.
+        # Inputs: example (dict with a PIL image under image). Outputs: bool. Exceptions: none expected. Side effects: none.
         image = example["image"]
         return image.size[0] < 512 and image.size[1] < 512
 
     dataset = dataset.filter(filter_big_images)
 
     def convert_to_rgb(example):
+        # [FUNCTION DOC]
+        # HELPER: Map function converting the row's PIL image to RGB mode when it is not already RGB.
+        # Inputs: example (dict with image). Outputs: the same example dict with image replaced. Exceptions: PIL conversion
+        # errors propagate. Side effects: mutates the passed example dict.
         image = example["image"]
         if image.mode != "RGB":
             image = image.convert("RGB")

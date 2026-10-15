@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Defines GRPOConfig, the TrainingArguments subclass (via _BaseConfig) used to configure
+# GRPOTrainer (Group Relative Policy Optimization and its loss variants such as DAPO, Dr. GRPO,
+# GSPO, SAPO, VESPO, CISPO), including generation (transformers or vLLM), reward aggregation,
+# importance-sampling correction, entropy regularization, tool calling and completion logging.
+# Inputs/Outputs: none at module level. Exceptions: none. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +28,29 @@ from .base_config import _BaseConfig
 
 @dataclass
 class GRPOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Large dataclass extending _BaseConfig; every field has argparse help metadata for
+    # HfArgumentParser. Groups of fields:
+    # - model: model_init_kwargs, trust_remote_code, router_aux_loss_coef, disable_dropout.
+    # - data: remove_unused_columns, num_generations / num_generations_eval (group size G),
+    # max_completion_length, shuffle_dataset, pad_to_multiple_of.
+    # - batching: generation_batch_size and steps_per_generation (mutually exclusive, one derived
+    # from the other in __post_init__).
+    # - sampling: temperature, top_p, top_k, min_p, repetition_penalty, generation_kwargs,
+    # chat_template_kwargs, cache_implementation, transformers continuous batching options.
+    # - vLLM: use_vllm, vllm_mode (server/colocate), server address/port/timeout, group port, memory
+    # utilization, max model length, tensor parallel size, sleep mode, structured-output regex.
+    # - loss: beta (KL coefficient), num_iterations, epsilon / epsilon_high / delta clipping,
+    # SAPO and VESPO temperature/shape parameters, importance_sampling_level, loss_type,
+    # mask_truncated_completions, reward_weights, multi_objective_aggregation, scale_rewards,
+    # TR-DPO reference syncing, top_entropy_quantile, entropy coefficient and adaptive-entropy
+    # controls, off_policy_mask_threshold, use_bias_correction_kl.
+    # - vLLM importance sampling: correction flag, mode, clip min/max.
+    # - tools: max_tool_calling_iterations.
+    # - logging: log_completions, log_multimodal, num_completions_to_print, log_unique_prompts,
+    # log_completions_hub_repo.
+    # - deprecated: use_transformers_paged, vllm_importance_sampling_cap.
+    # Construction: keyword args; validation/derivation in __post_init__. Side effects: none beyond that.
     r"""
     Configuration class for the [`GRPOTrainer`].
 
@@ -1046,6 +1076,33 @@ class GRPOConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs the parent post-init, then normalizes, derives and validates fields.
+        # Behavior, in order:
+        # 1. pad_to_multiple_of: CLI string ("none"/"null" -> None, other non-"auto" -> int); "auto" ->
+        # 128 on a neuron device, else None.
+        # 2. use_transformers_paged: FutureWarning and forces use_transformers_continuous_batching on.
+        # 3. Rejects a parallelism_config with context or sequence parallelism enabled.
+        # 4. Maps boolean scale_rewards True -> "group", False -> "none"; other values kept.
+        # 5. Rejects log_completions_hub_repo without log_completions; rejects auto_find_batch_size.
+        # 6. Batch derivation with global batch = per_device_train_batch_size times world_size: if neither
+        # generation_batch_size nor steps_per_generation set, steps_per_generation =
+        # gradient_accumulation_steps and generation_batch_size = global batch times that; if only
+        # generation_batch_size set, it must be divisible by the global batch and steps_per_generation is
+        # the quotient; if only steps_per_generation set, generation_batch_size = global batch times it;
+        # both set is an error.
+        # 7. If do_eval and eval_strategy is not "no": global eval batch must be divisible by
+        # num_generations_eval (or num_generations when unset).
+        # 8. generation_batch_size must be divisible by num_generations; num_generations must be >= 2.
+        # 9. vllm_importance_sampling_cap (deprecated): FutureWarning and copied into
+        # vllm_importance_sampling_clip_max.
+        # 10. clip_min must be < clip_max when both set; with correction enabled and a "*_truncate" mode at
+        # least one clip bound must be set.
+        # Inputs: self. Outputs: none.
+        # Exceptions: ValueError for each failed check above; ValueError from int parsing.
+        # Side effects: mutates pad_to_multiple_of, use_transformers_continuous_batching, scale_rewards,
+        # generation_batch_size, steps_per_generation, vllm_importance_sampling_clip_max; emits
+        # FutureWarnings; reading device/world_size may initialize distributed state.
         super().__post_init__()
         # The CLI passes the value as a string
         if isinstance(self.pad_to_multiple_of, str) and self.pad_to_multiple_of != "auto":

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Experimental trainer implementing A*-PO (Optimal Advantage Regression, https://huggingface.co/papers/2505.20686).
+# Contents: the RewardFunc type alias (callable returning a list of floats) and A2POTrainer.
+# Import-time side effects: creates a module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,6 +51,20 @@ RewardFunc = Callable[..., list[float]]
 
 
 class A2POTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer (subclass of _BaseTrainer / transformers Trainer) running A*-PO in two stages.
+    # Stage 1 (_estimate_optimal_values, run once before training or lazily on first input preparation): sample
+    # num_value_samples completions per prompt from a frozen reference copy of the model, score them, and cache
+    # V*(x) = beta1 times log of the mean of exp(r/beta1), keyed by the chat-templated prompt text; optionally drop
+    # training prompts whose samples all scored zero.
+    # Stage 2 (_prepare_inputs + compute_loss): generate one completion per prompt with the current policy, compute its
+    # reward and the reference sequence log-prob, then regress beta2 times (policy minus reference sequence log-prob) onto
+    # r minus V* with a mean squared error.
+    # Key state: ref_model (frozen copy, prepared by accelerate in eval mode), reward_funcs and reward_weights (float32
+    # tensor), eos_token_ids, value_generation_config / generation_config (sampling configs with N and 1 return
+    # sequences), _optimal_values (dict prompt text -> float, None until Stage 1), _metrics (per-mode lists averaged in
+    # log), model_kwarg_keys (forward signature parameter names). Class attributes _tag_names, _name, _paper feed model
+    # card generation.
     """
     Trainer for the A*-PO (Optimal Advantage Regression) method, introduced in [Accelerating RL for LLM Reasoning with
     Optimal Advantage Regression](https://huggingface.co/papers/2505.20686).
@@ -108,6 +127,19 @@ class A2POTrainer(_BaseTrainer):
         callbacks=None,
         optimizers=(None, None),
     ):
+        # [FUNCTION DOC]
+        # Builds the trainer.
+        # Behavior: default args to A2POConfig with output dir "<model name>-A2PO"; if model is a string, load it with
+        # AutoModelForCausalLM using model_init_kwargs (setting trust_remote_code default, remembering revision); record the
+        # forward signature keys; create the reference model; load a left-padding tokenizer when none is given; collect EOS ids
+        # from the generation config (int or list) and prepend the tokenizer's eos id if missing; wrap a single reward function
+        # in a list and build reward_weights (ones or args.reward_weights); build the two GenerationConfigs (do_sample, given
+        # temperature/top_p/top_k, max_new_tokens = max_completion_length, pad id from tokenizer); use an identity data
+        # collator (list of raw examples); call the parent constructor; then prepare ref_model with accelerate in eval mode.
+        # Inputs: model (PreTrainedModel or id), reward_funcs (callable or list), args, train_dataset (needs "prompt"),
+        # eval_dataset, processing_class, callbacks, optimizers.
+        # Outputs: none. Exceptions: model/tokenizer loading errors; parent Trainer validation errors.
+        # Side effects: downloads/loads model weights; mutates args.model_init_kwargs (setdefault) when it is a dict.
         # Args
         if args is None:
             args = A2POConfig(f"{model if isinstance(model, str) else model.config._name_or_path}-A2PO")
@@ -181,6 +213,9 @@ class A2POTrainer(_BaseTrainer):
 
         # The data collator returns the list of features untouched; generation happens in `_prepare_inputs`.
         def data_collator(features):
+            # [FUNCTION DOC]
+            # HELPER: Identity collator - returns the list of dataset examples unchanged (generation happens in _prepare_inputs).
+            # Inputs: features (list of dict). Outputs: the same list. Exceptions: none. Side effects: none.
             return features
 
         super().__init__(
@@ -197,6 +232,12 @@ class A2POTrainer(_BaseTrainer):
         self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
     def _calculate_rewards(self, prompts, completions, **reward_kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Calls each reward function with prompts, completions and extra keyword columns, stores outputs in a
+        # (num_samples, num_funcs) float32 tensor on the accelerator device, and returns the reward_weights-weighted sum per
+        # sample (shape num_samples). A*-PO assumes this total is binary.
+        # Inputs: prompts (list), completions (list of str), reward_kwargs (column name -> list aligned with prompts).
+        # Outputs: 1D float tensor. Exceptions: errors from reward functions or length mismatches. Side effects: none.
         device = self.accelerator.device
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, reward_func in enumerate(self.reward_funcs):
@@ -206,6 +247,13 @@ class A2POTrainer(_BaseTrainer):
         return (rewards_per_func * self.reward_weights.to(device)).sum(dim=1)
 
     def _get_sequence_logps(self, model, input_ids, attention_mask, logits_to_keep):
+        # [FUNCTION DOC]
+        # HELPER: Sums per-token log-probabilities of the last logits_to_keep tokens (the completion) under model.
+        # Behavior: forward with input_ids/attention_mask (adding logits_to_keep + 1 when the model supports it); drop the
+        # final logit position; keep the last logits_to_keep positions; gather log-softmax at the completion token ids;
+        # multiply by the completion part of attention_mask and sum along the sequence.
+        # Inputs: model, input_ids and attention_mask (batch, seq), logits_to_keep (int).
+        # Outputs: tensor of shape (batch,). Exceptions: model forward errors. Side effects: none (grad tracked if enabled).
         model_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
         # Only pass `logits_to_keep` when the model supports it (some models and VLMs don't).
         if "logits_to_keep" in self.model_kwarg_keys:
@@ -222,6 +270,18 @@ class A2POTrainer(_BaseTrainer):
 
     # Stage 1: offline optimal value estimation
     def _estimate_optimal_values(self):
+        # [FUNCTION DOC]
+        # Stage 1: offline estimation of V* for every train (and eval, if given) prompt.
+        # Behavior: for each dataset, iterate an accelerate-prepared DataLoader (batch size per_device_train_batch_size,
+        # collate to list); chat-template prompts; tokenize with padding/left truncation to max_prompt_length without special
+        # tokens; generate num_value_samples completions per prompt from the unwrapped reference model; decode completion
+        # tokens; repeat prompts and extra columns (except "prompt"/"completion") N times and compute rewards; reshape to
+        # (batch, N); compute V* stably as beta1 times (logsumexp of rewards/beta1 minus log N); store per prompt text and
+        # mark prompts whose rewards sum to zero. Then all-gather the (prompt, value) pairs and the all-incorrect set across
+        # ranks into _optimal_values; if filter_all_incorrect, filter train_dataset to remove all-incorrect prompts (eval kept).
+        # Inputs: none (uses args, datasets). Outputs: none.
+        # Exceptions: generation/reward errors propagate.
+        # Side effects: sets self._optimal_values, may replace self.train_dataset, logs an info message, collective comms.
         beta1 = self.args.beta1
         n = self.args.num_value_samples
         optimal_values = {}
@@ -289,6 +349,17 @@ class A2POTrainer(_BaseTrainer):
 
     # Stage 2: on-policy regression
     def _prepare_inputs(self, inputs):
+        # [FUNCTION DOC]
+        # Stage 2: turns a list of raw examples into a loss batch.
+        # Behavior: runs Stage 1 first if V* is not yet available; chat-templates and tokenizes prompts as in Stage 1;
+        # generates one completion per prompt with the unwrapped policy; decodes; computes rewards (forwarding extra columns);
+        # looks up cached V* by prompt text; builds a completion mask that is 1 up to and including the first EOS (any id in
+        # eos_token_ids; whole length if none) and concatenates it after the prompt attention mask; computes reference sequence
+        # log-probs without grad. Appends mean reward and mean v_star to _metrics[mode] (mode from model.training).
+        # Inputs: inputs (list of dict with "prompt" plus extra columns).
+        # Outputs: dict with input_ids, attention_mask, logits_to_keep (completion length), ref_logps, rewards, v_star.
+        # Exceptions: KeyError if a prompt's V* is missing (e.g. prompt not in the estimated datasets).
+        # Side effects: may run Stage 1; appends metrics.
         # Estimate V* on first use, e.g. when `evaluate()` is called without a preceding `train()`.
         if self._optimal_values is None:
             self._estimate_optimal_values()
@@ -345,6 +416,12 @@ class A2POTrainer(_BaseTrainer):
         }
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Computes the A*-PO regression loss: policy sequence log-probs via _get_sequence_logps; implicit reward = beta2 times
+        # (policy minus ref log-probs); target = rewards minus v_star; loss = mean squared difference. Logs mean implicit
+        # reward and mean advantage (target) to _metrics[mode].
+        # Inputs: model, inputs (dict from _prepare_inputs); return_outputs and num_items_in_batch are ignored.
+        # Outputs: scalar loss tensor. Exceptions: none of its own. Side effects: appends metrics.
         mode = "train" if self.model.training else "eval"
 
         policy_logps = self._get_sequence_logps(
@@ -361,6 +438,11 @@ class A2POTrainer(_BaseTrainer):
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Evaluation step: prepares inputs (generation + rewards), computes the loss under no_grad within the compute-loss
+        # context manager, and returns (detached mean loss, None, None).
+        # Inputs: model, inputs (raw examples), prediction_loss_only and ignore_keys (ignored).
+        # Outputs: tuple (loss, None, None). Exceptions: as _prepare_inputs. Side effects: appends eval metrics.
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
             with self.compute_loss_context_manager():
@@ -369,12 +451,23 @@ class A2POTrainer(_BaseTrainer):
         return loss, None, None
 
     def train(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Runs Stage 1 (with an info log) if V* has not been estimated yet, so prompt filtering happens before the train
+        # dataloader is built, then delegates to the parent train.
+        # Inputs: parent train args/kwargs. Outputs: parent TrainOutput. Exceptions: as parent / Stage 1.
+        # Side effects: training, may filter train_dataset.
         if self._optimal_values is None:
             logger.info("Running Stage 1: offline optimal value estimation...")
             self._estimate_optimal_values()
         return super().train(*args, **kwargs)
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Averages the accumulated metric lists for the current mode, prefixes keys with "eval_" in eval mode, merges them into
+        # logs, forwards to the parent log, and clears that mode's metrics.
+        # Inputs: logs (dict), start_time (optional float). Outputs: none.
+        # Exceptions: none expected.
+        # Side effects: emits logs to reporters; clears self._metrics[mode].
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}
 

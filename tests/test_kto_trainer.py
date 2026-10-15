@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for trl KTOTrainer, KTOConfig and the KTO data collators (DataCollatorForUnpairedPreference and
+# DataCollatorForVisionUnpairedPreference) in trl.trainer.kto_trainer.
+# Main contents: collator unit tests (text and vision), end-to-end text trainer tests on tiny causal LMs with
+# the zen unpaired/paired preference datasets, and VLM trainer tests. PEFT symbols are imported only if peft is
+# installed. Optional-dependency tests are gated by require_* decorators.
+# Import-time side effects: conditional peft import.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,11 +55,19 @@ if is_peft_available():
 
 @require_vision
 class TestDataCollatorForVisionUnpairedPreference(TrlTestCase):
+    # [CLASS DOC]
+    # Tests DataCollatorForVisionUnpairedPreference with the tiny Qwen2.5-VL processor on 16x16 blank RGB images
+    # and conversational prompt/completion/label examples; requires vision extras. With calculate_kl the collator
+    # also builds KL_ prefixed tensors pairing each prompt with a mismatched (cycled) completion.
     @pytest.mark.skipif(
         Version(transformers.__version__) < Version("5.3.0"),
         reason="mm_token_type_ids are returned by default since transformers-5.3.0 (see transformers#43972)",
     )
     def test_mm_token_type_ids_shape(self):
+        # [FUNCTION DOC]
+        # Regression guard (transformers 5.3.0 or newer, skipped otherwise): asserts mm_token_type_ids exists with the
+        # shape of input_ids and KL_mm_token_type_ids exists with the shape of KL_input_ids.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: loads the processor.
         # Regression guard: when the processor returns mm_token_type_ids (Qwen2.5-VL after transformers#43972),
         # the collator must produce a KL_token_type_ids whose width matches KL_input_ids,
         # not the main completion's width (the two differ whenever their text lengths differ).
@@ -89,6 +105,10 @@ class TestDataCollatorForVisionUnpairedPreference(TrlTestCase):
         )
 
     def test_output_keys(self):
+        # [FUNCTION DOC]
+        # Asserts that with calculate_kl the output has input_ids, attention_mask, completion_mask, pixel_values, label
+        # and the three KL_ keys; without KL it has input_ids but no KL_input_ids.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: loads the processor.
         from PIL import Image
         from transformers import AutoProcessor
 
@@ -96,6 +116,9 @@ class TestDataCollatorForVisionUnpairedPreference(TrlTestCase):
         image = Image.new("RGB", (16, 16))
 
         def make_examples():
+            # [FUNCTION DOC]
+            # HELPER: Returns a fresh two-example list (one desirable, one undesirable) sharing the same image.
+            # Inputs: none. Outputs: list of dicts. Exceptions: none. Side effects: none.
             return [
                 {
                     "images": [image],
@@ -126,6 +149,10 @@ class TestDataCollatorForVisionUnpairedPreference(TrlTestCase):
         assert "KL_input_ids" not in output_no_kl
 
     def test_kl_cycling(self):
+        # [FUNCTION DOC]
+        # Asserts with two distinct completions that each row of KL_input_ids differs from the matching row of
+        # input_ids, showing KL completions are cycled from another example.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: loads the processor.
         # The KL completion for example i must be the completion from example i-1 (cycled by +1).
         from PIL import Image
         from transformers import AutoProcessor
@@ -156,7 +183,15 @@ class TestDataCollatorForVisionUnpairedPreference(TrlTestCase):
 
 
 class TestDataCollatorForUnpairedPreference(TrlTestCase):
+    # [CLASS DOC]
+    # Tests DataCollatorForUnpairedPreference on pre-tokenized examples: it concatenates prompt_ids with
+    # completion_ids (and with KL_completion_ids for KL tensors), right-pads with pad_token_id, builds attention and
+    # completion masks (1 only on completion tokens), stacks label and optional ref_logps/ref_KL_logps.
     def test_padding_and_masks(self):
+        # [FUNCTION DOC]
+        # Asserts exact input_ids, attention_mask, completion_mask, their KL_ counterparts and label for two examples,
+        # and that the output key set is exactly these seven keys.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         collator = DataCollatorForUnpairedPreference(pad_token_id=0)
         examples = [
             {"prompt_ids": [1, 2, 3], "completion_ids": [4, 5], "KL_completion_ids": [6], "label": True},
@@ -219,6 +254,9 @@ class TestDataCollatorForUnpairedPreference(TrlTestCase):
         torch.testing.assert_close(result["label"], torch.tensor([True, False]))
 
     def test_optional_reference_logps(self):
+        # [FUNCTION DOC]
+        # Asserts ref_logps and ref_KL_logps per example are collated into 1-D tensors and added to the key set.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         collator = DataCollatorForUnpairedPreference(pad_token_id=0)
         examples = [
             {
@@ -258,6 +296,9 @@ class TestDataCollatorForUnpairedPreference(TrlTestCase):
         torch.testing.assert_close(result["ref_KL_logps"], expected_ref_kl_logps)
 
     def test_with_pad_to_multiple_of(self):
+        # [FUNCTION DOC]
+        # Asserts that with pad_to_multiple_of 5 both input_ids and KL_input_ids are padded to length 5.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         collator = DataCollatorForUnpairedPreference(pad_token_id=0, pad_to_multiple_of=5)
         examples = [
             {"prompt_ids": [1], "completion_ids": [2], "KL_completion_ids": [3], "label": True},
@@ -292,7 +333,16 @@ class TestDataCollatorForUnpairedPreference(TrlTestCase):
 
 
 class TestKTOTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # End-to-end KTOTrainer tests on text models. setup_method provides model_id (tiny Qwen2), a float32 model, a
+    # reference model and a tokenizer with pad token set to eos. Most tests use self.tmp_dir and report_to none.
+    # Common "standard train check": snapshot named parameters, train, assert the last log entry has train_loss and
+    # every parameter changed. Common "PEFT train check": base-model parameters unchanged and other non-base_layer
+    # parameters changed. Inherits TrlTestCase.
     def setup_method(self):
+        # [FUNCTION DOC]
+        # HELPER: Loads the tiny Qwen2 model (float32), a separate reference model and the tokenizer, setting pad_token
+        # to eos_token. Inputs: none. Outputs: none. Exceptions: load errors. Side effects: sets instance attributes.
         self.model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         self.model = AutoModelForCausalLM.from_pretrained(self.model_id, dtype="float32")
         self.ref_model = AutoModelForCausalLM.from_pretrained(self.model_id)
@@ -309,6 +359,12 @@ class TestKTOTrainer(TrlTestCase):
         ],
     )
     def test_train(self, config_name, loss_type, pre_compute, eval_dataset):
+        # [FUNCTION DOC]
+        # Trains 3 steps (batch 2, lr 0.9, beta 0.1, eval every step) with an explicit ref model for combinations of
+        # dataset config (paired, unpaired, conversational), loss_type (kto, apo_zero_unpaired) and
+        # precompute_ref_log_probs; asserts train_loss is logged and every parameter with non-zero sum changed.
+        # Inputs: config_name, loss_type, pre_compute, eval_dataset (parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         training_args = KTOConfig(
             output_dir=self.tmp_dir,
             per_device_train_batch_size=2,
@@ -347,6 +403,10 @@ class TestKTOTrainer(TrlTestCase):
 
     @require_liger_kernel
     def test_train_with_liger(self):
+        # [FUNCTION DOC]
+        # Requires liger-kernel. Asserts use_liger_kernel True emits a deprecation FutureWarning and that
+        # liger_kernel_config disables fused_linear_cross_entropy, then runs the standard train check (lr 0.1).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         training_args = KTOConfig(output_dir=self.tmp_dir, learning_rate=0.1, use_liger_kernel=True, report_to="none")
@@ -371,6 +431,10 @@ class TestKTOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_fully_truncated_completion_examples_dropped(self):
+        # [FUNCTION DOC]
+        # With max_length 6 and one example whose prompt alone fills the budget, asserts dataset preparation keeps only
+        # the short-prompt example and its prompt_ids equal the tokenized prompt.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """The collator truncates with `keep_start`, so an example whose prompt alone fills `max_length` loses every
         completion token; it's dropped during dataset preparation."""
         dataset = Dataset.from_dict(
@@ -401,6 +465,12 @@ class TestKTOTrainer(TrlTestCase):
         ],
     )
     def test_evaluate_with_eval_dataset(self, eval_dataset_type, precompute_ref_log_probs):
+        # [FUNCTION DOC]
+        # Asserts evaluate accepts a raw eval dataset in six container forms using apo_zero_unpaired (no KL term).
+        # With streaming plus precompute_ref_log_probs expects a ValueError (not supported with IterableDataset) and
+        # returns early; otherwise asserts eval_loss or eval_data1_loss and eval_data2_loss.
+        # Inputs: eval_dataset_type (str), precompute_ref_log_probs (bool), parametrized. Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         # `evaluate` accepts a raw (unprepared) dataset passed directly, not only a preprocessed `eval_dataset` set
         # at init. See https://github.com/huggingface/trl/issues/6115. Also a regression test: Accelerate's dispatch
         # for `IterableDataset` requires every batch field to be a tensor, which previously broke streaming
@@ -441,6 +511,10 @@ class TestKTOTrainer(TrlTestCase):
             assert metrics["eval_data2_loss"] is not None
 
     def test_evaluate_precompute_ref_log_probs_after_training_raises(self):
+        # [FUNCTION DOC]
+        # With full fine-tuning, precompute_ref_log_probs and no ref model: evaluating a new dataset works before
+        # training, and after one training step raises ValueError (cannot compute reference log-probs).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Full fine-tuning with `precompute_ref_log_probs=True` and no `ref_model` uses `self.model` as the reference.
         # That's valid only before training; a dataset passed to `evaluate()` afterwards can't get a correct reference.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
@@ -463,6 +537,11 @@ class TestKTOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("eval_dataset_type", ["dataset", "dataset_dict", "dict_of_dataset"])
     def test_evaluate_precompute_ref_log_probs_at_init_after_training(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Asserts an eval_dataset given at init (Dataset, DatasetDict or dict) has stored reference log-probs, so a
+        # no-argument evaluate after one training step succeeds and yields the expected loss keys.
+        # Inputs: eval_dataset_type (str, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         # Regression for the guard above: an `eval_dataset` set at init has its reference log-probs precomputed once
         # (against the untrained reference) and stored, so no-arg `evaluate()` reuses those stored values and must not
         # raise after training, even with full fine-tuning and `precompute_ref_log_probs=True`.
@@ -495,6 +574,10 @@ class TestKTOTrainer(TrlTestCase):
             assert metrics["eval_data2_loss"] is not None
 
     def test_trust_remote_code(self):
+        # [FUNCTION DOC]
+        # Asserts a remote-code model id raises ValueError mentioning custom code without trust_remote_code, and loads
+        # as RemoteForCausalLM with it. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: may download remote code.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
         model_id = "trl-internal-testing/tiny-RemoteForCausalLM"
 
@@ -514,6 +597,10 @@ class TestKTOTrainer(TrlTestCase):
 
     # Special case for harmony
     def test_train_gpt_oss(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on tiny GPT-OSS with the harmony preference dataset (lr 0.1), then asserts
+        # aux_loss_enabled is true and the last log entry has aux_loss. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/harmony", "preference", split="train")
 
         training_args = KTOConfig(
@@ -541,6 +628,9 @@ class TestKTOTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["aux_loss"] is not None
 
     def test_train_with_ref_model_is_model_raises(self):
+        # [FUNCTION DOC]
+        # Asserts passing the same object as model and ref_model raises ValueError.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         training_args = KTOConfig(
             output_dir=self.tmp_dir,
             per_device_train_batch_size=2,
@@ -560,6 +650,11 @@ class TestKTOTrainer(TrlTestCase):
             )
 
     def test_tokenize_and_process_tokens(self):
+        # [FUNCTION DOC]
+        # Forces the spawn start method for multiprocess, builds a trainer, and asserts: the first train example's
+        # prompt_ids start with the tokenized prompt; completion_ids is non-empty; collating that example gives
+        # input_ids ending with eos and a completion_mask with zeros on a non-empty prompt prefix followed by ones.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: sets the global multiprocess start method.
         # Pytest/CI often starts background threads before tests run. Under Python 3.12+,
         # using "fork" in a multi-threaded process emits a DeprecationWarning and may deadlock.
         # Force "spawn" to keep this multiprocessing test safe while still exercising `num_proc=2`.
@@ -609,6 +704,10 @@ class TestKTOTrainer(TrlTestCase):
         assert all(m == 0 for m in completion_mask[:first_completion])
 
     def test_train_without_providing_ref_model(self):
+        # [FUNCTION DOC]
+        # Trains 3 steps (batch 2, grad accumulation 4, lr 0.9, eval every step) with ref_model None so the trainer
+        # builds its own reference; asserts train_loss is logged and every non-zero-sum parameter changed.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         training_args = KTOConfig(
             output_dir=self.tmp_dir,
             per_device_train_batch_size=2,
@@ -645,6 +744,10 @@ class TestKTOTrainer(TrlTestCase):
 
     @require_peft
     def test_train_without_providing_ref_model_with_lora(self):
+        # [FUNCTION DOC]
+        # Same setup with a LoRA config (r 16, alpha 32, dropout 0.05, causal LM); asserts train_loss is logged and every
+        # LoRA parameter with non-zero sum changed. Requires peft. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         lora_config = LoraConfig(
             r=16,
             lora_alpha=32,
@@ -690,6 +793,10 @@ class TestKTOTrainer(TrlTestCase):
                     assert not torch.equal(param, new_param)
 
     def test_compute_metrics(self):
+        # [FUNCTION DOC]
+        # Trains with eval every step and a compute_metrics returning test 0.0; asserts training emits a FutureWarning
+        # about return_outputs True and that the second-last log entry has eval_test 0.0.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype="float32")
         ref_model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
         tokenizer = AutoTokenizer.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5")
@@ -698,6 +805,8 @@ class TestKTOTrainer(TrlTestCase):
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference")
 
         def dummy_compute_metrics(*args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Accepts any arguments and returns a dict with test 0.0. Exceptions: none. Side effects: none.
             return {"test": 0.0}
 
         training_args = KTOConfig(
@@ -726,6 +835,10 @@ class TestKTOTrainer(TrlTestCase):
         assert trainer.state.log_history[-2]["eval_test"] == 0.0
 
     def test_train_with_explicit_ref_model(self):
+        # [FUNCTION DOC]
+        # Trains a model id with an explicitly loaded float32 reference of the same checkpoint (lr 0.1); asserts every
+        # policy parameter changed while the corresponding ref_model parameter still equals the initial value.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         training_args = KTOConfig(
@@ -759,6 +872,10 @@ class TestKTOTrainer(TrlTestCase):
             torch.testing.assert_close(param, new_ref_param, msg=f"Reference model parameter {n} has changed.")
 
     def test_train_with_sync_ref_model(self):
+        # [FUNCTION DOC]
+        # Trains with sync_ref_model True and ref_model_sync_steps 2; asserts the trainer created a ref model and that
+        # both policy and reference parameters changed (the reference was synced). Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         training_args = KTOConfig(
@@ -788,6 +905,9 @@ class TestKTOTrainer(TrlTestCase):
             assert not torch.equal(previous_ref_params[n], new_ref_param), f"Ref Parameter {n} has not changed."
 
     def test_ref_model_like_model_instance(self):
+        # [FUNCTION DOC]
+        # Passes a bfloat16 eager-attention model instance and asserts the auto-built ref_model has bfloat16 dtype and
+        # eager attention. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # A policy passed as an instance has no `model_init_kwargs`: the reference is built with its dtype and attention
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
         model = AutoModelForCausalLM.from_pretrained(
@@ -800,6 +920,9 @@ class TestKTOTrainer(TrlTestCase):
         assert trainer.ref_model.config._attn_implementation == "eager"
 
     def test_train_model_dtype(self):
+        # [FUNCTION DOC]
+        # Trains with model_init_kwargs dtype float16 (lr 0.1); asserts every non-layernorm parameter is float16 and
+        # changed. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         training_args = KTOConfig(
@@ -831,6 +954,9 @@ class TestKTOTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_init_is_seeded(self):
+        # [FUNCTION DOC]
+        # Builds two LoRA trainers after different global torch seeds and asserts identical non-empty lora_A weights.
+        # Requires peft. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: changes the global seed.
         # Two trainers with the same seed start from the same adapter weights
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
         adapters = []
@@ -850,6 +976,10 @@ class TestKTOTrainer(TrlTestCase):
 
     @require_peft
     def test_train_peft_model(self):
+        # [FUNCTION DOC]
+        # Trains an already-wrapped PEFT model (default LoRA, lr 1.0); base parameters must be unchanged and all others
+        # except base_layer and ref adapter parameters must change. Requires peft. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
 
@@ -883,6 +1013,11 @@ class TestKTOTrainer(TrlTestCase):
 
     @require_peft_target_parameters
     def test_train_moe_peft_model(self):
+        # [FUNCTION DOC]
+        # Regression for issue 5222 on tiny GPT-OSS with LoRA target_parameters on expert weights: asserts a ref adapter
+        # exists in peft_config for peft 0.20.0 or newer and is absent before; then the same check as
+        # test_train_peft_model. Requires peft target_parameters support. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Regression test for https://github.com/huggingface/trl/issues/5222. Before PEFT 0.20.0, only one adapter per
         # model was supported when the LoRA config uses `target_parameters` (see peft#3340, fixed in peft#3350), so no
         # "ref" adapter could be created and the reference log probs were computed with adapters disabled instead.
@@ -926,6 +1061,10 @@ class TestKTOTrainer(TrlTestCase):
     # changes, we still explicitly test PEFT + gradient checkpointing, which has caused issues in the past.
     @require_peft
     def test_train_with_peft_config_and_gradient_checkpointing(self):
+        # [FUNCTION DOC]
+        # Runs the PEFT train check with a LoRA peft_config and gradient_checkpointing explicitly True (lr 0.1),
+        # a regression guard since it is the default. Requires peft. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
@@ -962,6 +1101,11 @@ class TestKTOTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_lm_head_raises(self):
+        # [FUNCTION DOC]
+        # Asserts a LoRA config targeting lm_head (plus q_proj, v_proj) makes the trainer raise ValueError mentioning
+        # lm_head, because the chunked projection reads lm_head weights directly. Sets ensure_weight_tying only for peft
+        # versions from 0.19.0 up to before 0.19.2.dev0. Requires peft. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         # The chunked projection reads `lm_head.weight` directly, so a LoRA adapter on `lm_head` is silently
         # ignored and never trained. The trainer must fail fast instead of training a silently-frozen head.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
@@ -985,6 +1129,10 @@ class TestKTOTrainer(TrlTestCase):
 
     @require_peft
     def test_train_peft_prompt_tuning(self):
+        # [FUNCTION DOC]
+        # Trains with prompt tuning (8 virtual tokens, lr 0.1) and asserts train_loss is logged and every prompt_encoder
+        # parameter changed. Requires peft. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
         training_args = KTOConfig(
             output_dir=self.tmp_dir,
@@ -1011,6 +1159,10 @@ class TestKTOTrainer(TrlTestCase):
 
     @pytest.mark.skipif(not is_bf16_supported(), reason="test requires bf16 support")
     def test_logps_use_mixed_precision(self):
+        # [FUNCTION DOC]
+        # With bf16 (skipped if unsupported), registers a forward hook on the first q_proj module recording output
+        # dtypes during training; asserts the hook fired and all recorded dtypes are bfloat16.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir; temporary hook.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
         training_args = KTOConfig(
             output_dir=self.tmp_dir,
@@ -1023,6 +1175,9 @@ class TestKTOTrainer(TrlTestCase):
         projection_dtypes = []
 
         def record_projection_dtype(_module, _args, output):
+            # [FUNCTION DOC]
+            # HELPER: Forward hook appending the output dtype to projection_dtypes. Inputs: module, args, output.
+            # Outputs: none. Exceptions: none. Side effects: mutates the enclosing list.
             projection_dtypes.append(output.dtype)
 
         with projection.register_forward_hook(record_projection_dtype):
@@ -1032,6 +1187,9 @@ class TestKTOTrainer(TrlTestCase):
         assert set(projection_dtypes) == {torch.bfloat16}
 
     def test_train_with_precomputed_ref_logps(self):
+        # [FUNCTION DOC]
+        # Trains one step with precompute_ref_log_probs True and asserts train_loss is logged.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
         training_args = KTOConfig(
             output_dir=self.tmp_dir,
@@ -1048,6 +1206,11 @@ class TestKTOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("iterable_as", ["train", "eval", "eval_dict", "eval_iterable_dataset_dict"])
     def test_precompute_ref_log_probs_raises_for_iterable_dataset(self, iterable_as):
+        # [FUNCTION DOC]
+        # Asserts construction raises ValueError (precompute_ref_log_probs not supported with IterableDataset) when a
+        # streaming dataset is used as train, eval, inside a dict eval, or inside an IterableDatasetDict eval.
+        # Uses apo_zero_unpaired and max_steps 1. Inputs: iterable_as (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         # `precompute_ref_log_probs=True` caches reference log-probs by index, which requires random access and is
         # therefore incompatible with a streaming `IterableDataset` — whether passed directly or nested in a dict or
         # `IterableDatasetDict` as the eval dataset.
@@ -1086,6 +1249,10 @@ class TestKTOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("loss_type", ["kto", "apo_zero_unpaired"])
     def test_train_with_iterable_dataset(self, loss_type):
+        # [FUNCTION DOC]
+        # Runs the standard train check on a streaming dataset with batch 2, max_steps 3, lr 0.1, for kto and
+        # apo_zero_unpaired losses. Inputs: loss_type (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Streaming `IterableDataset` is supported for all loss types. Loss types that estimate the KL term (all except
         # `apo_zero_unpaired`) build the mismatched KL pairs from neighboring examples within each fixed-order batch,
         # which streaming preserves because it is consumed sequentially.
@@ -1120,6 +1287,10 @@ class TestKTOTrainer(TrlTestCase):
         Version(transformers.__version__) < Version("4.57.0"), reason="Olmo 3 requires transformers>=4.57.0"
     )
     def test_tokenize_prompt_not_prefix_of_conversation(self):
+        # [FUNCTION DOC]
+        # With tiny Olmo-3 (transformers 4.57.0 or newer) whose generation prompt is not a prefix of the full
+        # conversation, asserts each decoded completion_ids equals the assistant content plus the eos token.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # The Olmo-3 Think template ends the generation prompt with `<think>`, which the full conversation doesn't
         # have, so the tokenized prompt is not a prefix of the tokenized prompt+completion
         dataset = load_dataset("trl-internal-testing/zen", "conversational_unpaired_preference", split="train")
@@ -1138,6 +1309,12 @@ class TestKTOTrainer(TrlTestCase):
             assert completion == example["completion"][0]["content"] + tokenizer.eos_token
 
     def test_train_with_chat_template_kwargs(self):
+        # [FUNCTION DOC]
+        # Sets a Qwen-like template capitalizing roles when role_capital is true and adds an alternating
+        # chat_template_kwargs column to a paired conversational dataset; asserts the template is kept and that decoded
+        # prompts include both uppercase and lowercase system headers (order not checked since data is unpaired); then
+        # runs the standard train check (lr 0.1). Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = KTOConfig(
@@ -1187,6 +1364,9 @@ class TestKTOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_toolcall_data(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on the toolcall preference dataset (lr 0.1, batch 2, max_length 512).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/toolcall", "preference", split="train")
 
         training_args = KTOConfig(
@@ -1212,6 +1392,9 @@ class TestKTOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_eval(self):
+        # [FUNCTION DOC]
+        # Trains with eval every 3 steps and asserts the first log entry has eval_loss.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference")
 
         training_args = KTOConfig(output_dir=self.tmp_dir, eval_strategy="steps", eval_steps=3, report_to="none")
@@ -1227,6 +1410,10 @@ class TestKTOTrainer(TrlTestCase):
         assert trainer.state.log_history[0]["eval_loss"] is not None
 
     def test_train_with_multiple_eval_dataset(self):
+        # [FUNCTION DOC]
+        # Trains with two named eval datasets and asserts the third-last and second-last log entries contain
+        # eval_data1_loss and eval_data2_loss. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference")
 
         training_args = KTOConfig(output_dir=self.tmp_dir, eval_strategy="steps", eval_steps=3, report_to="none")
@@ -1243,6 +1430,11 @@ class TestKTOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("train_dataset_type", ["dataset", "iterable_dataset", "none", "unsupported_dataset_dict"])
     def test_init_with_train_dataset(self, train_dataset_type):
+        # [FUNCTION DOC]
+        # Checks train_dataset validation: None raises ValueError (train_dataset is required), a DatasetDict raises
+        # TypeError (must be Dataset or IterableDataset); Dataset and streaming dataset (max_steps 3) are tokenized so
+        # the first example has prompt_ids. Inputs: train_dataset_type (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         streaming = "iterable" in train_dataset_type
         if train_dataset_type == "none":
             train_dataset = None
@@ -1290,6 +1482,10 @@ class TestKTOTrainer(TrlTestCase):
         ],
     )
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Checks eval_dataset preparation with apo_zero_unpaired for None, single and dict-like containers: None stays
+        # None, dicts keep keys data1 and data2 each with prompt_ids, single datasets have prompt_ids.
+        # Inputs: eval_dataset_type (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: none.
         # `apo_zero_unpaired` avoids KTO's KL term, which is incompatible with streaming datasets.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
@@ -1330,6 +1526,9 @@ class TestKTOTrainer(TrlTestCase):
     # `KTOTrainer`. We keep it as a regression guard: if the default ever changes, we still explicitly test gradient
     # checkpointing, which has caused issues in the past.
     def test_train_with_gradient_checkpointing(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with gradient_checkpointing explicitly True and lr 0.1 (regression guard).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         training_args = KTOConfig(
@@ -1355,6 +1554,9 @@ class TestKTOTrainer(TrlTestCase):
 
     @require_torch_accelerator
     def test_train_with_fp16(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with fp16 and lr 0.1; requires an accelerator.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         training_args = KTOConfig(
@@ -1379,6 +1581,9 @@ class TestKTOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_tag_added(self):
+        # [FUNCTION DOC]
+        # Asserts a trainer with default args adds kto and trl to model.model_tags.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         trainer = KTOTrainer(
@@ -1391,6 +1596,9 @@ class TestKTOTrainer(TrlTestCase):
 
     @require_peft
     def test_tag_added_peft(self):
+        # [FUNCTION DOC]
+        # Same tag assertion with a LoRA peft_config (requires peft).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         trainer = KTOTrainer(
@@ -1405,6 +1613,11 @@ class TestKTOTrainer(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_peft_and_quantization(self):
+        # [FUNCTION DOC]
+        # With peft and bitsandbytes, loads the model id in 4-bit NF4 double-quant (bf16 compute) with LoRA; asserts
+        # 4-bit loading, trains with lr 0.1, and asserts LoRA parameters are bfloat16 and changed (base params not
+        # checked because bnb mutates biases). Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         training_args = KTOConfig(output_dir=self.tmp_dir, learning_rate=0.1, report_to="none")
@@ -1443,6 +1656,10 @@ class TestKTOTrainer(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_peft_dora_and_quantization(self):
+        # [FUNCTION DOC]
+        # Same as the 4-bit LoRA test with DoRA: lora_magnitude_vector parameters must stay float32 and change; other
+        # LoRA parameters must be bfloat16 and change. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
 
         training_args = KTOConfig(output_dir=self.tmp_dir, learning_rate=0.1, report_to="none")
@@ -1484,6 +1701,10 @@ class TestKTOTrainer(TrlTestCase):
                 assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_pad_token_id_synced_with_model_config(self):
+        # [FUNCTION DOC]
+        # With tiny Mistral (tokenizer has no pad token, so eos is used), asserts the tokenizer pad id is set and equals
+        # both model.config.pad_token_id and model.generation_config.pad_token_id. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         # This model's tokenizer has no pad token, so the trainer falls back to the eos token. The model configs must
         # follow: otherwise `Trainer` realigns them at train time and reports it as a change the user did not make.
         dataset = load_dataset("trl-internal-testing/zen", "standard_unpaired_preference", split="train")
@@ -1501,6 +1722,9 @@ class TestKTOTrainer(TrlTestCase):
 
 @require_vision
 class TestKTOTrainerVLM(TrlTestCase):
+    # [CLASS DOC]
+    # KTOTrainer tests on tiny vision-language models with the zen-image / zen-multi-image unpaired preference
+    # datasets (requires vision extras). Uses max_length None (to avoid cutting image tokens) and batch 2 typically.
     @pytest.mark.parametrize(
         "model_id",
         [
@@ -1564,6 +1788,12 @@ class TestKTOTrainerVLM(TrlTestCase):
         ],
     )
     def test_train_vlm(self, model_id):
+        # [FUNCTION DOC]
+        # Trains each listed VLM (Gemma3/4, LFM2.5-VL, LLaVA, LLaVA-Next, Muse Glimmer, Qwen2/2.5/3-VL, Qwen3.5 dense and
+        # MoE, Muse Spark; newer ones skipped on old transformers) and asserts train_loss is logged. Every parameter
+        # must change, except: for LLaVA and LLaVA-Next, vision encoder layers.1 and post_layernorm must stay unchanged;
+        # for Muse Spark, audio_tower parameters must stay unchanged.
+        # Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_unpaired_preference", split="train")
         training_args = KTOConfig(
             output_dir=self.tmp_dir,
@@ -1608,6 +1838,10 @@ class TestKTOTrainerVLM(TrlTestCase):
         strict=False,
     )
     def test_train_vlm_multi_image(self, model_id):
+        # [FUNCTION DOC]
+        # Runs the standard train check (lr 0.1) on the multi-image dataset with Qwen2.5-VL; xfail (non-strict) before
+        # transformers 4.57.0. Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset(
             "trl-internal-testing/zen-multi-image", "conversational_unpaired_preference", split="train"
         )
@@ -1637,6 +1871,9 @@ class TestKTOTrainerVLM(TrlTestCase):
             assert not torch.equal(param, new_param), f"Param {n} is not updated"
 
     def test_train_vlm_apo_zero_unpaired(self):
+        # [FUNCTION DOC]
+        # Trains Qwen2.5-VL with apo_zero_unpaired (no KL tensors in the collator) and asserts train_loss is logged.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # apo_zero_unpaired does not need the KL term: verify that calculate_kl=False path works end-to-end.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_unpaired_preference", split="train")
         training_args = KTOConfig(
@@ -1665,6 +1902,11 @@ class TestKTOTrainerVLM(TrlTestCase):
         ["conversational_unpaired_preference", "standard_unpaired_preference"],
     )
     def test_train_vlm_text_only_data(self, model_id, dataset_config):
+        # [FUNCTION DOC]
+        # Trains Qwen2.5-VL on text-only zen data (conversational and standard); asserts ddp_find_unused_parameters is
+        # enabled, train_loss is logged, parameters under model.visual are unchanged (tolerance 1e-12) and all others
+        # changed. Inputs: model_id, dataset_config (str, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", dataset_config, split="train")
         training_args = KTOConfig(output_dir=self.tmp_dir, report_to="none")
         trainer = KTOTrainer(
@@ -1691,6 +1933,10 @@ class TestKTOTrainerVLM(TrlTestCase):
                 assert not torch.equal(param, new_param), f"Param {n} is not updated"
 
     def test_train_vlm_with_max_length(self):
+        # [FUNCTION DOC]
+        # Regression: with max_length 37 (truncating one completion token but no image tokens), training Qwen2.5-VL must
+        # not crash from mismatched mm_token_type_ids; asserts train_loss is logged. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Regression test: mm_token_type_ids (and KL_mm_token_type_ids) must be truncated alongside
         # input_ids when max_length is set, otherwise a shape mismatch crashes the model forward pass.
         # max_length=37 truncates 1 completion token (total_len=38) while keeping all image tokens (prompt_len=34) safe.
@@ -1710,6 +1956,9 @@ class TestKTOTrainerVLM(TrlTestCase):
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
     def test_vision_dataset_with_text_model_raises(self):
+        # [FUNCTION DOC]
+        # Asserts an image dataset with a text-only model raises ValueError mentioning vision-related data and a
+        # vision-language model. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_unpaired_preference", split="train")
         training_args = KTOConfig(output_dir=self.tmp_dir, report_to="none")
         with pytest.raises(ValueError, match="vision-related.*vision-language model"):
@@ -1720,6 +1969,9 @@ class TestKTOTrainerVLM(TrlTestCase):
             )
 
     def test_precompute_ref_log_probs_raises_for_vision(self):
+        # [FUNCTION DOC]
+        # Asserts precompute_ref_log_probs True with an image dataset raises ValueError (not supported for vision
+        # datasets). Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_unpaired_preference", split="train")
         training_args = KTOConfig(output_dir=self.tmp_dir, report_to="none", precompute_ref_log_probs=True)
         with pytest.raises(ValueError, match="precompute_ref_log_probs.*not supported for vision datasets"):

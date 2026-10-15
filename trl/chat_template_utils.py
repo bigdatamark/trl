@@ -1,3 +1,18 @@
+# [MODULE DOC]
+# Chat-template utilities: cloning templates between tokenizers, attaching response parsers, probing template
+# capabilities (tool calling, prefix preservation, stop-token training), selecting training-compatible templates, and
+# parsing generated token ids into structured assistant messages.
+# Contents: feature flags _SUPPORTS_RESPONSE_TEMPLATE (transformers >= 5.13.0.dev0, new-style response_template parser
+# with prefix support) and _SUPPORTS_PARSE_RESPONSE_TOOLS (transformers >= 5.15.0, tool-schema typed arguments);
+# legacy regex-based response schemas (glm4moe, gptoss, qwen3, llama3, qwen3_5) and new-style response templates
+# (qwen3, qwen3_5, glm4moe, llama3, gptoss, lfm2_2_5, nemotron_3, gemma4, deepseek_r1_distill); the reference chat
+# templates and their "training" counterparts (with generation markers / prefix-preserving fixes) loaded as strings
+# from the chat_templates directory; and the functions has_generation_markers, clone_chat_template,
+# add_response_schema, supports_tool_calling, is_chat_template_prefix_preserving, is_chat_template_stop_token_trained,
+# get_training_chat_template, _validate_tool_calls, parse_response.
+# Import-time side effects: reads every .jinja file listed into module-level strings (fails if any is missing) and
+# builds the LFM2.5 argument regex by nesting bracket patterns three levels deep.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,6 +55,10 @@ _SUPPORTS_PARSE_RESPONSE_TOOLS = Version(transformers.__version__) >= Version("5
 
 
 def has_generation_markers(chat_template: str | dict[str, str]) -> bool:
+    # [FUNCTION DOC]
+    # Returns True if the template contains a Jinja generation block tag (allowing the whitespace-trim dash variants). A
+    # dict of named templates is reduced to its "default" entry.
+    # Inputs: chat_template (str or dict). Outputs: bool. Exceptions: KeyError if a dict lacks "default". Side effects: none.
     """
     Check whether the chat template defines `{% generation %}` markers, accounting for whitespace-trim variants such as
     `{%- generation %}` and `{%- generation -%}`. For a chat template shipped as named variants, the `default` variant
@@ -56,6 +75,16 @@ def clone_chat_template(
     source_tokenizer_path: str,
     resize_to_multiple_of: int | None = 64,
 ) -> tuple[PreTrainedModel, PreTrainedTokenizerBase, list[int]]:
+    # [FUNCTION DOC]
+    # Copies the chat template and special tokens of a source tokenizer onto a target tokenizer and adapts the model.
+    # Behavior: load the source tokenizer; copy its chat template; add the source's added tokens missing from the target
+    # vocab; set the target eos token to the source's and update eos_token_id on the model's text config and, if the model
+    # can generate, on its generation config; resize embeddings to the tokenizer vocab length padded to a multiple of
+    # resize_to_multiple_of; then add dummy tokens named extra_id_N until the tokenizer vocab size equals model.vocab_size.
+    # Inputs: model, tokenizer, source_tokenizer_path (hub id or path), resize_to_multiple_of (default 64; None = exact).
+    # Outputs: tuple (model, tokenizer, list of ids of all newly added tokens incl. dummy ones).
+    # Exceptions: RuntimeError if sizes still mismatch; loading errors.
+    # Side effects: mutates model and tokenizer in place; may download the source tokenizer.
     """
     Clones a chat template from a source tokenizer to the target tokenizer and updates the model accordingly.
 
@@ -684,6 +713,16 @@ ProcessingClassT = TypeVar("ProcessingClassT", PreTrainedTokenizerBase, Processo
 
 
 def add_response_schema(processing_class: ProcessingClassT) -> ProcessingClassT:
+    # [FUNCTION DOC]
+    # Attaches a response parser to the tokenizer (inner tokenizer for processors) by exact match of the top-level chat
+    # template against known templates: GLM-4-MoE, GPT-OSS, Llama 3.1/3.2, Qwen2.5/Qwen3 family, Qwen3.5/3.6/3.8 family,
+    # Nemotron 3 family (qwen3_5 schema + nemotron template), LFM2 v2 / LFM2.5 family, Gemma 4 variants and
+    # DeepSeek-R1-Distill (the last three have no legacy schema). On transformers with response_template support it sets
+    # response_template; otherwise it sets the legacy response_schema.
+    # Inputs: processing_class (tokenizer or processor). Outputs: the same processing_class.
+    # Exceptions: ValueError for an unrecognized template, or when only a new-style template exists but transformers is
+    # too old.
+    # Side effects: sets an attribute on the tokenizer.
     r"""
     Adds the appropriate response template (or legacy schema) to the given tokenizer based on its chat template.
 
@@ -798,6 +837,15 @@ def add_response_schema(processing_class: ProcessingClassT) -> ProcessingClassT:
 
 
 def supports_tool_calling(processing_class) -> bool:
+    # [FUNCTION DOC]
+    # Probes whether the chat template renders a full tool-calling exchange.
+    # Behavior: False if there is no chat template. Render (untokenized) a user turn, an assistant turn with one tool call
+    # (sentinel name and a sentinel key/value argument dict), and a tool response with sentinel content (converted to
+    # structured content for processors). TemplateError (incl. UndefinedError) means False; TypeError triggers one retry
+    # with arguments as a JSON string (a TemplateError then means False). Return True only if all four sentinels appear in
+    # the rendered text.
+    # Inputs: processing_class. Outputs: bool.
+    # Exceptions: TypeError on the retry, or other unexpected errors, propagate. Side effects: none.
     """
     Check if the processing class's chat template can render a full tool-calling conversation.
 
@@ -864,6 +912,13 @@ def supports_tool_calling(processing_class) -> bool:
 
 
 def is_chat_template_prefix_preserving(processing_class: PreTrainedTokenizerBase | ProcessorMixin) -> bool:
+    # [FUNCTION DOC]
+    # Checks that tokenizing [user, assistant-with-tool-call] yields a prefix of tokenizing the same conversation plus a
+    # tool message with a generation prompt. For processors, a dummy 8x8 RGB image is injected so image-token expansion is
+    # exercised and the batched outputs are unwrapped. On TypeError, retries once with JSON-string tool arguments.
+    # Inputs: processing_class. Outputs: bool.
+    # Exceptions: errors from the retry or other template errors propagate (TemplateError is not caught).
+    # Side effects: imports PIL for processors.
     """
     Check whether the chat template preserves prefixes when applied.
 
@@ -927,6 +982,14 @@ def is_chat_template_prefix_preserving(processing_class: PreTrainedTokenizerBase
 def is_chat_template_stop_token_trained(
     processing_class: PreTrainedTokenizerBase | ProcessorMixin, chat_template: str | None = None
 ) -> bool:
+    # [FUNCTION DOC]
+    # Checks whether the assistant mask produced by the template covers the assistant end-of-turn token.
+    # Behavior: tokenize user/assistant/user dummy messages (text blocks for processors, no images) with
+    # return_assistant_tokens_mask, optionally using an explicit chat_template; template/type/value errors return False.
+    # Take the masked token ids, scan them from the end skipping tokens that decode to whitespace, and return whether the
+    # last non-whitespace masked token is in the tokenizer's added vocabulary. False if nothing is masked.
+    # Inputs: processing_class, chat_template (optional override string). Outputs: bool.
+    # Exceptions: none expected beyond unexpected tokenizer errors. Side effects: none.
     """
     Check whether the chat template includes an assistant turn's end-of-turn token in the loss mask.
 
@@ -1078,6 +1141,17 @@ def get_training_chat_template(
     processing_class: PreTrainedTokenizerBase | ProcessorMixin | None = None,
     tokenizer: PreTrainedTokenizerBase | None = None,
 ) -> str | None:
+    # [FUNCTION DOC]
+    # Returns a training-compatible replacement chat template, or None if the current one is already suitable.
+    # Behavior: accept the deprecated tokenizer alias (FutureWarning; TypeError if both are given; TypeError if neither).
+    # Use the "default" variant of a dict template. The template is suitable if it has generation markers and, when it
+    # supports tool calling, is prefix-preserving. Otherwise look up an exact match among the known templates (Cohere,
+    # Cohere2, DeepSeek-R1-Distill, DeepSeek-V3, Diffusion Gemma, Gemma, Gemma3, GLM-4-MoE, GPT-OSS, Idefics3, LFM2,
+    # LFM2 v2, Llama 3, LLaVA-Next, Muse Glimmer, Nemotron 3 variants, Phi-3, Phi-3.5, Qwen2.5, Qwen2.5-VL, Qwen3 variants,
+    # Qwen3.5/3.6/3.8, SmolVLM) and return its training version.
+    # Inputs: processing_class, tokenizer (deprecated). Outputs: str template or None.
+    # Exceptions: TypeError for argument misuse; ValueError if patching is needed but no training template exists.
+    # Side effects: may emit a FutureWarning.
     r"""
     Get a training-compatible chat template, if needed.
 
@@ -1254,6 +1328,12 @@ def get_training_chat_template(
 
 
 def _validate_tool_calls(tool_calls: list | None) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Validates and normalizes parsed tool calls in place.
+    # Behavior: None is accepted. Otherwise it must be a list of dicts; nested form requires a dict "function" with a string
+    # "name"; flat form requires a string "name". Missing or None "arguments" is set to an empty dict.
+    # Inputs: tool_calls (list or None). Outputs: None.
+    # Exceptions: ValueError on structural problems. Side effects: mutates tool call dicts.
     """
     Validate tool_calls to ensure all required fields exist with valid values.
 
@@ -1297,6 +1377,17 @@ def parse_response(
     prefix: list[int] | None = None,
     tools: list[dict | Callable] | None = None,
 ) -> dict:
+    # [FUNCTION DOC]
+    # Parses generated token ids into an assistant message dict with a plain-text fallback.
+    # Behavior: when a prefix is given and the tokenizer has a new-style response_template on supporting transformers,
+    # call the tokenizer's parse_response with the prefix (and tools on transformers >= 5.15); otherwise call it with ids
+    # only. A None result is treated as failure. Strip a trailing eos token string from string content; normalize falsy
+    # content to an empty string; validate tool_calls if present. On ValueError or TypeError at any step, return
+    # {"role": "assistant", "content": decoded text with special tokens skipped}.
+    # Inputs: tokenizer, ids (list of int), prefix (optional prompt ids), tools (optional; only used on the prefix path).
+    # Outputs: dict (role, content, optionally reasoning_content/thinking, tool_calls).
+    # Exceptions: other exception types from parsing propagate (e.g. KeyError, AttributeError).
+    # Side effects: none.
     r"""
     Parse a token sequence into structured response dictionaries with fallback handling.
 

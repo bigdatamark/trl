@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Correctness-based math reward functions built on math_verify: accuracy_reward (whole completion),
+# reasoning_accuracy_reward (only the text after a reasoning delimiter), and get_cosine_scaled_reward
+# (correctness combined with a cosine length schedule). Part of trl.rewards.
+# Import-time side effects: imports latex2sympy2_extended and math_verify only if math_verify is installed;
+# the reward functions raise ImportError at call time otherwise.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,6 +38,20 @@ def accuracy_reward(
     log_extra: Callable[[str, list], None] | None = None,
     **kwargs,
 ) -> list[float | None]:
+    # [FUNCTION DOC]
+    # Behavior: requires math_verify. Takes the "content" of the first message of each completion. Timeouts:
+    # parsing 10s and verification 5s in the main thread; disabled (None) in other threads because math_verify
+    # relies on SIGALRM, in which case the math_verify.parser/grader loggers are raised to ERROR. For each
+    # (content, solution) pair: parse the gold solution; if parsing yields nothing, reward None (skip example).
+    # Otherwise parse the completion with a LaTeX extraction config (units normalization, boxed answers tried
+    # first, no anchor-free extraction, first match) and reward 1.0/0.0 from verify(gold, answer).
+    # Records string forms of gold and parsed answer ("[unparseable]" / "[skipped]" placeholders).
+    # Inputs: completions; solution (list of str, same length - strict zip); log_extra optional callback
+    # (column name, values); kwargs ignored.
+    # Outputs: list of float or None per example.
+    # Exceptions: ImportError without math_verify; ValueError if lengths differ.
+    # Side effects: when log_extra is given, logs columns "solution", "gold_parsed", "answer_parsed"; may change
+    # math_verify logger levels globally (non-main thread).
     r"""
     Reward function that checks if the completion matches the ground truth.
         - If both gold and prediction are parseable → use math verification.
@@ -122,6 +143,11 @@ def get_cosine_scaled_reward(
     min_value_correct: float = 0.5,
     max_value_correct: float = 1.0,
 ) -> Callable:
+    # [FUNCTION DOC]
+    # Behavior: returns a _CosineScaledReward callable with the given bounds; no validation.
+    # Inputs: max_len (tokens, normalizes the schedule); min_value_wrong (-1.0), max_value_wrong (-0.5),
+    # min_value_correct (0.5), max_value_correct (1.0).
+    # Outputs: _CosineScaledReward instance. Exceptions: none. Side effects: none.
     # docstyle-ignore
     r"""
     Reward function that scales a correctness reward by the completion length following a cosine schedule, to favor
@@ -175,6 +201,10 @@ def get_cosine_scaled_reward(
 
 
 class _CosineScaledReward:
+    # [CLASS DOC]
+    # HELPER: Picklable callable implementing the cosine length-scaled correctness reward (closure avoided so the
+    # async GRPO rollout worker can pickle it). Class attribute __name__ "cosine_scaled_reward" names logged
+    # metrics. State: max_len and the four bound values. Built by get_cosine_scaled_reward.
     # Callable class rather than a closure so the reward stays picklable: the async GRPO rollout
     # worker forwards reward funcs to a spawned child process, and closures can't be pickled.
     __name__ = "cosine_scaled_reward"
@@ -187,6 +217,9 @@ class _CosineScaledReward:
         min_value_correct: float,
         max_value_correct: float,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Stores max_len, min_value_wrong, max_value_wrong, min_value_correct, max_value_correct.
+        # Inputs/Outputs: as named; returns none. Exceptions: none. Side effects: sets attributes.
         self.max_len = max_len
         self.min_value_wrong = min_value_wrong
         self.max_value_wrong = max_value_wrong
@@ -200,6 +233,18 @@ class _CosineScaledReward:
         completion_ids: list[list[int]],
         **kwargs,
     ) -> list[float | None]:
+        # [FUNCTION DOC]
+        # HELPER: Scores each completion.
+        # Behavior: computes correctness with accuracy_reward (no log_extra). For each example: None correctness gives
+        # None. Otherwise progress = number of completion tokens / max_len clamped to at most 1.0, cosine of
+        # progress times pi; bounds are (min_value_correct, max_value_correct) when correct, else swapped wrong
+        # bounds (max_value_wrong as min, min_value_wrong as max); reward = min + half of (max - min) times
+        # (1 + cosine). So short correct answers approach max_value_correct and short wrong answers approach
+        # min_value_wrong.
+        # Inputs: completions, solution, completion_ids (token-id lists, same length); kwargs ignored.
+        # Outputs: list of float or None.
+        # Exceptions: ImportError (via accuracy_reward); ValueError on length mismatch; ZeroDivisionError if max_len 0.
+        # Side effects: same logger-level side effect as accuracy_reward in non-main threads.
         is_correct = accuracy_reward(completions, solution)
         rewards = []
         for correct, ids in zip(is_correct, completion_ids, strict=True):
@@ -227,6 +272,18 @@ def reasoning_accuracy_reward(
     log_extra: Callable[[str, list], None] | None = None,
     **kwargs,
 ) -> list[float | None]:
+    # [FUNCTION DOC]
+    # Behavior: same as accuracy_reward but first strips reasoning: delimiters default to the single "</think>".
+    # Delimiters are tried in list order; the first one present in the content is used and the content becomes the
+    # text after its last occurrence. If no delimiter is present the reward is 0.0 (not None, to penalize
+    # incomplete reasoning) and both logged strings are "[incomplete reasoning]". Then gold parsing / answer
+    # parsing / verify exactly as in accuracy_reward (same timeouts, thread handling, None for unparseable gold).
+    # Inputs: completions, solution, reasoning_delimiters (optional list of str), log_extra (optional), kwargs ignored.
+    # Outputs: list of float or None.
+    # Exceptions: ImportError without math_verify; ValueError on length mismatch.
+    # Side effects: log_extra columns "solution", "gold_parsed", "answer_parsed"; logger levels in non-main threads.
+    # KNOWN ISSUE: the docstring says the answer follows the last occurrence of any delimiter, but the code uses
+    # the first delimiter in list order that appears, not the delimiter occurring last in the text.
     r"""
     Reward function that removes the reasoning content and checks if the final answer matches the ground truth.
         - If both gold and prediction are parseable → use math verification.

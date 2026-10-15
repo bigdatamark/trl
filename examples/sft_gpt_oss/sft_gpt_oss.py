@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Example training script: SFT of gpt-oss models (e.g. openai/gpt-oss-20b on HuggingFaceH4/Multilingual-Thinking)
+# with MXFP4 weights dequantized at load time. Under the main guard parses ScriptArguments, SFTConfig and ModelConfig
+# (ignoring unrecognized remaining CLI strings) and calls main. Importing has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -55,6 +60,14 @@ from trl import ModelConfig, ScriptArguments, SFTConfig, SFTTrainer, TrlParser, 
 
 
 def main(script_args, training_args, model_args):
+    # [FUNCTION DOC]
+    # Loads the model and dataset and runs SFT.
+    # Behavior: builds model kwargs with revision, attention implementation, the raw dtype string from model_args,
+    # use_cache disabled when gradient checkpointing, and Mxfp4Config with dequantize True; loads AutoModelForCausalLM;
+    # loads the dataset by name/config; builds SFTTrainer with the train split, the test split only when eval_strategy is
+    # not no, and an optional PEFT config; trains, saves to output_dir, pushes when push_to_hub is set, calls end.
+    # Inputs: script_args (ScriptArguments), training_args (SFTConfig), model_args (ModelConfig). Outputs: none.
+    # Exceptions: propagated from loading and training. Side effects: downloads, GPU training, file writes, optional upload.
     # Load model
     quantization_config = Mxfp4Config(dequantize=True)
     model_kwargs = dict(

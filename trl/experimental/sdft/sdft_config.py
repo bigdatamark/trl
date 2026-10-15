@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental SDFT (self-distillation fine-tuning) trainer. Defines SDFTConfig, a
+# _BaseConfig (TrainingArguments subclass) with loss, teacher, generation, vLLM and batching fields. No import-time
+# side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +27,18 @@ from ...trainer.base_config import _BaseConfig
 
 @dataclass
 class SDFTConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass of SDFT hyperparameters consumed by SDFTTrainer.
+    # Groups: distillation loss (distillation_alpha 0.5, distillation_mode topk_logits / full_logits / sampled_token,
+    # distillation_topk 100, distillation_is_clip 2.0, distillation_add_tail, num_loss_tokens_to_skip); teacher
+    # (teacher_model_kind base/live/ema, teacher_update_rate 0.05, teacher_sync_steps 1, generate_from_teacher,
+    # teacher_prompt_template combining prompt and privileged_context, use_teacher_server); model loading
+    # (model_init_kwargs, trust_remote_code, disable_dropout); data (remove_unused_columns False, max_prompt_length 512,
+    # shuffle_dataset); generation (num_generations 8, num_generations_eval, max_completion_length 256, sampling params,
+    # generation_kwargs, chat_template_kwargs, cache_implementation, ds3_gather_for_generation); vLLM (mode, server
+    # address/ports/timeout, colocate TP size, memory utilization 0.3, max model length, sleep mode, model impl);
+    # batching (num_iterations, generation_batch_size, steps_per_generation).
+    # Note: _VALID_DICT_FIELDS extends TrainingArguments' list rather than _BaseConfig's.
     r"""
     Configuration class for the [`experimental.sdft.SDFTTrainer`].
 
@@ -431,6 +448,16 @@ class SDFTConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs base post-init then validates and derives batching fields.
+        # Behavior: sampled_token mode requires distillation_alpha 1.0. Using world_size as process count: if neither
+        # generation_batch_size nor steps_per_generation is set, steps defaults to gradient_accumulation_steps and the batch to
+        # per-device batch times processes times steps; if only the batch is set, it must be divisible by the global batch and
+        # steps is derived; if only steps is set, the batch is derived; both set is an error. generation_batch_size must be
+        # divisible by num_generations. When evaluating, the global eval batch must be divisible by num_generations_eval (or
+        # num_generations). teacher_prompt_template must contain both placeholders.
+        # Inputs: none. Outputs: none. Exceptions: ValueError on any violated rule.
+        # Side effects: sets steps_per_generation and generation_batch_size.
         super().__post_init__()
         if self.distillation_mode == "sampled_token" and self.distillation_alpha != 1.0:
             raise ValueError(

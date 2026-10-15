@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Example training script: GSPO (GRPO with sequence-level importance sampling, set via CLI flags) on the
+# AI-MO/NuminaMath-TIR math dataset, rewarded by think_format_reward and accuracy_reward.
+# Behavior (only under the main guard): parses ScriptArguments, GRPOConfig and ModelConfig with TrlParser; puts
+# revision, attention implementation and dtype (string resolved to a torch dtype unless auto/None) into
+# model_init_kwargs; loads the first 5% of train and test splits; maps each row into a system+user conversational
+# prompt (system prompt asks for reasoning in think tags) and drops the messages/problem columns; builds a GRPOTrainer
+# from the model name with optional quantization and PEFT configs; trains, saves to output_dir, pushes to the Hub when
+# push_to_hub is set, and calls trainer.end.
+# Inputs: CLI arguments / config file. Outputs: trained model in output_dir.
+# Exceptions: propagated from parsing, dataset loading and training. Side effects: downloads, GPU training, file
+# writes, optional Hub upload, experiment logging. Importing the module has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -92,6 +105,10 @@ if __name__ == "__main__":
     )
 
     def make_conversation(example):
+        # [FUNCTION DOC]
+        # HELPER: Map function turning a dataset row into a conversational prompt.
+        # Inputs: example (dict with a problem string). Outputs: dict with prompt = system message (SYSTEM_PROMPT) followed
+        # by a user message holding the problem. Exceptions: KeyError if problem is missing. Side effects: none.
         return {
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},

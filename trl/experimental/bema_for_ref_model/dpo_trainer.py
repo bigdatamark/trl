@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Experimental DPOTrainer that exposes the reference model to callbacks, enabling BEMACallback to update it.
+# Main content: DPOTrainer subclass of the stable trl DPOTrainer. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +21,16 @@ from .callback import CallbackHandlerWithRefModel
 
 
 class DPOTrainer(_DPOTrainer):
+    # [CLASS DOC]
+    # Stable DPOTrainer whose callback_handler is replaced by CallbackHandlerWithRefModel after construction; all other
+    # behavior is inherited.
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: runs the parent constructor, then rebuilds callback_handler from the existing handler's callbacks plus
+        # model, ref_model, processing_class, optimizer and lr_scheduler.
+        # Inputs: same arguments as the stable DPOTrainer. Outputs: none.
+        # Exceptions: those of the parent constructor.
+        # Side effects: replaces self.callback_handler.
         super().__init__(*args, **kwargs)
         # Replace with a new one that calls the events with the reference model
         self.callback_handler = CallbackHandlerWithRefModel(

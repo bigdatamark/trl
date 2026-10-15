@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Example training script: SFT of vision-language chat models (LLaVA, LLaVA-NeXT, Llama 3.2 Vision, SmolVLM, ...) on an
+# image chat dataset such as HuggingFaceH4/llava-instruct-mix-vsft.
+# Behavior (only under the main guard): parses ScriptArguments, SFTConfig and ModelConfig; disables truncation by
+# setting max_length to None (so image tokens are never cut); builds model kwargs (revision, attention, dtype resolved
+# to torch dtype unless auto/None, quantization only when set) and loads AutoModelForImageTextToText; loads the
+# dataset; builds SFTTrainer with the train split, test split only when eval is enabled, and optional PEFT; trains,
+# saves, optionally pushes, calls end.
+# Inputs: CLI args. Outputs: trained model in output_dir. Exceptions: propagated. Side effects: downloads, training,
+# file writes, optional Hub upload. Importing has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

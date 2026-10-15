@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Example training script: LoRA SFT of meta-models/Muse-Spark-Open-816B-A42B across 64 GPUs (launched via a slurm
+# script), with the model sharded at load time through a transformers DistributedConfig (FSDP size 64, expert
+# parallel size 8).
+# Behavior (runs at import time; there is no main guard): loads the first 500000 rows of allenai/tulu-3-sft-mixture;
+# builds SFTConfig (checkpoint dtype kept via auto, distributed config in model_init_kwargs, batch size 1 per device,
+# 500 max steps, max length 2048, 32 dataset processes, packing, logging every step, model-only saves every 50 steps,
+# trackio reporting); builds SFTTrainer from the model id with LoRA rank 16 / alpha 32 on q/k/v/o projections; trains.
+# Inputs: none. Outputs: checkpoints in Muse-Spark-Open-SFT.
+# Exceptions: propagated from loading and distributed training.
+# Side effects: downloads, multi-node GPU training, checkpoint writes, trackio logging. Nothing is pushed to the Hub.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

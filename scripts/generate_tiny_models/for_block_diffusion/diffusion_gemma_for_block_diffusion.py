@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Script that builds a tiny DiffusionGemmaForBlockDiffusion mirroring google/diffusiongemma-26B-A4B-it and pushes it to
+# trl-internal-testing/tiny-DiffusionGemmaForBlockDiffusion.
+# Behavior (import time): requires transformers 5.11.0 exactly, seeds RNGs, loads the reference processor and
+# DiffusionGemmaGenerationConfig, sets the image token budget to 70 on the processor and image processor, loads the
+# reference config and overwrites text sub-config fields (2 layers, hidden 16, MoE with 4 experts, top-2) and vision
+# sub-config fields (2 layers, hidden 16, position embedding size 630, output length 70) in place, sets one sliding and
+# one full attention layer and canvas_length 32, instantiates in bfloat16 (no weight re-init), runs a text-only
+# smoke_test (no processor), check_dtype_pattern, print_config_diff and push_to_hub with the processor.
+# Inputs: --create-pr / --full-diff. Outputs: none.
+# Exceptions: RuntimeError on version mismatch or smoke failure; Hub errors propagate.
+# Side effects: Hub downloads, printing, Hub upload.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

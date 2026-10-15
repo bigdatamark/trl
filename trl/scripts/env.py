@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# "trl env" command: prints environment information for bug reports. Contains print_env. Import-time side
+# effects: none beyond stdlib imports; runs print_env when executed as a script.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +28,17 @@ from importlib.metadata import version
 
 
 def print_env():
+    # [FUNCTION DOC]
+    # Behavior: detects accelerators in order CUDA (device names), MPS ("MPS"), XPU (device names), Neuron (torch
+    # 2.6.0 or newer with a neuron current accelerator; chip names from device properties); else reports "cpu".
+    # Loads the default accelerate config file if it exists and formats it as an indented bullet list (else "not
+    # found"). Gets the TRL git commit hash and appends its first 7 chars to the version. Collects platform,
+    # Python, TRL, torch, transformers, accelerate, datasets, huggingface_hub versions, and versions of optional
+    # bitsandbytes, deepspeed, liger_kernel, peft, vllm ("not installed" when absent), then prints them as a
+    # bullet list with a copy-paste header.
+    # Inputs: none. Outputs: none.
+    # Exceptions: PackageNotFoundError if a required package metadata is missing.
+    # Side effects: reads the accelerate config file, may run git, prints to stdout.
     import torch
     from accelerate.commands.config import default_config_file, load_config_from_file
     from packaging.version import Version

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Defines _BaseTrainer, the minimal transformers Trainer subclass shared by all TRL trainers (telemetry,
+# gradient-accumulation loss-scaling compatibility, model card generation), and _TELEMETRY_TRAINERS, the
+# allowlist of trainer names reportable in telemetry. Import-time side effects: imports wandb if available.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -62,6 +67,13 @@ _TELEMETRY_TRAINERS = {
 
 
 class _BaseTrainer(Trainer):
+    # [CLASS DOC]
+    # HELPER: Base class for TRL trainers (inherits transformers Trainer).
+    # Class attributes subclasses override: loss_is_scaled_for_ga (None/True/False: whether compute_loss already
+    # scales for gradient accumulation), _tag_names (model card tags), _name (trainer display name), _paper (dict
+    # with optional title, id, citation), _template_file (model card template).
+    # Construction: Trainer init, then the GA compatibility shim, then a telemetry ping. create_model_card writes
+    # README.md to output_dir.
     # Whether `compute_loss` already scales the loss for gradient accumulation, see `Trainer.loss_is_scaled_for_ga`
     loss_is_scaled_for_ga = None
 
@@ -71,6 +83,13 @@ class _BaseTrainer(Trainer):
     _template_file = None
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: calls Trainer init with all args. On transformers older than 5.19.0, when loss_is_scaled_for_ga
+        # is not None, emulates the newer attribute: sets model_accepts_loss_kwargs to False and, if the loss is
+        # already scaled, sets compute_loss_func to a non-None sentinel string so Trainer skips its own GA scaling.
+        # Then sends telemetry.
+        # Inputs: Trainer positional/keyword args. Outputs: none.
+        # Exceptions: those from Trainer init. Side effects: possibly sets the two attributes; network telemetry.
         super().__init__(*args, **kwargs)
         # `Trainer.loss_is_scaled_for_ga` requires transformers 5.19; older versions only read these two attributes
         if Version(transformers.__version__) < Version("5.19.0") and self.loss_is_scaled_for_ga is not None:
@@ -80,6 +99,18 @@ class _BaseTrainer(Trainer):
         self._send_telemetry()
 
     def _send_telemetry(self):
+        # [FUNCTION DOC]
+        # HELPER: Sends one anonymous usage ping via huggingface_hub send_telemetry.
+        # Behavior: skipped unless main process and CI env var unset. Reports: distributed mode (deepspeed, fsdp, ddp
+        # when more than one process, else none); device type and accelerator name (cuda/xpu/npu/mlu name of device
+        # 0, neuron chip name, else "other"); world size bucket ("1", "2-8", "9-64", "65+"); trainer class name only
+        # if in _TELEMETRY_TRAINERS and defined in a trl module, else "other"; dataset source ("other" for non-Dataset,
+        # "memory" when no cache files, "hub" when the first cache file path has a component containing "___", else
+        # "files"); model_type if in CONFIG_MAPPING else "other"; whether the model is a PEFT model. Topic is
+        # "trl/<trainer>".
+        # Inputs: none (uses self state). Outputs: none.
+        # Exceptions: AttributeError possible if the model has no config. Side effects: network request (respecting
+        # HF_HUB_DISABLE_TELEMETRY / HF_HUB_OFFLINE inside send_telemetry).
         # Only send from rank 0 to avoid multiplying pings by world size, and skip CI runs so automated tests don't
         # bias the data. Honors `HF_HUB_DISABLE_TELEMETRY=1` and `HF_HUB_OFFLINE=1` (handled by `send_telemetry`).
         if not self.accelerator.is_main_process or os.environ.get("CI"):
@@ -149,6 +180,14 @@ class _BaseTrainer(Trainer):
         dataset_name: str | None = None,
         tags: str | list[str] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: only on world process zero. base_model is the config's model id unless it is a local directory.
+        # Tags normalized to a set, plus "unsloth" if config has unsloth_version, "hf_jobs" if JOB_ID is set, and the
+        # class _tag_names; any "trackio:" tags are replaced by one with the current Trackio space URL. Generates the
+        # card with wandb run URL, trackio URL, comet URL, trainer name/paper info/template and saves README.md in
+        # args.output_dir.
+        # Inputs: model_name, dataset_name, tags (str or list), all optional. Outputs: none.
+        # Exceptions: I/O errors on save. Side effects: writes output_dir/README.md.
         """
         Creates a draft of a model card using the information available to the `Trainer`.
 

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# TRL environment_factory adapter for ORS-compliant servers using the openreward SDK.
+# Contents: _import_openreward (lazy import), JSON-Schema to Python type maps and _resolve_param_type,
+# _RolloutEnvironment (one session per rollout, tracks rewards/metadata, dispatches tool calls), _bind_tool_method
+# (generates a typed method per ORS tool via exec so transformers can build a tool schema from it), and utilities
+# _spec_to_dict and _join_text_blocks. Used by _spec.OpenRewardSpec.
+# Import-time side effects: creates a logger and compiles the tool-name regex; openreward is not imported.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 
 def _import_openreward():
+    # [FUNCTION DOC]
+    # HELPER: Imports and returns the openreward module.
+    # Inputs: none. Outputs: the module.
+    # Exceptions: ImportError with install instructions (chained) if missing. Side effects: module import.
     """Lazy-import the openreward package with a friendly error message."""
     try:
         import openreward
@@ -76,6 +88,12 @@ _PY_TYPE_FROM_VALUE: dict[type, str] = {
 
 
 def _resolve_param_type(pdef: dict[str, Any]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Picks a Python type name for one JSON-Schema property.
+    # Behavior: uses a primitive "type" if it maps; else the first non-null mapped type inside anyOf/oneOf; else the type of
+    # a non-None default (bool checked before int); else "str".
+    # Inputs: pdef (property schema dict). Outputs: one of "str", "int", "float", "bool", "list", "dict".
+    # Exceptions: none. Side effects: none.
     """Pick the best Python type name for one JSON-Schema property.
 
     Handles primitive ``"type"``, Pydantic's ``anyOf``/``oneOf`` form for ``Optional[T]``, and falls back to the type
@@ -102,6 +120,12 @@ def _resolve_param_type(pdef: dict[str, Any]) -> str:
 
 
 class _RolloutEnvironment:
+    # [CLASS DOC]
+    # Per-rollout environment adapter; GRPOTrainer creates one per rollout slot and calls reset and the bound tool methods.
+    # State: _client, _env (SDK handles), _split, _secrets, _session_cm (the SDK context manager) and _session (entered
+    # session); episode state reward (last non-null reward), rewards (per-step), metadata (per-step), finished, last_output.
+    # Tool methods are bound onto the class (not the instance) at construction, one per ORS tool, each forwarding to
+    # _call_ors_tool. Private methods (leading underscore) are hidden from the model's tool surface. No base class.
     """Per-rollout TRL adapter backed by the ``openreward`` SDK.
 
     **Internal class.** Users don't construct this directly; they create an :class:`OpenRewardSpec` and pass
@@ -156,6 +180,15 @@ class _RolloutEnvironment:
         _env: Any = None,
         _tool_specs: list[Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Builds or reuses SDK handles, initializes episode state and binds tool methods.
+        # Behavior: requires exactly one of name/base_url. Without _client, creates an OpenReward client (api_key option, or env
+        # var OPENREWARD_API_KEY when using name; base_url when given). Without _env, looks up the environment by name, else
+        # env_name, else "env" for a URL target. Binds a method for each spec in _tool_specs (or the env's list_tools).
+        # Inputs: keyword-only name, base_url, env_name, split ("train"), api_key, secrets, timeout (unused), _client, _env,
+        # _tool_specs.
+        # Outputs: none. Exceptions: ValueError for invalid name/base_url combination; ImportError; SDK errors.
+        # Side effects: possible network calls; mutates the class by adding methods.
         if (name is None) == (base_url is None):
             raise ValueError("Provide exactly one of: name, base_url.")
 
@@ -210,6 +243,14 @@ class _RolloutEnvironment:
         task_spec: dict[str, Any] | None = None,
         **_: Any,
     ) -> str:
+        # [FUNCTION DOC]
+        # Starts a new episode.
+        # Behavior: tears down any previous session and clears episode state; opens a session via a Task built from task_spec
+        # (server, environment name, namespace taken from the env) when given, else by split and integer task_index; keeps the
+        # context manager and the entered session; fetches the prompt and returns its joined text blocks.
+        # Inputs: keyword-only task_index (default 0), task_spec (optional dict), other kwargs ignored.
+        # Outputs: prompt text (appended by TRL to the user message).
+        # Exceptions: SDK/network errors. Side effects: server session created.
         """Open a fresh ORS session for this rollout.
 
         Closes any prior session, starts a new one via the SDK's ``env.session(...)`` context manager, fetches the
@@ -246,12 +287,19 @@ class _RolloutEnvironment:
     # Leading underscore so TRL's tool collector at grpo_trainer.py:502-506
     # excludes this from the model's tool surface.
     def _close(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Best-effort teardown of the active session (delegates to _teardown_session).
+        # Inputs: none. Outputs: none. Side effects: server session deleted.
         """Tear down the active session (best-effort)."""
         self._teardown_session()
 
     # ── helpers ──────────────────────────────────────────────────────
 
     def _teardown_session(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Exits the stored session context manager if any (errors logged at debug level and swallowed), then clears
+        # _session_cm and _session.
+        # Inputs: none. Outputs: none. Exceptions: none. Side effects: server session cleanup.
         if self._session_cm is None:
             return
         try:
@@ -264,6 +312,14 @@ class _RolloutEnvironment:
         self._session = None
 
     def _call_ors_tool(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Invokes a server tool and records the step.
+        # Behavior: on call failure appends None reward/metadata and returns "Error: <message>" (also stored in last_output).
+        # On success joins text blocks (or "(no output)"), converts reward to float when possible (else None), appends it and
+        # updates reward when non-null, appends metadata if a dict else None, sets finished and last_output.
+        # Inputs: tool_name, tool_input (dict of arguments).
+        # Outputs: text for the model.
+        # Exceptions: RuntimeError if called before reset. Side effects: network call; mutates episode state.
         """Invoke a server-side tool and update episode state."""
         if self._session is None:
             raise RuntimeError("Cannot call a tool before reset() opens a session.")
@@ -303,6 +359,18 @@ _VALID_TOOL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _bind_tool_method(cls: type, spec: dict[str, Any]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Creates and attaches a typed method for one ORS tool to cls.
+    # Behavior: skips (with warning) tool names that are not Python identifiers, and silently skips names already in the
+    # class dict. Description defaults to "Call the <name> tool.". Orders required properties before optional ones; each
+    # parameter gets a type from _resolve_param_type, optional ones a default from the schema (None if absent, rendered with
+    # repr). Aborts with a warning if any parameter name is not an identifier. Builds a docstring with an Args section and
+    # embeds it via repr so untrusted text cannot break the source; generates source for a method that collects its locals
+    # (minus self) and calls _call_ors_tool; executes it, sets qualname and annotations (return str), and sets it on cls.
+    # Inputs: cls, spec (dict with name, description, input_schema).
+    # Outputs: none. Side effects: mutates cls; executes generated code.
+    # KNOWN ISSUE: names matching the identifier regex can still be Python keywords (for example "class" or "from"), which
+    # makes the generated source fail with SyntaxError instead of being skipped.
     """Generate a typed Python method for one ORS tool spec.
 
     Signature comes from the JSON Schema; docstring is Google-style so ``transformers.utils.get_json_schema`` (used by
@@ -367,6 +435,10 @@ def _bind_tool_method(cls: type, spec: dict[str, Any]) -> None:
 
 
 def _spec_to_dict(spec: Any) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Returns dict specs unchanged; converts SDK ToolSpec objects to a dict of name, description and input_schema
+    # (empty dict when None).
+    # Inputs: spec. Outputs: dict. Exceptions: AttributeError for unexpected objects. Side effects: none.
     """Normalise SDK ``ToolSpec`` and dict shapes to the same dict form.
 
     ``openreward.api.environments.types.ToolSpec`` is a stable dataclass with ``name``, ``description``,
@@ -382,6 +454,10 @@ def _spec_to_dict(spec: Any) -> dict[str, Any]:
 
 
 def _join_text_blocks(blocks: list[Any]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Joins with newlines the non-empty text of all blocks whose type is "text" (dicts or SDK block objects),
+    # skipping other block types; returns "" for empty input.
+    # Inputs: blocks (list). Outputs: str. Exceptions: AttributeError for objects without type. Side effects: none.
     """Concatenate the ``text`` field of every text block in order.
 
     Accepts both SDK ``TextBlock`` dataclasses and plain dicts. Both shapes expose a ``type`` discriminator (`"text"`

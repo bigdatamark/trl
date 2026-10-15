@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Experimental GKD (Generalized Knowledge Distillation) trainer.
+# Main content: GKDTrainer, an SFTTrainer subclass that distills a same-vocabulary teacher into the student using the
+# generalized Jensen-Shannon divergence on token distributions, mixing dataset, on-policy student and (optionally)
+# teacher-generated sequences. Import-time side effects: conditional peft import; module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,6 +58,12 @@ logger = get_logger(__name__)
 
 
 class GKDTrainer(SFTTrainer):
+    # [CLASS DOC]
+    # SFTTrainer subclass for GKD. Key state: teacher_model (accelerator- or DeepSpeed-prepared, eval mode), lmbda, beta,
+    # temperature, seq_kd, generation_config (sampling with temperature, top_k 0, top_p 1, max_new_tokens, cache off under
+    # gradient checkpointing, eos taken from the model's generation config) and generation_kwargs.
+    # Flow: training_step optionally replaces the batch with generated sequences, then the base training step calls
+    # compute_loss, which runs student and teacher and applies generalized_jsd_loss. Model-card tags trl, gkd.
     """Trainer for Generalized Knowledge Distillation (GKD) of language models.
 
     For details on GKD, see the paper: [On-Policy Distillation of Language Models: Learning from Self-Generated
@@ -128,6 +140,22 @@ class GKDTrainer(SFTTrainer):
         peft_config: "PeftConfig | None" = None,
         formatting_func: Callable | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: forces args.remove_unused_columns False; defaults the collator to DataCollatorForChatML(processing_class,
+        # max_length); sets dataset_kwargs skip_prepare_dataset True so raw messages reach the collator; runs the SFTTrainer
+        # constructor. Then resolves teacher init kwargs (only allowed when teacher_model is a string; dtype strings other
+        # than "auto"/None become torch dtypes), loads a string teacher with AutoModelForCausalLM (trust_remote_code from args),
+        # checks student and teacher text-config vocab sizes match, disables student dropout if configured, prepares the
+        # teacher via DeepSpeed or accelerator in evaluation mode, stores hyperparameters, warns when lmbda and temperature are
+        # both 1.0 (DistillationTrainer covers that case), and builds the generation config.
+        # Inputs: model, teacher_model (model or str), args (GKDConfig), data_collator, train_dataset, eval_dataset,
+        # processing_class, compute_metrics, callbacks, optimizers, preprocess_logits_for_metrics, peft_config,
+        # formatting_func.
+        # Outputs: none.
+        # Exceptions: ValueError if init kwargs are given with an instantiated teacher or vocab sizes differ.
+        # Side effects: mutates args; may download the teacher; warning log.
+        # KNOWN ISSUE: args defaults to None but is dereferenced on the first line, so omitting args raises AttributeError;
+        # teacher_model_init_kwargs without a "dtype" key raises KeyError; teacher_model defaults to None but is required.
         # Ensure Trainer does not drop non-signature columns used by the collator (e.g., "prompts")
         args.remove_unused_columns = False
         # Respect a user-provided data_collator; otherwise, provide a ChatML collator that
@@ -244,6 +272,18 @@ class GKDTrainer(SFTTrainer):
         reduction="batchmean",
         num_items_in_batch=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: static. Divides both logits by temperature and takes log-softmax. beta 0: KL(teacher || student) computed
+        # elementwise; beta 1: KL(student || teacher); otherwise the log mixture is the log-sum-exp of student log-probs plus
+        # log(1 - beta) and teacher log-probs plus log(beta), and the divergence is beta times KL(teacher || mixture) plus
+        # (1 - beta) times KL(student || mixture), all per vocabulary entry. If labels are given, keeps only positions whose
+        # label is not -100 (flattening). Reduction: if num_items_in_batch is given, total sum divided by it; else batchmean
+        # divides the sum by the count of valid positions (at least 1) or by the first dimension when no labels; "sum",
+        # "mean", or no reduction otherwise.
+        # Inputs: student_logits, teacher_logits (B, T, V), labels (B, T, optional), beta (default 0.5), temperature
+        # (default 1.0), reduction (default "batchmean"), num_items_in_batch (int or tensor, optional).
+        # Outputs: scalar tensor (or unreduced tensor).
+        # Exceptions: none expected. Side effects: none.
         """
         Compute the generalized Jensen-Shannon Divergence loss for knowledge distillation using F.kl_div. See Eq. (1)
         of https://huggingface.co/papers/2306.13649 for the definition.
@@ -322,6 +362,15 @@ class GKDTrainer(SFTTrainer):
             return jsd
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Behavior: runs the student on input_ids/attention_mask; runs the teacher in eval mode without grad; drops the last
+        # logits position and the first label column (causal shift, no prompt slicing since labels already mask the prompt);
+        # computes generalized_jsd_loss with self.beta (temperature left at 1.0) and num_items_in_batch; empties the device
+        # cache.
+        # Inputs: model, inputs (input_ids, attention_mask, labels), return_outputs (default False), num_items_in_batch.
+        # Outputs: loss, or (loss, student outputs).
+        # Exceptions: model forward errors.
+        # Side effects: teacher set to eval; cache emptied.
         # compute student output
         student_outputs = model(
             input_ids=inputs["input_ids"],
@@ -362,6 +411,14 @@ class GKDTrainer(SFTTrainer):
 
     @staticmethod
     def generate_on_policy_outputs(model, inputs, generation_config):
+        # [FUNCTION DOC]
+        # Behavior: static. Generates from prompts (left-padded prompt ids and mask) with the generation config. Completion is
+        # everything after the prompt width. Completion mask keeps tokens up to and including the first EOS (any of a list of
+        # eos ids), or all when no EOS id is configured. Attention mask is the prompt mask followed by the completion mask.
+        # Labels copy the generated ids, set to -100 where the attention mask is 0 and over the whole prompt width.
+        # Inputs: model (unwrapped), inputs (prompts, prompt_attention_mask), generation_config.
+        # Outputs: tuple (generated ids, attention mask, labels), each (B, prompt width plus generated length).
+        # Exceptions: generation errors. Side effects: none.
         # Generate output with respect to the prompt-only
         generated_outputs = model.generate(
             input_ids=inputs["prompts"],
@@ -406,6 +463,14 @@ class GKDTrainer(SFTTrainer):
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: draws a uniform random number; if it is at most lmbda, generates on-policy sequences with the unwrapped
+        # student (generation kwargs override, gradient checkpointing kwargs passed) and replaces input_ids, attention_mask and
+        # labels; else if seq_kd, does the same with the teacher. Then runs the base training step.
+        # Inputs: model, inputs dict (mutated), num_items_in_batch (optional).
+        # Outputs: detached loss tensor from the base step.
+        # Exceptions: generation/training errors.
+        # Side effects: mutates inputs; consumes Python random state; optimizer-related side effects of the base step.
         """
         Perform a training step for the Generalized Knowledge Distillation (GKD) model.
 

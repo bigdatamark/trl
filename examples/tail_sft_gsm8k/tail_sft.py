@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Example implementing TailSFT (paper 2608.25756) on GSM8K: SFT where, in each selection batch (one forward pass across
+# all ranks), the examples whose length-normalized loss has fallen furthest below the initial policy's loss are dropped
+# from the gradient, with a static or linearly ramped drop fraction.
+# Contents: argument dataclasses with paper defaults (TailSFTScriptArguments, TailSFTConfig, TailSFTModelConfig), a
+# collator that also batches initial_loss, TailSFTTrainer (SFTTrainer subclass), main and make_parser.
+# Under the main guard parses the three dataclasses with TrlParser and calls main. Importing has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,6 +42,8 @@ from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
 
 @dataclass
 class TailSFTScriptArguments(ScriptArguments):
+    # [CLASS DOC]
+    # ScriptArguments subclass whose defaults point at openai/gsm8k with config main. No methods.
     r"""
     [`ScriptArguments`] with GSM8K as the default dataset.
 
@@ -49,6 +59,11 @@ class TailSFTScriptArguments(ScriptArguments):
 
 @dataclass
 class TailSFTConfig(SFTConfig):
+    # [CLASS DOC]
+    # SFTConfig subclass with the paper's training defaults (learning rate 3e-5, adam beta2 0.95, weight decay 0.1, 3%
+    # warmup, constant-with-warmup schedule, 2 epochs, per-device batch 2, gradient accumulation 4, max length 4096) and two
+    # new fields: filter_fraction (float, default 0.5, fraction of each selection batch to drop; 0 means standard SFT) and
+    # filter_schedule (static or ramp, default ramp). No methods.
     r"""
     [`SFTConfig`] with the filtering schedule of TailSFT.
 
@@ -95,6 +110,8 @@ class TailSFTConfig(SFTConfig):
 
 @dataclass
 class TailSFTModelConfig(ModelConfig):
+    # [CLASS DOC]
+    # ModelConfig subclass defaulting model_name_or_path to allenai/Olmo-3-1025-7B and dtype to bfloat16. No methods.
     r"""
     [`ModelConfig`] with the paper's model as default.
 
@@ -110,15 +127,27 @@ class TailSFTModelConfig(ModelConfig):
 
 @dataclass
 class DataCollatorForTailSFT(DataCollatorForLanguageModeling):
+    # [CLASS DOC]
+    # HELPER: DataCollatorForLanguageModeling subclass that adds a 1-D initial_loss tensor (one float per example) to the
+    # batch produced by the parent collator.
     """SFT collator that also batches the recorded initial-policy loss of each example."""
 
     def torch_call(self, examples: list[dict]) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Calls the parent collator then sets initial_loss to a tensor of each example's initial_loss value.
+        # Inputs: examples (list of dict, each with initial_loss). Outputs: batch dict of tensors.
+        # Exceptions: KeyError if an example lacks initial_loss. Side effects: none.
         output = super().torch_call(examples)
         output["initial_loss"] = torch.tensor([example["initial_loss"] for example in examples])
         return output
 
 
 class TailSFTTrainer(SFTTrainer):
+    # [CLASS DOC]
+    # SFTTrainer subclass implementing TailSFT filtering. On construction it rejects packing, forces loss scaling for
+    # gradient accumulation, records per-example initial-policy losses as an initial_loss dataset column (unless already
+    # present), and swaps in DataCollatorForTailSFT. compute_loss performs the filtering during training and falls back to
+    # the parent loss in eval. Logs filtered_fraction (and aux_loss for MoE) into self._metrics train.
     """
     [`SFTTrainer`] with the sequence filtering of TailSFT.
 
@@ -128,6 +157,14 @@ class TailSFTTrainer(SFTTrainer):
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Initializes the parent SFTTrainer, then adapts it for TailSFT.
+        # Behavior: raises if args.packing; sets model_accepts_loss_kwargs False so the parent scales the loss under gradient
+        # accumulation; if the tokenized train dataset lacks initial_loss, adds it from record_initial_losses; replaces the
+        # data collator with DataCollatorForTailSFT reusing the pad token id and the pad_to_multiple_of arg.
+        # Inputs: same as SFTTrainer. Outputs: none.
+        # Exceptions: ValueError when packing is enabled. Side effects: a full forward pass over the training set; mutates
+        # train_dataset and data_collator.
         super().__init__(*args, **kwargs)
         if self.args.packing:
             raise ValueError("Packing is not supported: filtering is per sequence, and packing concatenates them.")
@@ -147,12 +184,24 @@ class TailSFTTrainer(SFTTrainer):
         )
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # HELPER: Extends the parent's signature columns with initial_loss so remove_unused_columns keeps it for the collator.
+        # Inputs: none. Outputs: none. Exceptions: none. Side effects: mutates self._signature_columns.
         # Without this, `initial_loss` is dropped from the dataset before it reaches the collator.
         super()._set_signature_columns_if_needed()
         self._signature_columns = [*self._signature_columns, "initial_loss"]
 
     @torch.no_grad()
     def record_initial_losses(self) -> list[float]:
+        # [FUNCTION DOC]
+        # Scores every training example with the initial policy, without gradients.
+        # Behavior: every rank iterates the whole train dataset (not sharded) in batches of per_device_train_batch_size using
+        # the current collator; model in eval mode; for each batch moves tensors to the model device, runs a forward on
+        # input_ids and attention_mask, gets per-token loss and mask from per_token_loss, and appends each sequence's summed
+        # loss divided by its target-token count; restores train mode.
+        # Inputs: none. Outputs: list of floats (one per training example, in dataset order).
+        # Exceptions: propagated from the model; division by zero yields NaN for examples without target tokens.
+        # Side effects: toggles model mode; GPU compute.
         """Length-normalized loss of the initial policy over every training example."""
         # Every rank scores the whole dataset. The pass is redundant across ranks, but it is forward-only and keeps the
         # recording free of cross-rank bookkeeping.
@@ -172,12 +221,34 @@ class TailSFTTrainer(SFTTrainer):
         return initial_losses
 
     def per_token_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Next-token cross-entropy per position.
+        # Behavior: drops the last logit position and the first label position, computes unreduced cross-entropy with
+        # ignore index -100 (zero loss at ignored positions), and returns the mask of non-ignored shifted labels.
+        # Inputs: logits (batch, seq, vocab), labels (batch, seq). Outputs: tuple of loss (batch, seq-1) and bool mask
+        # (batch, seq-1). Exceptions: none. Side effects: none.
         """Cross-entropy of every next-token prediction, zero outside the target tokens, and the mask of those."""
         shift_logits, shift_labels = logits[..., :-1, :], labels[..., 1:]
         loss = F.cross_entropy(shift_logits.transpose(1, 2), shift_labels, ignore_index=-100, reduction="none")
         return loss, shift_labels != -100
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # TailSFT training loss with per-sequence filtering.
+        # Behavior: pops initial_loss; if the model is not training, returns the parent compute_loss. Otherwise pops labels,
+        # requests router logits when aux loss is enabled, runs the model with use_cache False and gets per-token loss/mask.
+        # Fraction is filter_fraction, multiplied for the ramp schedule by global_step divided by max(max_steps minus 1, 1).
+        # Margins are the detached length-normalized current loss minus initial_loss, gathered across ranks. The examples
+        # with the smallest margins, count round(n times fraction) capped at n minus 1, are marked dropped; the dropped share
+        # is recorded; the keep mask is reshaped to (num_processes, per-rank batch) and this rank's row is taken. Loss is the
+        # sum of kept-token losses times num_processes divided by the total kept-token count gathered across ranks (so the
+        # DDP average equals the global token mean). For MoE (aux_loss_enabled), recomputes the load-balancing loss with
+        # dropped sequences masked out of the attention mask (zero-valued graph-connected loss if all are dropped), adds it
+        # times router_aux_loss_coef, and logs its gathered mean as aux_loss. Logs filtered_fraction.
+        # Inputs: model, inputs (batch dict), return_outputs (bool), num_items_in_batch (unused in training path).
+        # Outputs: loss tensor, or (loss, outputs) when return_outputs.
+        # Exceptions: propagated; reshape fails if ranks have different batch sizes.
+        # Side effects: mutates inputs (pops keys, may add output_router_logits); collective gathers; appends to self._metrics.
         initial_loss = inputs.pop("initial_loss")
         if not self.model.training:
             return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
@@ -230,6 +301,14 @@ class TailSFTTrainer(SFTTrainer):
 
 
 def main(script_args, training_args, model_args):
+    # [FUNCTION DOC]
+    # Runs TailSFT on GSM8K.
+    # Behavior: sets model_init_kwargs (revision, attention, dtype); loads the train split; maps each row to a
+    # prompt-completion pair whose user message is the question followed by a blank line and an instruction to put the
+    # answer in a LaTeX boxed expression, and whose assistant message is the reference answer (other columns removed);
+    # builds TailSFTTrainer from the model name; trains, saves, optionally pushes, calls end.
+    # Inputs: script_args, training_args (TailSFTConfig), model_args. Outputs: none.
+    # Exceptions: propagated. Side effects: downloads, training, file writes, optional Hub upload.
     training_args.model_init_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
@@ -261,6 +340,9 @@ def main(script_args, training_args, model_args):
 
 
 def make_parser():
+    # [FUNCTION DOC]
+    # HELPER: Returns a TrlParser over TailSFTScriptArguments, TailSFTConfig and TailSFTModelConfig.
+    # Inputs: none. Outputs: TrlParser. Exceptions: none. Side effects: none.
     dataclass_types = (TailSFTScriptArguments, TailSFTConfig, TailSFTModelConfig)
     return TrlParser(dataclass_types)
 

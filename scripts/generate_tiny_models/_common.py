@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# HELPER: Shared utilities for the tiny-model generation scripts: version pinning, seeding, a forward-pass smoke test,
+# dtype and config comparisons against the reference Hub checkpoint, CLI flag parsing, single-commit Hub upload and
+# safe weight initialization. Constants: ORGANIZATION ("trl-internal-testing"), SEED (42), MODEL_CARD template,
+# _DIFF_IGNORE keys and a torch-dtype to safetensors-dtype-string table.
+# Import-time side effects: creates a module-level HfApi client (no network call).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,6 +58,12 @@ api = HfApi()
 
 
 def _transformers_floor_from_pyproject():
+    # [FUNCTION DOC]
+    # HELPER: Returns the minimum transformers version declared in the repository's pyproject.toml.
+    # Behavior: reads pyproject.toml two directories above this file and regex-searches for a quoted transformers>= bound.
+    # Inputs: none. Outputs: version string after the >= sign.
+    # Exceptions: RuntimeError if no bound is found; OSError if the file is missing.
+    # Side effects: reads a file.
     """Read the `transformers>=X.Y.Z` floor from the repo's pyproject.toml."""
     pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
     match = re.search(r'"transformers>=([^"]+)"', pyproject.read_text())
@@ -60,6 +73,10 @@ def _transformers_floor_from_pyproject():
 
 
 def check_transformers_version(expected_version=None):
+    # [FUNCTION DOC]
+    # HELPER: Ensures the installed transformers version equals an expected version exactly (parsed with packaging Version).
+    # Inputs: expected_version (str or None; None means the pyproject floor). Outputs: none.
+    # Exceptions: RuntimeError naming both versions on mismatch. Side effects: imports transformers.
     """Raise unless the installed transformers matches `expected_version` exactly.
 
     If `expected_version` is None, defaults to the `transformers>=` floor from pyproject.toml.
@@ -76,6 +93,9 @@ def check_transformers_version(expected_version=None):
 
 
 def set_seed(seed=SEED):
+    # [FUNCTION DOC]
+    # HELPER: Seeds all RNGs through transformers.set_seed so regenerated weights are reproducible.
+    # Inputs: seed (int, default SEED = 42). Outputs: none. Exceptions: none. Side effects: global RNG state.
     """Seed the RNGs that model construction draws from.
 
     Without this every run produces different weights, so re-pushing a tiny model always creates a new
@@ -88,6 +108,15 @@ def set_seed(seed=SEED):
 
 
 def smoke_test(model, tokenizer_or_processor=None):
+    # [FUNCTION DOC]
+    # HELPER: Runs one forward pass and fails on missing outputs or NaNs.
+    # Behavior: puts the model in eval mode and uses the device of its first parameter. If tokenizer_or_processor is a
+    # ProcessorMixin, builds a batch of two chat conversations each with one 24x24 solid-color image (red / blue) and a
+    # text question, applies the chat template with generation prompt, tokenization and padding to tensors. Otherwise
+    # uses a single input_ids sequence 1,2,3,4. Runs the model under no_grad, takes logits or else last_hidden_state.
+    # Inputs: model, tokenizer_or_processor (optional; tokenizers are ignored). Outputs: none.
+    # Exceptions: RuntimeError if neither output exists or the tensor contains NaN.
+    # Side effects: switches model to eval mode; prints an OK line with the output shape.
     """Run a minimal forward pass to sanity-check the tiny model doesn't crash or produce NaNs."""
     model.eval()
     device = next(model.parameters()).device
@@ -134,6 +163,9 @@ def smoke_test(model, tokenizer_or_processor=None):
 
 
 def _flatten(d, prefix=""):
+    # [FUNCTION DOC]
+    # HELPER: Flattens a nested dict into one level with dot-joined keys (recursing into dict values only).
+    # Inputs: d (dict), prefix (str, default empty). Outputs: new flat dict. Exceptions: none. Side effects: none.
     out = {}
     for k, v in d.items():
         key = f"{prefix}{k}" if prefix else k
@@ -164,6 +196,14 @@ _TORCH_TO_SAFETENSORS_DTYPE = {
 
 
 def check_dtype_pattern(reference_id, model):
+    # [FUNCTION DOC]
+    # HELPER: Reports tensors whose dtype differs from the reference checkpoint, without downloading weights.
+    # Behavior: fetches safetensors metadata for reference_id via the Hub API (prints and returns if the repo is not a
+    # safetensors repo), builds a name to dtype map over all shards, then for every tensor in model.state_dict that has a
+    # same-named reference tensor, compares the safetensors dtype string; prints either an all-matched line or each
+    # mismatch with reference and tiny dtypes.
+    # Inputs: reference_id (str), model. Outputs: none (report only, never raises on mismatch).
+    # Exceptions: Hub errors other than NotASafetensorsRepoError propagate. Side effects: network call, printing.
     """Flag tensors whose dtype diverges from the reference checkpoint.
 
     Reads the reference safetensors header via the Hub API (no weight download). Useful to catch cases
@@ -195,6 +235,11 @@ def check_dtype_pattern(reference_id, model):
 
 
 def _format_diff_value(value, width):
+    # [FUNCTION DOC]
+    # HELPER: Renders a config value for the diff table.
+    # Behavior: lists are prefixed with their item count; the string is cut to width minus one characters plus an
+    # ellipsis when longer than width; width None disables truncation.
+    # Inputs: value, width (int or None). Outputs: str. Exceptions: none. Side effects: none.
     """Render a config value for the diff table, tagging lists with their length and marking truncation."""
     text = f"[{len(value)} items] {value}" if isinstance(value, list) else str(value)
     if width is None or len(text) <= width:
@@ -203,6 +248,14 @@ def _format_diff_value(value, width):
 
 
 def print_config_diff(reference_id, model, full=None):
+    # [FUNCTION DOC]
+    # HELPER: Prints every differing flattened key between the reference Hub config and model.config.
+    # Behavior: full None reads the --full-diff CLI flag; column width 34 unless full. Loads AutoConfig for reference_id,
+    # flattens both config dicts, iterates sorted union of keys, skips keys equal to or ending with an ignored name
+    # (name/path, versions, architectures, model_type, dtype), uses the placeholder missing marker for absent keys, and
+    # prints a header with the difference count and one aligned row per difference.
+    # Inputs: reference_id (str), model, full (bool or None). Outputs: none.
+    # Exceptions: Hub/config loading errors propagate. Side effects: network call, printing.
     """Print the flat, recursive diff between the reference Hub config and the tiny-model config.
 
     Values are truncated to keep the table aligned; pass `--full-diff` (or `full=True`) to print them in full.
@@ -229,6 +282,10 @@ def print_config_diff(reference_id, model, full=None):
 
 
 def _parse_args():
+    # [FUNCTION DOC]
+    # HELPER: Parses the shared optional CLI flags --create-pr and --full-diff (both store_true) with parse_known_args,
+    # ignoring unknown args and without adding a help flag. Inputs: sys.argv. Outputs: argparse Namespace.
+    # Exceptions: none in practice. Side effects: none.
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--create-pr",
@@ -245,6 +302,16 @@ def _parse_args():
 
 
 def push_to_hub(model, tokenizer, generation_config, prefix=None, suffix=None, create_pr=None):
+    # [FUNCTION DOC]
+    # HELPER: Uploads the model, tokenizer/processor, generation config and a model card to the Hub in one commit.
+    # Behavior: create_pr None reads --create-pr. Model card is MODEL_CARD filled with the model class name. Repo id is
+    # ORGANIZATION / [prefix-]ClassName[-suffix]. If the repo exists and create_pr is false, prints a skip message and
+    # returns. Creates the repo when missing. Saves everything (README.md included) into a temp directory, walks it to
+    # build one add-operation per file, and creates a single commit (as a PR only when the repo already existed and
+    # create_pr is set); prints the PR URL when one is opened.
+    # Inputs: model, tokenizer (or None), generation_config (or None), prefix (str, optional), suffix (str, optional),
+    # create_pr (bool or None). Outputs: none.
+    # Exceptions: Hub API errors propagate. Side effects: network calls, temp files, repo creation/commit, printing.
     if create_pr is None:
         create_pr = _parse_args().create_pr
 
@@ -293,6 +360,11 @@ def push_to_hub(model, tokenizer, generation_config, prefix=None, suffix=None, c
 
 
 def init_weights_tiny_model(model):
+    # [FUNCTION DOC]
+    # HELPER: Re-initializes common module types in place to avoid NaNs from uninitialized memory.
+    # Behavior: for every submodule: Linear and Conv1d get Xavier-uniform weights and zero biases; Embedding gets
+    # normal(0, 0.02); LayerNorm gets weight ones and zero bias. Other module types (e.g. RMSNorm) are untouched.
+    # Inputs: model (nn.Module). Outputs: none. Exceptions: none. Side effects: mutates model parameters.
     """
     Initialize tiny test models to avoid NaNs from uninitialized weights.
 

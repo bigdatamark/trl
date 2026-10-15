@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Experimental GMPO (Geometric-Mean Policy Optimization) package, a GRPO variant.
+# Exposes GMPOConfig and GMPOTrainer via eager imports (no __all__ is defined).
+# No lazy-import behavior; no side effects beyond submodule imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# HELPER: Pure tensor functions for self-distillation losses shared by the self-distillation trainer in this package.
+# Contents: compute_divergence (forward KL, reverse KL, or generalized Jensen-Shannon by alpha), add_tail_bucket,
+# apply_importance_sampling_clipping, and three loss variants: top-k support, full vocabulary, and sampled-token.
+# No state and no import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +31,15 @@ def compute_divergence(
     teacher_log_probs: torch.Tensor,
     alpha: float,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Per-position divergence between student and teacher distributions given as log-probabilities.
+    # Behavior: alpha 0 gives KL(teacher || student) (forward KL); alpha 1 gives KL(student || teacher) (reverse KL);
+    # otherwise builds the log of the mixture (1 - alpha) * student + alpha * teacher via logsumexp and returns
+    # (1 - alpha) * KL(student || mixture) + alpha * KL(teacher || mixture) (generalized JSD). Element-wise terms are summed
+    # over the last (vocabulary/support) dimension.
+    # Inputs: student_log_probs, teacher_log_probs (same shape, ... x V), alpha (float in [0, 1]).
+    # Outputs: tensor with the last dimension reduced.
+    # Exceptions: none (alpha outside [0, 1] produces NaN). Side effects: none.
     if alpha == 0.0:
         kl = F.kl_div(student_log_probs, teacher_log_probs, reduction="none", log_target=True)
     elif alpha == 1.0:
@@ -42,6 +57,11 @@ def compute_divergence(
 
 
 def add_tail_bucket(log_probs: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Appends one category holding the leftover mass 1 - sum(exp(log_probs)) to a top-k log-prob vector.
+    # Behavior: logsumexp over the last dim clamped to at most -1e-7 (avoids log of zero), tail log computed as log of
+    # negative expm1; concatenated as a new last element.
+    # Inputs: log_probs (..., k). Outputs: tensor (..., k + 1). Exceptions: none. Side effects: none.
     """Append a bucket holding the leftover probability mass to a top-k log-prob support.
 
     `log_probs` are true log-probabilities over a top-k subset, so they sum to the captured mass `P_topk <= 1`. This
@@ -59,6 +79,12 @@ def apply_importance_sampling_clipping(
     old_log_probs: torch.Tensor,
     clip_coeff: float,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Reweights a per-token loss by a truncated importance ratio between current and old policy.
+    # Behavior: detached log-ratio (student minus old), clamped to [-20, 20], exponentiated and capped above at clip_coeff;
+    # multiplies the loss by it.
+    # Inputs: per_token_loss, student_log_probs, old_log_probs (same shape), clip_coeff (upper bound).
+    # Outputs: tensor of the same shape. Exceptions: none. Side effects: none.
     negative_approx_kl = (student_log_probs - old_log_probs).detach()
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl).clamp(max=clip_coeff)
@@ -73,6 +99,15 @@ def compute_topk_self_distillation_loss(
     distillation_alpha: float,
     distillation_add_tail: bool,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Divergence restricted to the student's top-k tokens.
+    # Behavior: takes the k highest student logits per position and their indices; converts student and gathered teacher
+    # logits at those indices to true log-probs using full-vocabulary logsumexp; then either appends a tail bucket to both
+    # (distillation_add_tail) or renormalizes both over the top-k; returns compute_divergence with distillation_alpha.
+    # Inputs: student_logits, teacher_logits (..., V); keyword-only distillation_topk, distillation_alpha,
+    # distillation_add_tail.
+    # Outputs: per-position divergence tensor (..., ).
+    # Exceptions: RuntimeError if k exceeds the vocabulary size. Side effects: none.
     """Compute distillation loss on the student's top-k token support.
 
     The student's top-k logits define the support. The teacher distribution is projected onto the same token indices.
@@ -105,6 +140,10 @@ def compute_full_logit_self_distillation_loss(
     *,
     distillation_alpha: float,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Full-vocabulary divergence: log-softmax of both logits then compute_divergence with distillation_alpha.
+    # Inputs: student_logits, teacher_logits (..., V); keyword-only distillation_alpha.
+    # Outputs: per-position divergence. Exceptions: none. Side effects: none.
     """Compute full-vocabulary self-distillation loss between student and teacher logits."""
     student_log_probs = torch.log_softmax(student_logits, dim=-1)
     teacher_log_probs = torch.log_softmax(teacher_logits, dim=-1)
@@ -118,6 +157,13 @@ def compute_sampled_token_self_distillation_loss(
     *,
     distillation_alpha: float,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Token-level reverse-KL surrogate on sampled completion tokens only.
+    # Behavior: gathers student and teacher log-probs of completion_ids; returns the detached log-ratio (student minus
+    # teacher) times the student log-prob, a score-function estimator whose gradient matches reverse KL.
+    # Inputs: student_logits, teacher_logits (B, T, V), completion_ids (B, T); keyword-only distillation_alpha.
+    # Outputs: per-token loss (B, T).
+    # Exceptions: ValueError unless distillation_alpha is 1.0. Side effects: none.
     """Compute token-level self-distillation loss only on the sampled completion tokens.
 
     This path compares student and teacher log-probabilities on the realized completion tokens rather than over a

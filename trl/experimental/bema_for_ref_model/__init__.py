@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# Experimental BEMA-as-reference-model package: lets the BEMA (bias-corrected EMA) weights periodically
+# overwrite the DPO reference model.
+# Exports BEMACallback (extends the stable BEMA callback with reference-model updates) and DPOTrainer (stable DPO
+# trainer whose callback handler passes ref_model to callbacks).
+# Imports eagerly (no lazy loading); no side effects beyond importing the submodules.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

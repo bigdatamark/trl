@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Repository maintenance script (run in CI / pre-commit) that ensures every git-tracked Python file starts with the
+# exact HuggingFace Apache-2.0 copyright header, prepending it where missing.
+# Contents: COPYRIGHT_HEADER (year range ends at the current year, computed at import), get_tracked_python_files,
+# check_and_add_copyright and main. Import-time side effects: none beyond computing the header string.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +41,10 @@ COPYRIGHT_HEADER = f"""# Copyright 2020-{datetime.now().year} The HuggingFace Te
 
 
 def get_tracked_python_files():
+    # [FUNCTION DOC]
+    # HELPER: Lists tracked Python files by running git ls-files in the current directory and keeping paths ending in .py.
+    # Inputs: none. Outputs: list of relative path strings; empty list if git fails.
+    # Exceptions: CalledProcessError is caught and printed. Side effects: spawns a git subprocess, may print an error.
     """Get a list of all tracked Python files using git."""
     try:
         # Get the list of all tracked files from Git
@@ -50,6 +60,15 @@ def get_tracked_python_files():
 
 
 def check_and_add_copyright(file_path):
+    # [FUNCTION DOC]
+    # HELPER: Ensures one file begins with COPYRIGHT_HEADER.
+    # Behavior: if the path is not a file, prints a skip message and returns None. Reads the file (utf-8); if its text
+    # starts with the header exactly, returns True. Otherwise prints a modify message, rewrites the file as header plus a
+    # blank line plus the original content and returns False.
+    # Inputs: file_path (str). Outputs: True, False, or None (missing file).
+    # Exceptions: I/O errors propagate. Side effects: may rewrite the file; printing.
+    # KNOWN ISSUE: the missing-file path returns None (docstring implies a check result), which main treats as falsy, so a
+    # tracked-but-deleted file makes the script report missing copyrights and exit 1.
     """Check if the file contains a copyright notice, and add it if missing."""
     if not os.path.isfile(file_path):
         print(f"[SKIP] {file_path} does not exist.")
@@ -71,6 +90,13 @@ def check_and_add_copyright(file_path):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Checks all tracked Python files and sets the exit status.
+    # Behavior: gets tracked files; if none, prints a message and returns (exit 0). Runs check_and_add_copyright on every
+    # file (all files are processed, not short-circuited); exits 1 with a failure message if any result is falsy,
+    # else exits 0 with a success message.
+    # Inputs: none. Outputs: none (always terminates via sys.exit unless no files). Exceptions: SystemExit.
+    # Side effects: may rewrite files; printing.
     """Main function to check and add copyright for all tracked Python files."""
     py_files = get_tracked_python_files()
     if not py_files:

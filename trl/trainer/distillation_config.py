@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Defines DistillationConfig, the TrainingArguments-based configuration for DistillationTrainer (on-policy
+# knowledge distillation from a teacher via generalized JSD). No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +24,18 @@ from .base_config import _BaseConfig
 
 @dataclass
 class DistillationConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass config (inherits _BaseConfig, hence TrainingArguments) for DistillationTrainer.
+    # Field groups: student/teacher loading (model_init_kwargs, trust_remote_code, teacher_model_name_or_path,
+    # teacher_model_revision, teacher_model_init_kwargs, disable_dropout); data (remove_unused_columns False since
+    # only the raw "prompt" column is used, max_completion_length 512, ds3_gather_for_generation, shuffle_dataset,
+    # pad_to_multiple_of "auto"); generation (temperature, top_p, top_k, min_p, generation_kwargs,
+    # chat_template_kwargs, repetition_penalty, cache_implementation); vLLM (use_vllm, vllm_mode "colocate" or
+    # "server", server host/port/base URL/timeout/group port, colocate memory/max length/TP size, sleep mode,
+    # structured outputs regex); training (beta in [0, 1] interpolating generalized JSD: 0 forward KL, 0.5 JSD,
+    # 1 reverse KL; max_tool_calling_iterations); logging (log_completions, num_completions_to_print,
+    # log_unique_prompts). learning_rate default overridden to 1e-6. _VALID_DICT_FIELDS extended with the four
+    # dict-or-JSON-string fields so they can be passed as JSON strings from the CLI.
     r"""
     Configuration class for the [`DistillationTrainer`].
 
@@ -395,6 +411,13 @@ class DistillationConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs the parent post-init; converts a string pad_to_multiple_of other than "auto" to None ("none"
+        # / "null", case-insensitive) or int; resolves "auto" to 128 on Neuron devices and None elsewhere; validates
+        # beta in [0, 1]; rejects parallelism_config with context or sequence parallelism enabled.
+        # Inputs: none. Outputs: none.
+        # Exceptions: ValueError for invalid beta, non-integer pad string, or CP/SP enabled; parent validation errors.
+        # Side effects: mutates pad_to_multiple_of (and fields set by the parent).
         super().__post_init__()
         # The CLI passes the value as a string
         if isinstance(self.pad_to_multiple_of, str) and self.pad_to_multiple_of != "auto":

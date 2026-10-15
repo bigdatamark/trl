@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Test subpackage for multi-GPU / multi-process tests (run with accelerate launchers), kept separate from the
+# single-process suite.
+# Exports: nothing. Lazy imports: none. Side effects on import: none (license header only).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

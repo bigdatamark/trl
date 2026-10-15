@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# OpenEnv harness integration for AsyncGRPO: a rollout worker whose per-rollout generation is delegated to an OpenEnv
+# ResourceSessionFactory (e.g. Harbor sandboxes) instead of TRL's own tool-calling turn loop.
+# Two modes: adapter mode (a HarnessAdapter runs the agent loop and calls back into TRL to sample each turn from vLLM)
+# and loop-owning mode (the external agent samples via its own client; TRL fetches a token-level TrainingTrace
+# afterwards). Contents: CaptureContractError, HarnessRolloutOutcome, conversion helpers, _HarnessRolloutLoop,
+# trace helpers, HarnessRolloutWorker. Requires the openenv package at import time.
+# Import-time side effects: imports openenv (ImportError if missing); creates module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -53,11 +62,19 @@ Message = dict[str, Any]
 
 
 class CaptureContractError(ValueError):
+    # [CLASS DOC]
+    # ValueError subclass raised when captured tokens/masks/sampling metadata from a session are unusable for training.
+    # Unlike other session errors (which make a rollout unscorable), it propagates and stops the worker.
+    # Inputs: message. Side effects: none.
     """Captured tokens, masks or sampling metadata do not satisfy the training contract."""
 
 
 @dataclass
 class HarnessRolloutOutcome:
+    # [CLASS DOC]
+    # Dataclass passed to a user rollout_reward_fn: env_reward (float or None from session.verify), completion
+    # (message list), trace (TraceEntry list; empty in adapter mode), tool_call_count, tool_failure_count,
+    # tool_calls_by_name, timed_out (loop-owning agent timed out).
     env_reward: float | None
     completion: list[Message]
     trace: list[TraceEntry]
@@ -68,6 +85,10 @@ class HarnessRolloutOutcome:
 
 
 def _tools_to_schema(tools: list) -> list[dict] | None:
+    # [FUNCTION DOC]
+    # HELPER: Maps OpenEnv/MCP Tool objects (name, description, input_schema) to OpenAI function-schema dicts of type
+    # "function". Returns None for an empty or missing list.
+    # Inputs: tools list. Outputs: list of dicts or None. Exceptions: AttributeError on malformed tools. Side effects: none.
     """Convert OpenEnv `Tool`s (MCP spec) into the OpenAI function schema `apply_chat_template` expects."""
     if not tools:
         return None
@@ -81,6 +102,11 @@ def _tools_to_schema(tools: list) -> list[dict] | None:
 
 
 def _msg_to_llm_response(msg: Message) -> LLMResponse:
+    # [FUNCTION DOC]
+    # HELPER: Converts a parsed assistant message dict to an OpenEnv LLMResponse.
+    # Behavior: for each tool call takes the nested "function" dict (or the call itself), parses string arguments as JSON
+    # (invalid JSON becomes an empty dict), uses the call id or "call_<index>"; content defaults to an empty string.
+    # Inputs: msg dict. Outputs: LLMResponse. Exceptions: KeyError if a tool call lacks a name. Side effects: none.
     """Convert a `parse_response` assistant message into the `LLMResponse` the harness adapter expects."""
     tool_calls = []
     for i, tc in enumerate(msg.get("tool_calls") or []):
@@ -96,6 +122,14 @@ def _msg_to_llm_response(msg: Message) -> LLMResponse:
 
 
 class _HarnessRolloutLoop(_AsyncRolloutLoop):
+    # [CLASS DOC]
+    # Subclass of _AsyncRolloutLoop whose _generate_one runs one OpenEnv session on a thread pool and returns the same
+    # tuple shape as the base loop (completion messages, completion ids, sequences, tool call count, tool failure count,
+    # reward). Class attributes: _provides_rollout_reward True (reward comes from the rollout, not reward functions),
+    # _EMPTY_ROLLOUT sentinel (empty data, reward None => excluded from group baseline).
+    # State: _adapter, _factory (session factory), _limits (HarnessRunLimits), _rollout_reward_fn, _session_pool
+    # (ThreadPoolExecutor sized max(1, max_inflight_tasks)), _live_sessions (sessions to close on stop).
+    # Appends "harness_reward" to reward_func_names.
     """`_AsyncRolloutLoop` whose `_generate_one` drives an OpenEnv session instead of TRL's own turn loop."""
 
     _provides_rollout_reward = True
@@ -112,6 +146,15 @@ class _HarnessRolloutLoop(_AsyncRolloutLoop):
         lossless_capture: bool = True,
         **loop_kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: in loop-owning mode with lossless_capture, forces fork_threshold_tokens to 0 (any rewrite forks a row) before
+        # calling the base constructor. In loop-owning mode builds the factory with sampling settings (temperature, top_p,
+        # top_k, min_p, repetition_penalty, dropping None values) wrapped by training_sampling; in adapter mode calls the factory
+        # without arguments. Sets run limits: max_turns = max_tool_calling_iterations or 8, sampling temperature and max_tokens.
+        # Creates the session thread pool and live-session set.
+        # Inputs: harness_session_factory (callable), harness_adapter (optional), rollout_reward_fn (optional),
+        # lossless_capture (bool, default True), remaining kwargs forwarded to the base loop.
+        # Outputs: none. Exceptions: from factory or base constructor. Side effects: thread pool creation, factory creation.
         # Fork rewritten captures so reconciliation preserves eligible sampled tokens.
         if harness_adapter is None and lossless_capture:
             loop_kwargs["fork_threshold_tokens"] = 0
@@ -143,6 +186,13 @@ class _HarnessRolloutLoop(_AsyncRolloutLoop):
         self._live_sessions: set = set()
 
     async def _generate_one(self, prompt, tool_dict, tools, group_id=0):
+        # [FUNCTION DOC]
+        # Runs _run_session on the session pool from the event loop and folds its metrics into the loop's counters.
+        # Behavior: if metrics exist, adds correctness to the rollout/correctness_mean rate (sum, count), per-tool call and
+        # failure counters (tools/<name>/call_total, failure_total), overall and per-tool latency rates, then forwards the
+        # remaining metrics to _push_rollout_metrics. tools and tool_dict arguments are ignored (the session owns tools).
+        # Inputs: prompt, tool_dict, tools, group_id (default 0). Outputs: rollout tuple.
+        # Exceptions: CaptureContractError propagates. Side effects: metric state mutation.
         # OpenEnv sessions are synchronous; metrics stay on the event loop.
         loop = asyncio.get_running_loop()
         result, metrics = await loop.run_in_executor(self._session_pool, self._run_session, prompt, group_id)
@@ -164,10 +214,21 @@ class _HarnessRolloutLoop(_AsyncRolloutLoop):
         return result
 
     async def _run_loops(self, stop_event) -> None:
+        # [FUNCTION DOC]
+        # Wraps the base _run_loops: starts a task that waits for stop_event and then closes all live sessions in threads;
+        # in a finally block sets stop_event, awaits that task and shuts down the session pool (waiting for threads).
+        # Inputs: stop_event (asyncio.Event). Outputs: none. Exceptions: propagates base errors after cleanup.
+        # Side effects: closes sessions, stops thread pool.
         async def _close_live_sessions_on_stop() -> None:
+            # [FUNCTION DOC]
+            # HELPER: Awaits stop_event, then closes a snapshot of live sessions concurrently via asyncio.to_thread.
+            # Inputs/Outputs: none. Exceptions: none (close errors logged). Side effects: session closes.
             await stop_event.wait()
 
             def _close(session):
+                # [FUNCTION DOC]
+                # HELPER: Calls session.close, logging a warning with traceback on any exception.
+                # Inputs: session. Outputs: none. Exceptions: none. Side effects: closes session, logging.
                 try:
                     session.close()
                 except Exception:
@@ -185,6 +246,25 @@ class _HarnessRolloutLoop(_AsyncRolloutLoop):
             await asyncio.to_thread(self._session_pool.shutdown, wait=True)
 
     def _run_session(self, prompt, group_id=0):
+        # [FUNCTION DOC]
+        # Runs one rollout synchronously on a pool thread.
+        # Behavior: creates a session with seed = group_id (all generations of a group pick the same task) and a random hex
+        # episode id; creation failure returns _EMPTY_ROLLOUT and no metrics. Registers the session as live; returns empty if the
+        # stop event is already set.
+        # Adapter mode: runs adapter.run_white_box with _sample_turn bound to local turns/turn_times lists; completion is the
+        # result messages; tool_call_count from metrics "tool_calls" (default trace length); counts calls and errors per tool
+        # from tool_trace; per-tool latency = gap between a turn's reply and next request divided evenly among that turn's
+        # tool names (last turn not timed).
+        # Loop-owning mode: session must be a TrainableSession (else CaptureContractError); waits for completion (TimeoutError
+        # sets timed_out and continues), fetches the training trace, converts turns and trace entries (conversion errors become
+        # CaptureContractError); completion, call counts and failure estimates come from the trace helpers.
+        # Then verifies the completion, computes reward via rollout_reward_fn(outcome) or env_reward, converts turns to training
+        # sequences with _chain_to_sequences (errors -> CaptureContractError), and builds metrics (turns, sequences,
+        # completion_ids, tally, loop_exhausted, duration_s, per-tool dicts, latency; correctness = env_reward only when a
+        # custom reward fn is used and env_reward exists).
+        # Inputs: prompt, group_id (default 0). Outputs: (rollout tuple, metrics dict or None).
+        # Exceptions: CaptureContractError re-raised; any other exception is logged and yields _EMPTY_ROLLOUT.
+        # Side effects: session lifecycle (always discarded from live set and closed in finally), network, logging.
         """Return a rollout and its metrics from a pool thread.
 
         Session failures are unscorable. Invalid training captures stop the worker.
@@ -293,6 +373,15 @@ class _HarnessRolloutLoop(_AsyncRolloutLoop):
     def _sample_turn(
         self, turns: list[TurnRecord], turn_times: list[tuple[float, float, list[str]]], messages, tools, sampling
     ) -> ModelStepResult:
+        # [FUNCTION DOC]
+        # OpenEnv ModelStep callback used in adapter mode (called on a pool thread).
+        # Behavior: records request time; converts tools to schema; tokenizes messages with the chat template (generation
+        # prompt added, chat_template and chat_template_kwargs applied); submits _generate_one_turn to the loop's event loop and
+        # blocks on the result (token ids, logprobs); appends a TurnRecord; parses the reply with parse_response (prefix =
+        # prompt ids) and converts to LLMResponse; appends (request time, reply time, tool names) to turn_times.
+        # Inputs: turns, turn_times (mutable accumulators), messages, tools, sampling (unused).
+        # Outputs: ModelStepResult with response, prompt_ids, completion_ids, logprobs.
+        # Exceptions: generation/parse errors propagate. Side effects: appends to the two lists, vLLM request.
         """OpenEnv `ModelStep`: sample one assistant turn against vLLM and record a `TurnRecord` into `turns`.
 
         `turn_times` gets `(request time, reply time, requested tool names)` per turn, for the tool latency metrics.
@@ -317,6 +406,10 @@ class _HarnessRolloutLoop(_AsyncRolloutLoop):
 
 
 def _turns_from_training_trace(trace: TrainingTrace) -> list[TurnRecord]:
+    # [FUNCTION DOC]
+    # HELPER: Builds TurnRecords from an OpenEnv TrainingTrace: prompt ids, completion ids, per-token logprobs and the loss
+    # mask with the prompt part removed (so it aligns with completion tokens).
+    # Inputs: trace. Outputs: list of TurnRecord. Exceptions: AttributeError on malformed trace. Side effects: none.
     """Map OpenEnv's validated full masks to TRL's completion masks."""
     return [
         TurnRecord(
@@ -330,6 +423,10 @@ def _turns_from_training_trace(trace: TrainingTrace) -> list[TurnRecord]:
 
 
 def _tool_call_counts_by_name(entries: list[TraceEntry]) -> dict[str, int]:
+    # [FUNCTION DOC]
+    # HELPER: For every trace entry, reads the first choice's message tool_calls from the response (missing pieces treated
+    # as empty) and counts calls per function name (skipping unnamed).
+    # Inputs: entries. Outputs: dict name -> count. Exceptions: none for missing keys. Side effects: none.
     """Count tool calls by name across the selected agent turns."""
     counts: dict[str, int] = {}
     for entry in entries:
@@ -341,6 +438,12 @@ def _tool_call_counts_by_name(entries: list[TraceEntry]) -> dict[str, int]:
 
 
 def _tool_failures_by_name(entries: list[TraceEntry]) -> dict[str, int]:
+    # [FUNCTION DOC]
+    # HELPER: Heuristic failure count per tool from the last entry's request messages.
+    # Behavior: maps tool call id -> tool name from assistant tool_calls; for each "tool" role message resolves its name
+    # (message name or via tool_call_id), deduplicates on (name, first 200 chars of content), and counts it as a failure
+    # if the lowercased content contains "error", "failed", "traceback" or "exception".
+    # Inputs: entries. Outputs: dict name -> failure count (name may be None). Exceptions: none. Side effects: none.
     """Estimate failures per tool from the last request's tool-result text, deduplicated by name and content."""
     messages = (entries[-1]["request"] if entries else {}).get("messages") or []
     # A tool result names its call id, not its tool; the assistant message that issued the call has the name.
@@ -363,6 +466,11 @@ def _tool_failures_by_name(entries: list[TraceEntry]) -> dict[str, int]:
 
 
 def _messages_from_trace(entries: list[TraceEntry]) -> list[Message]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the last entry's request messages plus an assistant message with the first choice's content (empty
+    # string if no choices). Empty entries return an empty list. Tool calls of the final reply are not included.
+    # Inputs: entries. Outputs: list of message dicts. Exceptions: KeyError if the last entry lacks "request".
+    # Side effects: none.
     """Return the last selected request's messages followed by its assistant reply."""
     if not entries:
         return []
@@ -373,6 +481,9 @@ def _messages_from_trace(entries: list[TraceEntry]) -> list[Message]:
 
 
 class HarnessRolloutWorker(AsyncRolloutWorker):
+    # [CLASS DOC]
+    # AsyncRolloutWorker subclass that only swaps the loop class to _HarnessRolloutLoop (_loop_cls); harness constructor
+    # kwargs are forwarded through the base worker to the loop. Inject via AsyncGRPOTrainer(rollout_worker=...).
     """AsyncGRPO rollout worker that drives an OpenEnv `ResourceSessionFactory`.
 
     Pass `harness_session_factory` as a callable returning an OpenEnv `ResourceSessionFactory`, for example

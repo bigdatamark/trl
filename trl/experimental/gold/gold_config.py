@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental GOLD (cross-tokenizer on-policy distillation) trainer.
+# Main content: GOLDConfig, used by gold_trainer.GOLDTrainer. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +25,19 @@ from ...trainer.sft_config import SFTConfig
 
 @dataclass
 class GOLDConfig(SFTConfig):
+    # [CLASS DOC]
+    # SFTConfig subclass. Groups of fields (defaults): learning_rate 1e-7; generation/loop: temperature 0.9, top_p 0.95,
+    # top_k 0, lmbda 0.5 (on-policy fraction), beta 0.5 (JSD interpolation), max_completion_length 128,
+    # teacher_model_name_or_path, teacher_model_revision, teacher_model_init_kwargs (dict or JSON string),
+    # teacher_tokenizer_name_or_path, disable_dropout True, seq_kd False, num_generations 1, generation_batch_size (derived);
+    # ULD loss: use_uld_loss False, uld_token_merge_strategy "observed" or "bayesian", use_extended_uld True,
+    # uld_use_hybrid_loss False with optional matched/unmatched weights, uld_crossentropy_weight 0.0,
+    # uld_distillation_weight 1.0, student/teacher temperatures 1.0, skip student/teacher EOS True;
+    # vLLM: use_vllm False, vllm_mode "colocate" (or "server"), server base URL/host 0.0.0.0/port 8001/timeout 240,
+    # group port 51216, gpu memory utilization 0.9, tensor parallel size 1, max model length, model impl "vllm",
+    # structured outputs regex, sync frequency 1, sleep mode False;
+    # logging: log_completions False, log_completions_steps 100, num_completions_to_print, wandb_log_unique_prompts True,
+    # callbacks (list of names, default empty).
     r"""
     Configuration class for [`experimental.gold.GOLDTrainer`].
 
@@ -460,6 +477,16 @@ class GOLDConfig(SFTConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: runs the parent post-init, then validates: lmbda and beta in [0, 1]; max_completion_length smaller than
+        # max_length when max_length is set; num_generations at least 1; generation_batch_size defaults to
+        # per_device_train_batch_size times gradient_accumulation_steps divided (integer) by num_generations, must be at least
+        # 1, and times num_generations must equal that product. Warns (UserWarning) when num_generations is above 1 and lmbda
+        # below 1. With use_uld_loss: non-negative CE/distillation weights, positive temperatures, merge strategy in observed
+        # or bayesian, and with hybrid loss both hybrid weights None or both set and non-negative.
+        # Inputs: none. Outputs: none.
+        # Exceptions: ValueError for each failed check.
+        # Side effects: sets generation_batch_size; may warn.
         super().__post_init__()
 
         # check lmbda and beta are in the range [0, 1]

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Example training script: SFT of Gemma 3 vision models on single-image (HuggingFaceH4/llava-instruct-mix-vsft) or
+# multi-image (FanqingM/MMIU-Benchmark) data. For MMIU, image zip archives are downloaded and extracted into the
+# current directory and rows are converted to system/user/assistant messages with embedded PIL images.
+# Contents: process_vision_info, format_data, prepare_dataset, main. Importing has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -75,6 +81,14 @@ from trl import (
 
 # For multi-image example
 def process_vision_info(messages: list[dict]) -> list[Image.Image]:
+    # [FUNCTION DOC]
+    # HELPER: Collects RGB PIL images from chat messages.
+    # Behavior: for each message, treats non-list content as a one-element list; for each dict element having an image
+    # key or type image, takes the image value (or the element itself), and if not None decodes its bytes field into a
+    # PIL image converted to RGB.
+    # Inputs: messages (list of dict). Outputs: list of PIL images. Exceptions: KeyError/TypeError if an image entry lacks
+    # bytes (e.g. already a PIL image); PIL decode errors. Side effects: none.
+    # KNOWN ISSUE: unused in this script (dead code), despite the comment marking it for the multi-image example.
     image_inputs = []
     for msg in messages:
         content = msg.get("content", [])
@@ -94,6 +108,15 @@ def process_vision_info(messages: list[dict]) -> list[Image.Image]:
 
 
 def format_data(samples: dict[str, any]) -> dict[str, list]:
+    # [FUNCTION DOC]
+    # HELPER: Batched map function converting MMIU rows into conversational messages.
+    # Behavior: for each row index, opens every path in input_image_path (relative to the cwd, i.e. the extracted zip
+    # folders), converts to RGB and wraps it as an image content part; failures are printed and skipped. Builds a system
+    # message from context, a user message of all images followed by the question text, and an assistant message with
+    # output.
+    # Inputs: samples (batched dict with question, input_image_path, context, output). Outputs: dict with messages list.
+    # Exceptions: none raised for unreadable images (caught); KeyError on missing columns. Side effects: file reads,
+    # printing.
     formatted_samples = {"messages": []}
     for cont in range(len(samples["question"])):
         images = []
@@ -119,6 +142,12 @@ def format_data(samples: dict[str, any]) -> dict[str, list]:
 
 # For multi-image example
 def prepare_dataset(dataset: DatasetDict, dataset_name: str) -> DatasetDict:
+    # [FUNCTION DOC]
+    # HELPER: Downloads and extracts the dataset repo's zip archives, then reformats rows with format_data.
+    # Behavior: lists repo files, downloads every .zip, extracts each into a folder named after the zip path without the
+    # extension (created relative to the cwd), then maps format_data batched (batch size 4, 16 processes).
+    # Inputs: dataset (DatasetDict), dataset_name (str). Outputs: the mapped DatasetDict.
+    # Exceptions: Hub/zip errors propagate. Side effects: network downloads, directory creation and file extraction in cwd.
     all_files = list_repo_files(dataset_name, repo_type="dataset")
     zip_files = [f for f in all_files if f.endswith(".zip")]
 
@@ -135,6 +164,13 @@ def prepare_dataset(dataset: DatasetDict, dataset_name: str) -> DatasetDict:
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses arguments and runs SFT.
+    # Behavior: parses ScriptArguments, SFTConfig and ModelConfig; sets max_length None (no truncation); builds model
+    # kwargs (revision, attention, dtype resolved to torch dtype unless auto/None, quantization only when set) and loads
+    # AutoModelForImageTextToText; loads the dataset and runs prepare_dataset only for FanqingM/MMIU-Benchmark; builds
+    # SFTTrainer (eval split only when eval enabled, optional PEFT); trains, saves, optionally pushes, calls end.
+    # Inputs: CLI args. Outputs: none. Exceptions: propagated. Side effects: downloads, training, file writes.
     parser = TrlParser((ScriptArguments, SFTConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     training_args.max_length = None

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Experimental ORPO trainer (paper 2403.07691, "ORPO: Monolithic Preference Optimization without Reference Model").
+# Contents: log1mexp (stable log(1 - exp(x))) and ORPOTrainer, which trains on prompt/chosen/rejected pairs with a loss
+# equal to the chosen-sequence NLL minus beta times the mean log-sigmoid of the log odds ratio between chosen and
+# rejected, without a reference model. Supports decoder-only and encoder-decoder models, PEFT (including k-bit),
+# MoE auxiliary loss, TorchXLA padding, and optional W&B/Comet generation logging during eval.
+# Import-time side effects: conditionally imports peft, torch_xla and wandb; creates an accelerate logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,6 +93,11 @@ logger = get_logger(__name__)
 
 
 def log1mexp(x: torch.FloatTensor) -> torch.FloatTensor:
+    # [FUNCTION DOC]
+    # HELPER: Numerically stable log(1 - exp(x)) for x <= 0.
+    # Behavior: for x below -ln 2 uses log1p of negative exp(x); otherwise log of negative expm1(x); chosen elementwise.
+    # Inputs: x (float tensor of log-probabilities). Outputs: tensor of the same shape.
+    # Exceptions: none (x > 0 yields NaN). Side effects: none.
     """Numerically stable computation of log(1-exp(x))."""
     # branch at -ln 2 ~ -0.693 to avoid cancellation
     t = -0.6931471805599453
@@ -92,6 +105,16 @@ def log1mexp(x: torch.FloatTensor) -> torch.FloatTensor:
 
 
 class ORPOTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer subclass (via _BaseTrainer) implementing ORPO preference optimization.
+    # Key state: is_encoder_decoder, decoder_start_token_id and pad_token_id (encoder-decoder only), max_length,
+    # max_completion_length, padding_value, beta, generate_during_eval, use_dpo_data_collator, aux_loss_enabled and
+    # aux_loss_coef (MoE router loss), _peft_has_been_casted_to_bf16 (enables autocast), _stored_metrics
+    # (train/eval -> metric name -> list of values). loss_is_scaled_for_ga is False.
+    # Flow: __init__ prepares model/PEFT and tokenizes datasets with tokenize_row (build_tokenized_answer handles tokenizer
+    # merge effects); compute_loss and prediction_step call get_batch_loss_metrics, which runs concatenated_forward
+    # (concatenated_inputs, get_batch_logps) and odds_ratio_loss; metrics are stored with store_metrics and averaged in log;
+    # evaluation_loop can log generated samples; _save_checkpoint writes a model card.
     r"""
     Initialize ORPOTrainer.
 
@@ -165,6 +188,35 @@ class ORPOTrainer(_BaseTrainer):
         peft_config: "PeftConfig | None" = None,
         compute_metrics: Callable[[EvalLoopOutput], dict] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Builds the trainer: loads/wraps the model, configures tokenizer, collator and lengths, and preprocesses datasets.
+        # Steps:
+        # 1. Requires train_dataset. model_init_kwargs are only allowed with a string model; their dtype is resolved ("auto",
+        # None, torch dtype or string name) and device_map defaults to "auto"; trust_remote_code defaulted from args; the
+        # revision is remembered for the tokenizer. Seeds, then loads the model from a string.
+        # 2. PEFT: validates availability and type, rejects an already-PEFT model; for 8/4-bit models runs
+        # prepare_model_for_kbit_training (passing gradient_checkpointing_kwargs when supported); otherwise with gradient
+        # checkpointing enables input require-grads (or registers a hook). Wraps with get_peft_model (autocast_adapter_dtype
+        # False under ZeRO-3 for non-quantized models); casts to bf16 for 4-bit with bf16 and sets the autocast flag. Without
+        # PEFT, gradient checkpointing still enables input require-grads.
+        # 3. Requires wandb or comet when generate_during_eval. Determines is_encoder_decoder from the model or args (error if
+        # neither); stores decoder start/pad ids for encoder-decoder.
+        # 4. Loads the tokenizer from the model id if missing. max_length defaults to 512 with a warning when None;
+        # max_completion_length defaults to 128 with a warning for encoder-decoder.
+        # 5. Default collator DPODataCollatorWithPadding (forces remove_unused_columns False with a warning).
+        # 6. Optionally disables dropout; sets padding_value (tokenizer pad id by default), beta, aux-loss settings (warning if
+        # enabled with zero coefficient), _stored_metrics.
+        # 7. Under global-then-local main-first ordering, maps train/eval datasets through maybe_extract_prompt,
+        # maybe_apply_chat_template and tokenize_row.
+        # 8. Defaults use_reentrant False for transformers < 5.0, calls the parent constructor, adds model tags, and checks an
+        # accelerator exists.
+        # Inputs: see the class docstring. Outputs: none.
+        # Exceptions: ValueError (missing dataset, bad kwargs/dtype, PEFT model plus config, missing loggers, unknown
+        # encoder-decoder), ImportError, TypeError, AttributeError (no accelerator).
+        # Side effects: model/tokenizer downloads, dataset mapping (cached), mutation of args and model.
+        # KNOWN ISSUE: args defaults to None but is dereferenced immediately, so omitting args raises AttributeError. When model
+        # is None (model_init path), disable_dropout_in_model and the model.config reads for aux loss and tokenizer loading
+        # would fail.
         if train_dataset is None:
             raise ValueError("`train_dataset` is required")
 
@@ -237,6 +289,10 @@ class ORPOTrainer(_BaseTrainer):
                 else:
 
                     def make_inputs_require_grad(module, input, output):
+                        # [FUNCTION DOC]
+                        # HELPER: Forward hook making the input-embedding output require gradients (fallback for models without
+                        # enable_input_require_grads), so gradient checkpointing works with frozen embeddings.
+                        # Inputs: module, input, output (embedding output tensor). Outputs: none. Side effects: sets requires_grad on output.
                         output.requires_grad_(True)
 
                     model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
@@ -274,6 +330,10 @@ class ORPOTrainer(_BaseTrainer):
             else:
 
                 def make_inputs_require_grad(module, input, output):
+                    # [FUNCTION DOC]
+                    # HELPER: Forward hook making the input-embedding output require gradients (fallback for models without
+                    # enable_input_require_grads), so gradient checkpointing works with frozen embeddings.
+                    # Inputs: module, input, output (embedding output tensor). Outputs: none. Side effects: sets requires_grad on output.
                     output.requires_grad_(True)
 
                 model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
@@ -407,6 +467,15 @@ class ORPOTrainer(_BaseTrainer):
             )
 
     def build_tokenized_answer(self, prompt, answer):
+        # [FUNCTION DOC]
+        # Tokenizes prompt plus answer so the answer tokens are consistent with joint tokenization.
+        # Behavior: tokenizes the concatenation and the prompt alone (no special tokens); answer ids/mask are the joint
+        # tokens after the prompt length; verifies lengths are consistent; if the prompt's own tokens differ from the joint
+        # prefix (last token merged with the answer), moves the boundary one token earlier. Returns prompt ids/mask and answer
+        # ids/mask taken from the joint tokenization.
+        # Inputs: prompt (str), answer (str).
+        # Outputs: dict with prompt_input_ids, prompt_attention_mask, input_ids, attention_mask (lists).
+        # Exceptions: ValueError on length inconsistencies. Side effects: none.
         """
         Llama tokenizer does satisfy `enc(a + b) = enc(a) + enc(b)`. It does ensure `enc(a + b) = enc(a) + enc(a +
         b)[len(enc(a)):]`. Reference:
@@ -456,6 +525,22 @@ class ORPOTrainer(_BaseTrainer):
         )
 
     def tokenize_row(self, feature, model: PreTrainedModel | nn.Module | None = None) -> dict:
+        # [FUNCTION DOC]
+        # Tokenizes one prompt/chosen/rejected row into model-ready lists.
+        # Decoder-only: requires strings; tokenizes the prompt and builds chosen/rejected answers with build_tokenized_answer;
+        # trims the prompt to the shorter of the two answer-specific prompt lengths and checks they differ by at most one token
+        # and one in length; adds BOS to the prompts and EOS to the answers if needed; if prompt plus answer exceeds max_length,
+        # truncates only the answer (warning once when it becomes empty); builds full sequences with labels where prompt
+        # positions are -100; emits keys chosen_*, rejected_* and prompt_* (token_type_ids skipped).
+        # Encoder-decoder: tokenizes chosen/rejected (truncated to max_completion_length, with special tokens) as labels and the
+        # prompt as inputs; adds decoder input ids via the model when given and supported.
+        # On TorchXLA, right-pads every list to max_length (-100 for labels and all encoder-decoder keys, padding_value for
+        # input ids, 0 for masks).
+        # Inputs: feature (dict with prompt, chosen, rejected), model (optional).
+        # Outputs: dict of lists.
+        # Exceptions: ValueError for non-string fields or inconsistent prompts. Side effects: may log a warning.
+        # KNOWN ISSUE: the docstring says the prompt is truncated first, but the code never truncates the prompt; only the
+        # responses are cut, possibly to empty.
         """Tokenize a single row from a ORPO specific dataset.
 
         At this stage, we don't convert to PyTorch tensors yet; we just handle the truncation in case the prompt +
@@ -609,6 +694,15 @@ class ORPOTrainer(_BaseTrainer):
         padding_value: int = 0,
         device: torch.device | None = None,
     ) -> dict[str, torch.LongTensor]:
+        # [FUNCTION DOC]
+        # Static helper stacking chosen and rejected tensors into one batch along dimension 0.
+        # Behavior: pads every chosen_* and rejected_* tensor to the longer sequence length of the two (labels for
+        # encoder-decoder, input ids otherwise) using -100 for labels (and every key for encoder-decoder), padding_value for
+        # input ids and 0 for masks; renames to concatenated_*; for encoder-decoder, also repeats the prompt ids and mask twice
+        # as the concatenated inputs. Moves results to device.
+        # Inputs: batch (dict of tensors), is_encoder_decoder (False), padding_value (0), device (optional).
+        # Outputs: dict of concatenated tensors (chosen rows first).
+        # Exceptions: KeyError if expected keys are missing. Side effects: none.
         """Concatenate the chosen and rejected inputs into a single tensor.
 
         Args:
@@ -672,6 +766,16 @@ class ORPOTrainer(_BaseTrainer):
         policy_chosen_logps: torch.FloatTensor,
         policy_rejected_logps: torch.FloatTensor,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        # [FUNCTION DOC]
+        # Computes the ORPO odds-ratio term.
+        # Behavior: casts to float; log odds = (chosen logp minus rejected logp) minus (log1mexp(chosen) minus
+        # log1mexp(rejected)); ratio = log-sigmoid of the log odds; losses = beta times ratio (to be subtracted from the NLL).
+        # Rewards are beta times the detached log-probs on the accelerator device.
+        # Inputs: policy_chosen_logps, policy_rejected_logps (shape (batch,), average per-token log-probs).
+        # Outputs: tuple of (losses, chosen_rewards, rejected_rewards, mean ratio, mean log odds).
+        # Exceptions: none. Side effects: none.
+        # KNOWN ISSUE: the docstring says it returns three tensors and mentions reference-model log-probs, but it returns five
+        # values and ORPO uses no reference model.
         """Compute ORPO's odds ratio (OR) loss for a batch of policy and reference model log probabilities.
 
         Args:
@@ -708,6 +812,14 @@ class ORPOTrainer(_BaseTrainer):
         average_log_prob: bool = False,
         is_encoder_decoder: bool = False,
     ) -> torch.FloatTensor:
+        # [FUNCTION DOC]
+        # Static helper computing per-sequence log-probabilities of labels.
+        # Behavior: checks logits and labels share batch and sequence dims; for decoder-only shifts (drop first label, last
+        # logit); masks positions with label -100 (replaced by 0 for gathering); gathers token log-probs with
+        # selective_log_softmax; returns masked mean (average_log_prob) or sum over the sequence.
+        # Inputs: logits (B, T, V), labels (B, T), average_log_prob (False), is_encoder_decoder (False).
+        # Outputs: tensor (B,).
+        # Exceptions: ValueError on shape mismatch. Side effects: none.
         """Compute the log probabilities of the given labels under the given logits.
 
         Args:
@@ -745,6 +857,18 @@ class ORPOTrainer(_BaseTrainer):
     def concatenated_forward(
         self, model: nn.Module, batch: dict[str, list | torch.LongTensor]
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        # [FUNCTION DOC]
+        # Single forward pass over chosen and rejected sequences together.
+        # Behavior: builds concatenated inputs; for encoder-decoder passes decoder_input_ids made by shifting labels right;
+        # requests router logits when aux loss is enabled; runs the model without cache. Computes the chosen NLL with
+        # cross-entropy over the chosen half (decoder-only labels are the input ids with non-attended positions set to -100, so
+        # the NLL covers prompt and response). Computes average per-token log-probs of the concatenated labels (response only)
+        # and splits them; slices logits (dropping the last position for decoder-only).
+        # Inputs: model, batch.
+        # Outputs: tuple (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_nll_loss) plus aux_loss when
+        # enabled.
+        # Exceptions: errors from the model or _shift_right. Side effects: none.
+        # KNOWN ISSUE: the return annotation declares a 4-tuple, but 5 or 6 values are returned.
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
 
         We do this to avoid doing two forward passes, because it's faster for FSDP.
@@ -777,6 +901,10 @@ class ORPOTrainer(_BaseTrainer):
         all_logits = outputs.logits
 
         def cross_entropy_loss(logits, labels):
+            # [FUNCTION DOC]
+            # HELPER: Mean token cross-entropy (ignore index -100) between logits and labels, shifting by one position for
+            # decoder-only models and moving labels to the logits device.
+            # Inputs: logits (B, T, V), labels (B, T). Outputs: scalar loss. Exceptions: none. Side effects: none.
             if not self.is_encoder_decoder:
                 # Shift so that tokens < n predict n
                 logits = logits[..., :-1, :].contiguous()
@@ -827,6 +955,14 @@ class ORPOTrainer(_BaseTrainer):
         batch: dict[str, list | torch.LongTensor],
         train_eval: Literal["train", "eval"] = "train",
     ):
+        # [FUNCTION DOC]
+        # Computes the full ORPO loss and metrics for a batch.
+        # Behavior: loss = chosen NLL minus mean odds-ratio term (plus aux_loss_coef times aux loss when enabled). Metrics
+        # (prefixed "eval_" in eval): rewards chosen/rejected/accuracies/margins, logps chosen/rejected, mean logits
+        # chosen/rejected, nll_loss, log_odds_ratio, log_odds_chosen; all gathered across processes, averaged and converted to
+        # Python floats (marking an XLA step first when on XLA).
+        # Inputs: model, batch, train_eval ("train" or "eval").
+        # Outputs: (loss tensor, metrics dict). Exceptions: none specific. Side effects: cross-process gathers.
         """Compute the ORPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
 
@@ -883,6 +1019,11 @@ class ORPOTrainer(_BaseTrainer):
         return_outputs=False,
         num_items_in_batch=None,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Trainer hook computing the training loss under autocast when PEFT was cast to bf16; moves loss to args.device,
+        # stores metrics under "train", and returns loss or (loss, metrics) when return_outputs.
+        # Inputs: model, inputs, return_outputs (False), num_items_in_batch (unused).
+        # Outputs: loss or tuple. Side effects: appends to _stored_metrics.
         compute_loss_context_manager = (
             autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
         )
@@ -901,6 +1042,15 @@ class ORPOTrainer(_BaseTrainer):
         return loss
 
     def generate_from_model(self, model, batch: dict[str, torch.LongTensor]) -> str:
+        # [FUNCTION DOC]
+        # Samples completions for a batch of prompts (used for eval logging).
+        # Behavior: generates under autocast when PEFT was cast to bf16, sampling up to max_length total tokens with the
+        # tokenizer pad id; pads outputs to max_length and decodes without special tokens.
+        # Inputs: model, batch (needs prompt_input_ids and prompt_attention_mask).
+        # Outputs: list of decoded strings (prompt plus completion).
+        # KNOWN ISSUE: annotated as returning str and documented as using a reference model, but returns a list from the policy
+        # only.
+        # Side effects: none beyond compute.
         """Generate samples from the model and reference model for the given batch of inputs."""
 
         # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
@@ -930,6 +1080,13 @@ class ORPOTrainer(_BaseTrainer):
         prediction_loss_only: bool,
         ignore_keys: list[str] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Evaluation step: warns if a non-default collator is used; determines ignore_keys from the model config when not
+        # given; computes loss and metrics without grad (autocast when needed) and stores them under "eval".
+        # Outputs: (loss, None, None) when prediction_loss_only; otherwise (loss, tensor of the eval chosen/rejected mean logits
+        # not in ignore_keys, zero labels of matching length).
+        # Inputs: model, inputs, prediction_loss_only, ignore_keys (optional).
+        # Side effects: appends to _stored_metrics.
         if not self.use_dpo_data_collator:
             logger.warning(
                 "prediction_step is only implemented for DPODataCollatorWithPadding, and you passed a datacollator that is different than "
@@ -966,6 +1123,9 @@ class ORPOTrainer(_BaseTrainer):
         return (loss.detach(), logits, labels)
 
     def store_metrics(self, metrics: dict[str, float], train_eval: Literal["train", "eval"] = "train") -> None:
+        # [FUNCTION DOC]
+        # HELPER: Appends each metric value to _stored_metrics under the given split ("train" by default).
+        # Inputs: metrics dict, train_eval. Outputs: none. Side effects: mutates _stored_metrics.
         for key, value in metrics.items():
             self._stored_metrics[train_eval][key].append(value)
 
@@ -977,6 +1137,16 @@ class ORPOTrainer(_BaseTrainer):
         ignore_keys: list[str] | None = None,
         metric_key_prefix: str = "eval",
     ) -> EvalLoopOutput:
+        # [FUNCTION DOC]
+        # Override of the evaluation loop that optionally logs sample generations first.
+        # Behavior: when generate_during_eval, samples eval_batch_size random indices from the dataset, collates and prepares
+        # them, generates with the policy, builds a table of prompt and completion (decoded text with the prompt-length prefix
+        # removed), and logs it to W&B ("game_log") and/or Comet ("game_log.csv") depending on report_to. Then runs the parent
+        # evaluation loop.
+        # Inputs: dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix ("eval").
+        # Outputs: EvalLoopOutput from the parent.
+        # Exceptions: ValueError from random.sample if the dataset is smaller than eval_batch_size.
+        # Side effects: external logging.
         """
         Overriding built-in evaluation loop to store metrics for each batch. Prediction/evaluation loop, shared by
         `Trainer.evaluate()` and `Trainer.predict()`.
@@ -1021,6 +1191,12 @@ class ORPOTrainer(_BaseTrainer):
         return initial_output
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Adds averaged stored metrics to the logs before delegating to the parent log.
+        # Behavior: chooses "train" if logs contain "loss" else "eval", writes the mean of each stored metric list into logs,
+        # and deletes that split's stored metrics.
+        # Inputs: logs (mutated), start_time (optional). Outputs: parent's return value.
+        # Side effects: mutates logs and _stored_metrics; emits logs to reporters.
         """
         Log `logs` on the various objects watching training, including stored metrics.
 
@@ -1039,6 +1215,11 @@ class ORPOTrainer(_BaseTrainer):
         return super().log(logs, start_time)
 
     def _shift_right(self, input_ids):
+        # [FUNCTION DOC]
+        # HELPER: Builds decoder input ids from labels for encoder-decoder models: prepends decoder_start_token_id, drops the
+        # last position (handling torch.fx proxies via concatenation), and replaces -100 with pad_token_id.
+        # Inputs: input_ids (labels tensor). Outputs: shifted tensor of the same shape.
+        # Exceptions: ValueError if decoder_start_token_id or pad_token_id is None. Side effects: none.
         if self.decoder_start_token_id is None:
             raise ValueError(
                 "model.config.decoder_start_token_id has to be defined. It is usually set to the pad_token_id."
@@ -1063,6 +1244,10 @@ class ORPOTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Writes a model card (named from hub_model_id's last part or the output_dir name) before delegating to the parent
+        # checkpoint save.
+        # Inputs: model, trial. Outputs: none. Side effects: writes files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:

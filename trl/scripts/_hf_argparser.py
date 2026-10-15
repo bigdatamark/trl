@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# HELPER: Vendored copy of transformers' HfArgumentParser (pinned commit) used by TrlParser, avoiding an
+# upstream import-latency issue; the yaml import is deferred into parse_yaml_file. Local change versus upstream:
+# "X | None" non-str fields accept "none"/"null" from the CLI.
+# Contents: string_to_bool, _accept_none, make_choice_type_function, HfArg, HfArgumentParser, and NewType
+# aliases DataClass / DataClassType. No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -38,6 +45,11 @@ DataClassType = NewType("DataClassType", Any)
 
 # From https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse
 def string_to_bool(v):
+    # [FUNCTION DOC]
+    # HELPER: argparse type converter for booleans.
+    # Behavior: bools returned unchanged; case-insensitive "yes/true/t/y/1" gives True, "no/false/f/n/0" gives False.
+    # Inputs: v (str or bool). Outputs: bool.
+    # Exceptions: ArgumentTypeError for any other string. Side effects: none.
     if isinstance(v, bool):
         return v
     if v.lower() in ("yes", "true", "t", "y", "1"):
@@ -51,6 +63,11 @@ def string_to_bool(v):
 
 
 def _accept_none(inner: Callable[[str], Any]) -> Callable[[str], Any]:
+    # [FUNCTION DOC]
+    # HELPER: Wraps a type converter so "none"/"null" (case-insensitive) map to None for "T | None" fields.
+    # Inputs: inner converter. Outputs: wrapper function whose __name__ copies inner's name (fallback "value") so
+    # argparse error messages keep the type name.
+    # Exceptions: none itself. Side effects: none.
     """Wrap a type converter so `'none'` and `'null'` (case-insensitive) parse to Python `None`.
 
     Used for `T | None` fields so they can be set to `None` from the CLI (argparse's `type=int` rejects `'None'`).
@@ -58,6 +75,9 @@ def _accept_none(inner: Callable[[str], Any]) -> Callable[[str], Any]:
     """
 
     def parse(v: str) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: Returns None for "none"/"null", otherwise inner(v).
+        # Inputs: v (str). Outputs: converted value or None. Exceptions: whatever inner raises. Side effects: none.
         if v.lower() in ("none", "null"):
             return None
         return inner(v)
@@ -67,6 +87,10 @@ def _accept_none(inner: Callable[[str], Any]) -> Callable[[str], Any]:
 
 
 def make_choice_type_function(choices: list) -> Callable[[str], Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a converter mapping the string form of each choice back to the original choice value (strings
+    # not in the map are returned unchanged so argparse's choices check reports them).
+    # Inputs: choices list. Outputs: one-argument callable. Exceptions: none. Side effects: none.
     """
     Creates a mapping function from each choices string representation to the actual value. Used to support multiple
     value types for a single argument.
@@ -90,6 +114,13 @@ def HfArg(
     metadata: dict | None = None,
     **kwargs,
 ) -> dataclasses.Field:
+    # [FUNCTION DOC]
+    # Behavior: convenience constructor for dataclass fields: puts aliases and help into metadata (fresh dict when
+    # metadata is None) and returns a dataclasses field with default / default_factory and extra kwargs.
+    # Inputs: aliases (str or list), help, default, default_factory, metadata, kwargs (keyword-only).
+    # Outputs: dataclasses.Field.
+    # Exceptions: ValueError from dataclasses if both default and default_factory are given.
+    # Side effects: mutates the passed metadata dict when provided.
     """Argument helper enabling a concise syntax to create dataclass fields for parsing with `HfArgumentParser`.
 
     Example comparing the use of `HfArg` and `dataclasses.field`:
@@ -130,6 +161,12 @@ def HfArg(
 
 
 class HfArgumentParser(ArgumentParser):
+    # [CLASS DOC]
+    # ArgumentParser subclass that generates CLI options from dataclass type hints and parses into dataclass
+    # instances. State: dataclass_types (list). Construction registers every init field of every dataclass via
+    # _add_dataclass_arguments/_parse_dataclass_field; parse_args_into_dataclasses parses CLI (and optional .args
+    # files); parse_dict / parse_json_file / parse_yaml_file build instances without argparse.
+    # Dataclasses may set _argument_group_name to get their own argument group.
     """
     This subclass of `argparse.ArgumentParser` uses type hints on dataclasses to generate arguments.
 
@@ -147,6 +184,11 @@ class HfArgumentParser(ArgumentParser):
     dataclass_types: Iterable[DataClassType]
 
     def __init__(self, dataclass_types: DataClassType | Iterable[DataClassType] | None = None, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: normalizes dataclass_types (None to empty list, single type to list), defaults formatter_class to
+        # ArgumentDefaultsHelpFormatter, calls ArgumentParser init, stores list and registers fields of each dataclass.
+        # Inputs: dataclass_types (type, iterable of types or None); kwargs for ArgumentParser.
+        # Outputs: none. Exceptions: those from field registration. Side effects: adds argparse actions.
         # Make sure dataclass_types is an iterable
         if dataclass_types is None:
             dataclass_types = []
@@ -165,6 +207,21 @@ class HfArgumentParser(ArgumentParser):
 
     @staticmethod
     def _parse_dataclass_field(parser: ArgumentParser, field: dataclasses.Field):
+        # [FUNCTION DOC]
+        # HELPER: Adds argparse option(s) for one dataclass field.
+        # Behavior: option names "--name" plus a hyphenated variant when the name has underscores, plus metadata
+        # aliases; remaining metadata becomes add_argument kwargs. Union handling: only Optional[X] or unions with str
+        # are allowed; a union with str (no None) collapses to the non-str member; Optional[X] (X not bool) collapses to
+        # X and enables none/null parsing unless X is str. Then: Literal/Enum fields get choices plus the choice
+        # converter, default or required. bool / Optional[bool] use string_to_bool; when type is bool or a non-None
+        # default exists, default (False if missing), nargs "?" and const True. list fields use the element type with
+        # nargs "+", default from default_factory, else required if no default. Other types use the (possibly
+        # none-accepting) converter with default / default_factory / required. Finally, bool fields whose default is
+        # True also get a "--no_name"/"--no-name" store_false option with the same dest.
+        # Inputs: parser (ArgumentParser or group), field (with already-resolved type).
+        # Outputs: none.
+        # Exceptions: RuntimeError for unresolved string annotations; ValueError for unsupported unions.
+        # Side effects: mutates field.type when collapsing unions; registers arguments on parser.
         # Long-option strings are conventionlly separated by hyphens rather
         # than underscores, e.g., "--long-format" rather than "--long_format".
         # Argparse converts hyphens to underscores so that the destination
@@ -275,6 +332,12 @@ class HfArgumentParser(ArgumentParser):
             )
 
     def _add_dataclass_arguments(self, dtype: DataClassType):
+        # [FUNCTION DOC]
+        # HELPER: Registers all init fields of a dataclass.
+        # Behavior: picks an argument group if _argument_group_name exists else self; resolves annotations with
+        # get_type_hints, assigns resolved types onto the fields, and calls _parse_dataclass_field for each.
+        # Inputs: dtype. Outputs: none.
+        # Exceptions: RuntimeError when type hints cannot be resolved (NameError). Side effects: adds arguments.
         if hasattr(dtype, "_argument_group_name"):
             parser = self.add_argument_group(dtype._argument_group_name)
         else:
@@ -303,6 +366,17 @@ class HfArgumentParser(ArgumentParser):
         args_filename=None,
         args_file_flag=None,
     ) -> tuple[DataClass, ...]:
+        # [FUNCTION DOC]
+        # Behavior: optionally prepends args from files: args_filename, else "<script>.args" next to sys.argv[0] when
+        # look_for_args_file, plus files named by repeated args_file_flag (extracted with a temporary parser and
+        # removed from args). Existing files are read and whitespace-split; file args come first so CLI wins. Then
+        # parse_known_args; for each dataclass, pops its init-field keys from the namespace and instantiates it.
+        # A non-empty leftover namespace is appended as an extra output.
+        # Inputs: args (list or None for sys.argv), return_remaining_strings, look_for_args_file (default True),
+        # args_filename, args_file_flag.
+        # Outputs: tuple of dataclass instances (plus namespace, plus remaining strings when requested).
+        # Exceptions: ValueError when unknown args remain and return_remaining_strings is False; argparse SystemExit.
+        # Side effects: reads args files from disk.
         """
         Parse command-line args into instances of the specified dataclass types.
 
@@ -382,6 +456,12 @@ class HfArgumentParser(ArgumentParser):
             return (*outputs,)
 
     def parse_dict(self, args: dict[str, Any], allow_extra_keys: bool = False) -> tuple[DataClass, ...]:
+        # [FUNCTION DOC]
+        # Behavior: instantiates each dataclass from the dict keys matching its init fields; tracks unused keys.
+        # Inputs: args dict, allow_extra_keys (default False).
+        # Outputs: tuple of dataclass instances.
+        # Exceptions: ValueError listing unused keys when not allowed; dataclass constructor errors.
+        # Side effects: none.
         """
         Alternative helper method that does not use `argparse` at all, instead uses a dict and populating the dataclass
         types.
@@ -410,6 +490,10 @@ class HfArgumentParser(ArgumentParser):
         return tuple(outputs)
 
     def parse_json_file(self, json_file: str | os.PathLike, allow_extra_keys: bool = False) -> tuple[DataClass, ...]:
+        # [FUNCTION DOC]
+        # Behavior: reads a UTF-8 JSON file and delegates to parse_dict.
+        # Inputs: json_file path, allow_extra_keys. Outputs: tuple of dataclasses.
+        # Exceptions: OSError, JSONDecodeError, ValueError. Side effects: reads the file.
         """
         Alternative helper method that does not use `argparse` at all, instead loading a json file and populating the
         dataclass types.
@@ -432,6 +516,10 @@ class HfArgumentParser(ArgumentParser):
         return tuple(outputs)
 
     def parse_yaml_file(self, yaml_file: str | os.PathLike, allow_extra_keys: bool = False) -> tuple[DataClass, ...]:
+        # [FUNCTION DOC]
+        # Behavior: imports yaml lazily, safe_loads the file and delegates to parse_dict.
+        # Inputs: yaml_file path, allow_extra_keys. Outputs: tuple of dataclasses.
+        # Exceptions: ImportError without PyYAML, OSError, yaml errors, ValueError. Side effects: reads the file.
         """
         Alternative helper method that does not use `argparse` at all, instead loading a yaml file and populating the
         dataclass types.

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Script identical to peft_qwen3_for_causal_lm.py except it seeds with SEED + 1, so its random LoRA weights differ,
+# and pushes under the suffix "2" (tiny-<PEFT wrapper class name>-2). Used by tests needing two distinct adapters.
+# Inputs: --create-pr CLI flag. Outputs: none. Exceptions: version mismatch / smoke test RuntimeError; Hub errors.
+# Side effects: Hub download of the base model and upload of adapter files.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

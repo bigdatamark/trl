@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Configuration dataclass for the experimental AsyncDistillationTrainer: asynchronous on-policy distillation where a
+# student generates with a vLLM server, one or more static teacher vLLM servers score the completions, and the
+# student is trained on a (generalized JSD / forward KL) divergence against teacher top-k logprobs. Mirrors
+# AsyncGRPOConfig's async pipeline / vLLM / logging fields.
+# Contents: AsyncDistillationConfig. Import-time side effects: none.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +27,20 @@ from ...trainer.base_config import _BaseConfig
 
 @dataclass
 class AsyncDistillationConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass extending _BaseConfig. Dict-like fields that may be given as JSON strings: model_init_kwargs,
+    # teacher_server_urls, chat_template_kwargs.
+    # Fields (defaults): model: model_init_kwargs (None), dtype ("float32"), ignore_data_skip (True), trust_remote_code
+    # (False); training overrides: learning_rate (1e-6), logging_steps (1); generation: max_completion_length (2048),
+    # temperature (1.0), top_p (1.0), top_k (0), min_p (None), repetition_penalty (1.0), chat_template_kwargs (None);
+    # servers: vllm_server_base_url ("http://localhost:8000", the student), vllm_server_timeout (240 s),
+    # teacher_server_urls (None -> {"default": "http://localhost:8001"}; several entries enable multi-teacher MOPD
+    # selected by each row's teacher_id column), request_timeout (600 s), weight_sync_timeout (1800 s); loss: beta (0.0 =
+    # forward KL over teacher top-k support; nonzero narrows support to teacher top-1 and realized token), teacher_temperature
+    # (1.0), teacher_top_k (8), add_tail_bucket (True), token_budget (None = student server max_model_len; <=0 means fixed
+    # per-device batch packing); async pipeline: max_inflight_tasks (-1), max_staleness (4), queue_maxsize (1024),
+    # weight_sync_steps (1), heartbeat_stale_after_s (300 s); logging: log_completions (False), log_completions_steps
+    # (100), num_completions_to_print (None = all).
     r"""
     Configuration class for the [`experimental.async_distillation.AsyncDistillationTrainer`].
 
@@ -394,6 +415,16 @@ class AsyncDistillationConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates and normalizes the config after the parent's post-init.
+        # Behavior: require beta in [0, 1]; reject context/sequence parallelism (parallelism_config with cp or sp enabled);
+        # default teacher_server_urls to a single "default" teacher at localhost:8001 and reject an empty mapping; force
+        # accelerator_config split_batches=True and dispatch_batches=True (creating a dict if unset, updating a dict, or
+        # setting attributes on an AcceleratorConfig object) so the main process drives the async dataloader and broadcasts.
+        # Inputs: self. Outputs: none.
+        # Exceptions: ValueError for out-of-range beta, sequence-dim parallelism, or empty teacher_server_urls; plus parent
+        # validation errors.
+        # Side effects: mutates teacher_server_urls and accelerator_config.
         super().__post_init__()
 
         if self.beta < 0.0 or self.beta > 1.0:

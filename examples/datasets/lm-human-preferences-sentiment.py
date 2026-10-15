@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Dataset preparation script: downloads OpenAI lm-human-preferences sentiment offline_5k labels (JSON), decodes GPT-2
+# tokens into standard preference format (prompt, chosen, rejected), splits with train_size 4992 and optionally pushes
+# with a dataset card. Main contents: ScriptArguments, to_prompt_completion, model_card.
+# Import-time side effects: builds the ModelCard object.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +27,10 @@ from transformers import AutoTokenizer, HfArgumentParser
 
 @dataclass
 class ScriptArguments:
+    # [CLASS DOC]
+    # Dataclass of CLI options parsed by HfArgumentParser: push_to_hub (default False), repo_id (target Hub
+    # dataset repo), dataset_num_proc (worker count for map/filter, default None). No methods; plain data holder.
+    # Side effects: none.
     r"""
     Arguments for the script.
 
@@ -48,6 +58,14 @@ class ScriptArguments:
 
 
 def to_prompt_completion(example, tokenizer):
+    # [FUNCTION DOC]
+    # Behavior: decodes the token-id "query" with the tokenizer and strips it as prompt; decodes the sample indexed by
+    # "best" as chosen; scans sample0..sample3 in order and takes the first decoded sample differing from chosen as
+    # rejected.
+    # Inputs: example with "query", "best", "sample0".."sample3" token-id lists; tokenizer (GPT-2).
+    # Outputs: dict with "prompt", "chosen", "rejected" strings.
+    # Exceptions: AssertionError if every sample decodes identically to chosen.
+    # Side effects: none.
     prompt = tokenizer.decode(example["query"]).strip()
     best_idx = example["best"]
     chosen = tokenizer.decode(example[f"sample{best_idx}"])

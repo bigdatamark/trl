@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Tests for the experimental SDFTTrainer / SDFTConfig (trl.experimental.sdft), self-distillation
+# fine-tuning where a teacher sees the prompt plus a privileged_context column. Covers remote-code
+# gating, training, teacher construction, eval datasets, privileged_context validation,
+# generate_from_teacher, chat_template_kwargs, PEFT (incl. EMA teacher sync), old-logprob capture for
+# distillation clipping, generation-batch buffering, the teacher-server loss path, and pad tokens.
+# Defines a capture callback and a fake teacher server client.
+# Import-time side effects: imports peft LoraConfig when peft is available.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,51 +37,94 @@ if is_peft_available():
 
 
 class SelfDistillationCaptureCallback(TrainerCallback):
+    # [CLASS DOC]
+    # HELPER: TrainerCallback that records data emitted by SDFT's custom callback events: the first
+    # non-None generation_prompts, the first old_per_token_logps and prompt_ids (detached, on CPU), and a
+    # count of generation batches built.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes captured_generation_prompts, captured_old_per_token_logps, captured_prompt_ids
+        # to None and generation_batch_build_count to 0. Inputs: none. Outputs: none. Exceptions: none.
+        # Side effects: sets attributes.
         self.captured_generation_prompts = None
         self.captured_old_per_token_logps = None
         self.captured_prompt_ids = None
         self.generation_batch_build_count = 0
 
     def on_generation_prompts_selected(self, generation_prompts=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Stores generation_prompts on first non-None call; later calls are ignored.
+        # Inputs: generation_prompts (optional), kwargs. Outputs: None. Exceptions: none.
+        # Side effects: mutates self.
         if self.captured_generation_prompts is None and generation_prompts is not None:
             self.captured_generation_prompts = generation_prompts
 
     def on_self_distillation_batch_prepared(self, old_per_token_logps=None, prompt_ids=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: On first non-None value each, stores old_per_token_logps and prompt_ids as detached CPU
+        # tensors. Inputs: old_per_token_logps, prompt_ids (tensors, optional), kwargs. Outputs: None.
+        # Exceptions: none. Side effects: mutates self.
         if self.captured_old_per_token_logps is None and old_per_token_logps is not None:
             self.captured_old_per_token_logps = old_per_token_logps.detach().cpu()
         if self.captured_prompt_ids is None and prompt_ids is not None:
             self.captured_prompt_ids = prompt_ids.detach().cpu()
 
     def on_generation_batch_built(self, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Increments generation_batch_build_count. Inputs: kwargs. Outputs: None. Exceptions: none.
+        # Side effects: mutates self.
         self.generation_batch_build_count += 1
 
 
 class RecordingTeacherClient:
+    # [CLASS DOC]
+    # HELPER: Fake vLLM teacher-server client (remote server cannot run in tests). Returns a fixed
+    # response from get_sequence_logprobs and records each call's kwargs in self.calls.
     """Stands in for the vLLM server client and records scoring requests."""
 
     def __init__(self, response):
+        # [FUNCTION DOC]
+        # HELPER: Stores response and initializes an empty calls list. Inputs: response (dict).
+        # Outputs: none. Exceptions: none. Side effects: sets attributes.
         self.response = response
         self.calls = []
 
     def get_sequence_logprobs(self, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Appends kwargs to self.calls and returns self.response. Inputs: kwargs. Outputs: the
+        # stored response. Exceptions: none. Side effects: mutates self.calls.
         self.calls.append(kwargs)
         return self.response
 
 
 class TestSDFTTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # Integration tests for SDFTTrainer; inherits TrlTestCase. Provides two static helpers to snapshot
+    # trainable params and assert at least one changed.
     @staticmethod
     def _trainable_param_snapshot(model):
+        # [FUNCTION DOC]
+        # HELPER: Returns a dict of name to detached clone for each parameter with requires_grad.
+        # Inputs: model. Outputs: dict[str, Tensor]. Exceptions: none. Side effects: none.
         return {name: param.detach().clone() for name, param in model.named_parameters() if param.requires_grad}
 
     @staticmethod
     def _assert_any_trainable_param_changed(model, previous_trainable_params):
+        # [FUNCTION DOC]
+        # HELPER: Asserts at least one snapshot parameter is not allclose (rtol=atol=1e-12) to the model's
+        # current parameter of the same name. Inputs: model, previous_trainable_params (dict).
+        # Outputs: None. Exceptions: AssertionError if none changed. Side effects: none.
         assert any(
             not torch.allclose(previous_param, model.get_parameter(name), rtol=1e-12, atol=1e-12)
             for name, previous_param in previous_trainable_params.items()
         )
 
     def test_trust_remote_code(self):
+        # [FUNCTION DOC]
+        # Tests a remote-code model raises ValueError matching "custom code" without trust_remote_code and
+        # loads as RemoteForCausalLM with it.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": ["Solve 2+2.", "Name the capital of France."],
@@ -96,6 +148,10 @@ class TestSDFTTrainer(TrlTestCase):
         assert type(trainer.model).__name__ == "RemoteForCausalLM"
 
     def test_train(self):
+        # [FUNCTION DOC]
+        # Uses a tiny 2-row prompt/privileged_context dataset and 1-step training (batch 1, 1 generation, 8 completion tokens, lr 0.1); asserts train_loss logged and some trainable parameter changed.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": ["Solve 2+2.", "Name the capital of France."],
@@ -129,6 +185,11 @@ class TestSDFTTrainer(TrlTestCase):
         self._assert_any_trainable_param_changed(trainer.model, previous_trainable_params)
 
     def test_teacher_model_like_model_instance(self):
+        # [FUNCTION DOC]
+        # Tests that when the student is passed as an instance (bfloat16, eager attention), the teacher is
+        # built with the same dtype and attention implementation.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         # A student passed as an instance has no `model_init_kwargs`: the teacher is built with its dtype and attention
         dataset = Dataset.from_dict(
             {
@@ -147,6 +208,12 @@ class TestSDFTTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("eval_dataset_type", ["dataset", "dataset_dict", "dict_of_dataset", "none"])
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Parametrized over dataset, dataset_dict, dict_of_dataset, none. Tests eval datasets are stored as
+        # is: None stays None; dict-like becomes a dict with keys data1/data2; a single Dataset is the same
+        # object.
+        # Inputs: eval_dataset_type (str). Outputs: none. Exceptions: AssertionError.
+        # Side effects: downloads; tmp_dir.
         # Streaming datasets are not yet supported in SDFT
         train_dataset = Dataset.from_dict(
             {
@@ -182,6 +249,11 @@ class TestSDFTTrainer(TrlTestCase):
             assert trainer.eval_dataset is eval_dataset
 
     def test_train_rejects_none_privileged_context(self):
+        # [FUNCTION DOC]
+        # Tests training on a row whose privileged_context is None raises ValueError matching
+        # "privileged_context must not be None".
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": ["Solve 2+2."],
@@ -208,6 +280,12 @@ class TestSDFTTrainer(TrlTestCase):
             trainer.train()
 
     def test_train_with_generate_from_teacher(self):
+        # [FUNCTION DOC]
+        # Tests generate_from_teacher=True: the captured generation prompt is the prompt joined to the
+        # privileged context with a blank line, while the decoded student prompt_ids contain the prompt but
+        # not the teacher hint.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": ["Solve 2+2.", "Solve 3+3."],
@@ -250,6 +328,11 @@ class TestSDFTTrainer(TrlTestCase):
         assert "Solve 2+2." in student_prompt_text
 
     def test_train_with_chat_template_kwargs(self):
+        # [FUNCTION DOC]
+        # Tests training a tiny Qwen3 on conversational prompts with chat_template_kwargs enable_thinking
+        # False: train_loss logged and some trainable parameter changed.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": [
@@ -289,6 +372,11 @@ class TestSDFTTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_init_is_seeded(self):
+        # [FUNCTION DOC]
+        # Requires peft. Two trainers with default LoraConfig built after different global seeds must have
+        # non-empty, identical lora_A parameters.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         # Two trainers with the same seed start from the same adapter weights
         dataset = Dataset.from_dict(
             {
@@ -313,6 +401,11 @@ class TestSDFTTrainer(TrlTestCase):
 
     @require_peft
     def test_train_with_peft_model(self):
+        # [FUNCTION DOC]
+        # Requires peft. Uses a tiny 2-row prompt/privileged_context dataset and 1-step training (batch 1, 1 generation, 8 completion tokens, lr 0.1) with LoRA on q_proj/v_proj; asserts train_loss and some
+        # trainable parameter changed.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": ["Solve 2+2.", "Name the capital of France."],
@@ -352,6 +445,11 @@ class TestSDFTTrainer(TrlTestCase):
 
     @require_peft
     def test_train_with_peft_model_and_ema_teacher_sync(self):
+        # [FUNCTION DOC]
+        # Requires peft. Like the LoRA test but 2 steps with teacher_model_kind ema, teacher_update_rate
+        # 0.05, teacher_sync_steps 1; asserts train_loss and some trainable parameter changed.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": ["Solve 2+2.", "Name the capital of France."],
@@ -392,6 +490,11 @@ class TestSDFTTrainer(TrlTestCase):
         self._assert_any_trainable_param_changed(trainer.model, previous_trainable_params)
 
     def test_train_populates_old_log_probs_for_distillation_clipping_when_misaligned(self):
+        # [FUNCTION DOC]
+        # Tests that with gradient_accumulation_steps 3 differing from steps_per_generation 2, the batch
+        # prepared for self-distillation carries old_per_token_logps (captured is not None).
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": ["Solve 2+2.", "Solve 3+3."],
@@ -427,6 +530,10 @@ class TestSDFTTrainer(TrlTestCase):
         assert capture_callback.captured_old_per_token_logps is not None
 
     def test_train_with_generate_from_teacher_skips_old_log_probs_for_distillation_clipping(self):
+        # [FUNCTION DOC]
+        # Tests the same misaligned setup with generate_from_teacher=True produces no old_per_token_logps.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": ["Solve 2+2.", "Solve 3+3."],
@@ -463,6 +570,10 @@ class TestSDFTTrainer(TrlTestCase):
         assert capture_callback.captured_old_per_token_logps is None
 
     def test_train_reuses_buffered_generation_batches(self):
+        # [FUNCTION DOC]
+        # Tests steps_per_generation 2 over 2 max_steps builds the generation batch exactly once.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         dataset = Dataset.from_dict(
             {
                 "prompt": ["Solve 2+2.", "Solve 3+3."],
@@ -497,6 +608,14 @@ class TestSDFTTrainer(TrlTestCase):
         assert capture_callback.generation_batch_build_count == 1
 
     def test_server_loss_finite_with_masked_and_padded_rows(self):
+        # [FUNCTION DOC]
+        # Drives compute_loss through the teacher-server path: sets use_teacher_server and installs a
+        # RecordingTeacherClient returning ragged top-k logprobs (row 0 empty, row 1 two tokens). Config:
+        # topk_logits distillation, topk 2, alpha 0.5, add_tail, no IS clipping, 3 completion tokens. Builds a
+        # hand-made 2-row batch where row 0's completion is fully masked and row 1 is padded. Asserts the
+        # loss is finite, backward yields finite grads, and the client was called with top_logprobs 2.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         # Drives the teacher-server path through `compute_loss` with a fake server client: row 0 is fully masked
         # (zero-length scored completion) and row 1 has a shorter completion than the padded batch, so the client
         # response is ragged and the padded tail comes back as -inf. Neither may leak NaN or inf.
@@ -545,6 +664,11 @@ class TestSDFTTrainer(TrlTestCase):
         assert trainer.teacher_client.calls[0]["top_logprobs"] == 2
 
     def test_pad_token_id_synced_with_model_config(self):
+        # [FUNCTION DOC]
+        # Tests with tiny Mistral (no pad token) that the trainer sets a pad token and model config and
+        # generation config pad_token_id equal it.
+        # Inputs/Outputs: none. Exceptions: AssertionError on failure.
+        # Side effects: downloads tiny models; writes to tmp_dir.
         # This model's tokenizer has no pad token, so the trainer falls back to the eos token. The model configs must
         # follow: otherwise `Trainer` realigns them at train time and reports it as a change the user did not make.
         dataset = Dataset.from_dict(

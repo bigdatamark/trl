@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Script that builds a tiny randomly initialized MuseSparkForConditionalGeneration mirroring meta-models/Muse-Spark-Open-816B-A42B and pushes it to trl-internal-testing/tiny-MuseSparkForConditionalGeneration.
+# Behavior (all at import time, run as a module): checks pinned transformers 5.20.0 is installed exactly, seeds RNGs, loads the reference AutoProcessor and GenerationConfig,
+# builds a scaled-down config (mostly 2 layers, hidden size 8-16, intermediate size 32), instantiates the model in bfloat16, re-initializes weights via init_weights_tiny_model,
+# runs smoke_test, check_dtype_pattern and print_config_diff against the reference, then calls push_to_hub.
+# Details: Text: 2 sparse MoE layers (one full, one sliding window 32), 16 local experts with 4 per token so expert-parallel tests can shard up to width 16. Vision: window and full attention layers, hidden 32. Audio: 4 layers with small hidden sizes, output size 64 to match text. After weight init, each router gate weight and e_score_correction_bias are cast back to float32 like the reference.
+# Inputs: CLI flags --create-pr / --full-diff (parsed by _common). Outputs: none returned.
+# Exceptions: RuntimeError on transformers version mismatch or failed smoke test; Hub/network errors propagate.
+# Side effects: downloads reference tokenizer/config from the Hub, prints diagnostics, creates/updates a Hub repo (or skips if it exists).
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

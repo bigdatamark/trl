@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Script that wraps the already-published trl-internal-testing/tiny-Qwen3ForCausalLM in a LoRA adapter and pushes
+# the adapter to trl-internal-testing/tiny-<PEFT wrapper class name> (e.g. tiny-PeftModelForCausalLM).
+# Behavior (import time): checks the transformers floor, seeds RNGs with the default seed, loads the base model with
+# its stored dtype, applies get_peft_model with a default LoraConfig but init_lora_weights False (so lora_B is
+# non-zero and the adapter is not the identity), runs smoke_test without tokenizer, then push_to_hub with no
+# tokenizer and no generation config.
+# Inputs: --create-pr CLI flag. Outputs: none. Exceptions: version mismatch / smoke test RuntimeError; Hub errors.
+# Side effects: Hub download of the base model and upload of adapter files.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
