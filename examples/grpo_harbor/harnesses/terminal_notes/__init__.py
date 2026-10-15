@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Package for the terminal-notes harness: re-exports TerminalNotesEnv from the env module (__all__ contains only
+# TerminalNotesEnv). Import side effects: imports the env module.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

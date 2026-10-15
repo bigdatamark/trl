@@ -1,3 +1,25 @@
+# [MODULE DOC]
+# Example training script for experimental SDFT (self-distillation fine-tuning) where the teacher sees extra
+# privileged context: each training row is reduced to prompt plus privileged_context, either given directly or built
+# from a demonstration (golden_response) via a string Template. Optionally scores a ReAct-style tool-use eval
+# (Action / Action Input against golden_answer) before and after training.
+# Contents: DEFAULT_DEMONSTRATION_TEMPLATE, SDFTScriptArguments, dataset-preparation helpers, tool-eval helpers and
+# the main-guard script body.
+# Main-guard behavior: parses SDFTScriptArguments, SDFTConfig and ModelConfig; requires model_name_or_path; chooses
+# dtype (explicit torch dtype, else bfloat16/float16 from bf16/fp16 flags, else auto); builds model kwargs with
+# quantization only when set and stores them as model_init_kwargs; loads a left-padding tokenizer (eos as pad if
+# missing); loads the dataset from disk (dataset_path) or the Hub and requires a DatasetDict; prepares the train split;
+# prepares the eval split only when eval is enabled, the split exists and it has prompt plus privileged_context or
+# golden_response; loads the model and sets use_cache False under gradient checkpointing; builds SDFTTrainer with
+# optional PEFT; adds LogCompletionsCallback (sampling with max_completion_length and temperature) when an eval set
+# exists and eval_num_prompts is non-zero; if the raw eval split has golden_answer, runs and logs/saves the
+# before-training tool eval; trains and saves; evaluates when an eval set exists; reruns the tool eval after training
+# adding delta metrics (after minus before); optionally pushes; calls end.
+# Inputs: CLI args. Outputs: model, metrics and tool-eval sample JSON files in output_dir.
+# Exceptions: ValueError for missing model name, non-DatasetDict datasets or rows lacking context columns.
+# Side effects: downloads, training, generation, file writes, logging, optional Hub upload. Importing has no side effects.
+# KNOWN ISSUE: with dataset_streaming the Hub load returns an IterableDatasetDict, which fails the DatasetDict check.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,6 +106,11 @@ DEFAULT_DEMONSTRATION_TEMPLATE = Template("""Example response: $output_text""")
 
 @dataclass
 class SDFTScriptArguments(ScriptArguments):
+    # [CLASS DOC]
+    # ScriptArguments subclass adding: dataset_path (local load_from_disk path overriding dataset_name), the names of the
+    # privileged_context and golden_response columns, eval_num_prompts (default 8, completions to log; 0 disables),
+    # demonstration_template (string Template, default "Example response: " followed by output_text placeholder),
+    # tool_eval_num_examples (default None = whole eval split) and tool_eval_max_new_tokens (default 256). No methods.
     dataset_path: str | None = field(
         default=None,
         metadata={"help": "Optional local dataset path to load with `load_from_disk`. Overrides `dataset_name`."},
@@ -117,6 +144,12 @@ class SDFTScriptArguments(ScriptArguments):
 
 
 def _extract_prompt_text(prompt: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns plain text for a prompt.
+    # Behavior: strings are returned as is; for a non-empty list of message dicts, returns the content of the last user
+    # message (joining text parts with spaces when the content is a list of parts); anything else (or no user message) is
+    # converted with str.
+    # Inputs: prompt (any). Outputs: str. Exceptions: none expected. Side effects: none.
     if isinstance(prompt, str):
         return prompt
     if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict):
@@ -130,6 +163,9 @@ def _extract_prompt_text(prompt: Any) -> str:
 
 
 def _stringify_golden_response(response: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Converts a golden response to text: strings as is, lists recursively joined with newlines, others via str.
+    # Inputs: response (any). Outputs: str. Exceptions: none. Side effects: none.
     if isinstance(response, str):
         return response
     if isinstance(response, list):
@@ -140,6 +176,14 @@ def _stringify_golden_response(response: Any) -> str:
 def _build_privileged_context(
     example: dict[str, Any], privileged_context_column: str, golden_response_column: str, template: Template
 ):
+    # [FUNCTION DOC]
+    # HELPER: Produces the prompt and privileged_context pair for one row.
+    # Behavior: uses the privileged context column when present and not None; else, if the golden response column exists,
+    # substitutes the template (safe substitution) with orig_content (prompt text) and output_text (stringified golden
+    # response); else raises, with a specific message if the row uses the old teacher_prompt column.
+    # Inputs: example (dict), privileged_context_column (str), golden_response_column (str), template (Template).
+    # Outputs: dict with prompt and privileged_context. Exceptions: ValueError when neither source is available.
+    # Side effects: none.
     if privileged_context_column in example and example[privileged_context_column] is not None:
         privileged_context = example[privileged_context_column]
     elif golden_response_column in example:
@@ -162,6 +206,10 @@ def _build_privileged_context(
 
 
 def _prepare_split(dataset, script_args: SDFTScriptArguments):
+    # [FUNCTION DOC]
+    # HELPER: Maps a dataset split through _build_privileged_context using the script's column names and template,
+    # removing all original columns. Inputs: dataset, script_args. Outputs: mapped Dataset with prompt and
+    # privileged_context. Exceptions: ValueError from row building. Side effects: none beyond dataset caching.
     template = Template(script_args.demonstration_template)
     return dataset.map(
         lambda example: _build_privileged_context(
@@ -175,11 +223,20 @@ def _prepare_split(dataset, script_args: SDFTScriptArguments):
 
 
 def _can_prepare_privileged_context(dataset) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True when the split has a prompt column and either a privileged_context or golden_response column.
+    # Inputs: dataset. Outputs: bool. Exceptions: none. Side effects: none.
+    # KNOWN ISSUE: checks the default column names, ignoring the configurable privileged_context_column and
+    # golden_response_column arguments that _prepare_split honors.
     columns = set(dataset.column_names)
     return "prompt" in columns and ("privileged_context" in columns or "golden_response" in columns)
 
 
 def _extract_action_and_input(text: str) -> tuple[str | None, str | None]:
+    # [FUNCTION DOC]
+    # HELPER: Parses a ReAct-style completion: the text after the first "Action:" up to end of line, and everything after
+    # the first "Action Input:" (across lines); both stripped.
+    # Inputs: text (str). Outputs: tuple (action or None, action input or None). Exceptions: none. Side effects: none.
     action_match = re.search(r"Action:\s*([^\n]+)", text)
     action_input_match = re.search(r"Action Input:\s*(.*)", text, flags=re.DOTALL)
     action = action_match.group(1).strip() if action_match else None
@@ -188,6 +245,11 @@ def _extract_action_and_input(text: str) -> tuple[str | None, str | None]:
 
 
 def _parse_json_object(text: str | None) -> tuple[bool, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Tries to parse text as JSON after stripping whitespace and an optional surrounding markdown code fence (with
+    # optional json language tag).
+    # Inputs: text (str or None). Outputs: tuple (success flag, parsed value or None); None input gives failure.
+    # Exceptions: all parse errors are caught. Side effects: none.
     if text is None:
         return False, None
     text = text.strip()
@@ -201,6 +263,12 @@ def _parse_json_object(text: str | None) -> tuple[bool, Any]:
 
 
 def _normalize_gold_answer(example: dict[str, Any]) -> tuple[str | None, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Extracts the reference action and input from the first entry of a row's golden_answer list.
+    # Behavior: returns (None, None) when the list is missing or empty; otherwise returns the Action field and the parsed
+    # Action_Input JSON, or the raw Action_Input when it does not parse.
+    # Inputs: example (dict). Outputs: tuple (action, action input). Exceptions: AttributeError if the entry is not a dict.
+    # Side effects: none.
     answers = example.get("golden_answer") or []
     if not answers:
         return None, None
@@ -211,6 +279,10 @@ def _normalize_gold_answer(example: dict[str, Any]) -> tuple[str | None, Any]:
 
 
 def _apply_prompt_template(tokenizer, prompt: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Renders a prompt to text with the tokenizer's chat template when conversational (via
+    # maybe_apply_chat_template), otherwise returns it unchanged.
+    # Inputs: tokenizer, prompt. Outputs: str. Exceptions: template errors propagate. Side effects: none.
     return maybe_apply_chat_template({"prompt": prompt}, tokenizer)["prompt"]
 
 
@@ -221,6 +293,19 @@ def _run_tooluse_eval(
     num_examples: int | None = None,
     metric_prefix: str = "tool_eval",
 ) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # HELPER: Greedy-generates completions for the eval rows and scores tool-call accuracy.
+    # Behavior: optionally keeps the first num_examples rows; renders prompts, tokenizes them in one left-padded batch
+    # truncated to the trainer's max_prompt_length without special tokens, moves to the accelerator device; generates
+    # greedily (max_new_tokens, tokenizer pad/eos ids) with the unwrapped model (gathering ZeRO-3 params per
+    # ds3_gather_for_generation) under no_grad; decodes only the new tokens. For each row: counts a present action,
+    # valid JSON input, action match with a non-None gold action, and full match (action correct, valid JSON and parsed
+    # input equal to gold input); records per-row details. Rates are counts divided by the number of rows (at least 1).
+    # Writes the first 20 records to output_dir as metric_prefix_samples.json.
+    # Inputs: trainer (SDFTTrainer), eval_dataset (with prompt, golden_answer), max_new_tokens (int), num_examples (int,
+    # optional), metric_prefix (str, default tool_eval). Outputs: dict of four rate metrics keyed with metric_prefix.
+    # Exceptions: generation/IO errors propagate. Side effects: GPU generation over the whole subset in one batch,
+    # creates output_dir, writes a JSON file.
     if num_examples is not None:
         eval_dataset = eval_dataset.select(range(min(num_examples, len(eval_dataset))))
 

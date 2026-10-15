@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Package for the Jupyter harness: re-exports JupyterEnv from the env module (__all__ contains only JupyterEnv). The
+# sibling kernel_server.py and run_cell.py are scripts uploaded into the sandbox, not imported here.
+# Import side effects: imports the env module.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Module trl.generation.vllm_generation: the vLLM generation backend shared by online trainers. Wraps both
+# "server" mode (an external vLLM server reached through VLLMClient) and "colocate" mode (an in-process vllm.LLM
+# on each training GPU), including weight synchronization from the training model (FSDP1/2, DeepSpeed ZeRO-3,
+# PEFT) to vLLM.
+# Main contents: empty_cache (device cache clearing), extract_logprobs (vLLM RequestOutput to nested lists) and
+# VLLMGeneration.
+# Import-time side effects: imports vllm when available and bitsandbytes when available; module logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +57,9 @@ logger = logging.getLogger(__name__)
 
 
 def empty_cache() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Empty the memory cache of the first available device among MLU, MPS, NPU and XPU, else CUDA.
+    # Inputs: none. Outputs: none. Exceptions: none. Side effects: frees cached device memory.
     """Empties the cache of the available torch device.
 
     This function checks for the availability of different torch devices (CUDA, MLU, MPS, NPU, XPU) and empties the
@@ -68,6 +80,13 @@ def empty_cache() -> None:
 
 
 def extract_logprobs(all_outputs: list["RequestOutput"]):
+    # [FUNCTION DOC]
+    # HELPER: Convert vLLM generation outputs into rank-sorted logprobs and token ids.
+    # Behavior: for every completion of every request, if its logprobs are None return (None, None) immediately;
+    # otherwise, per position, sort the logprob dict by rank and collect token ids and logprobs (NaN replaced by
+    # None).
+    # Inputs: all_outputs (list of RequestOutput). Outputs: (logprobs, token_ids), each (num_sequences, seq_len,
+    # num_logprobs), or (None, None). Exceptions: none. Side effects: none.
     """
     Extract logprobs and token IDs from vLLM generation outputs.
 
@@ -109,6 +128,17 @@ if is_bitsandbytes_available():
 
 
 class VLLMGeneration:
+    # [CLASS DOC]
+    # Encapsulates vLLM initialization, generation and weight sync for a trainer.
+    # State: model, accelerator, _dist (DistributedBackend helper for FSDP/DeepSpeed gathering), processing_class;
+    # mode and structured_outputs_regex; server settings (server_base_url, server_host, server_port, group_port,
+    # server_timeout) and vllm_client (main process only, server mode); colocate settings (tensor_parallel_size,
+    # gpu_memory_utilization, max_model_length, max_num_seqs, enable_sleep_mode, model_impl, trust_remote_code),
+    # llm, tp_group (when TP > 1) and _llm_weights_sleeping; sampling settings (repetition_penalty, temperature,
+    # top_p, top_k, min_p, max_completion_length, logprobs, generation_kwargs); _weight_metadata (cached
+    # (name, dtype, shape) list for server syncs).
+    # Flow: __init__ stores settings and calls _init_vllm; the trainer calls sync_weights after optimizer steps and
+    # generate to obtain completions.
     """Handles vLLM-based generation for trainers.
 
     Extracts all vLLM-specific logic (initialization, generation, weight sync) from trainers into a separate, testable
@@ -245,6 +275,14 @@ class VLLMGeneration:
         logprobs: int | None = 0,
         generation_kwargs: dict | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: store every argument as an attribute (generation_kwargs defaulting to {}), create the
+        # DistributedBackend, set _weight_metadata None and call _init_vllm.
+        # Inputs: model, accelerator, processing_class, plus the vLLM / server / colocate / generation settings listed
+        # in the class docstring (defaults: mode "colocate", server_host "0.0.0.0", server_port 8000, server_timeout
+        # 240.0, group_port 51216, tensor_parallel_size 1, gpu_memory_utilization 0.9, enable_sleep_mode False,
+        # model_impl "auto", temperature 1.0, top_p 1.0, top_k 0, min_p 0.0, max_completion_length 16, logprobs 0).
+        # Outputs: none. Exceptions: as _init_vllm. Side effects: as _init_vllm.
         self.model = model
         self.accelerator = accelerator
         self._dist = DistributedBackend(accelerator)
@@ -287,6 +325,19 @@ class VLLMGeneration:
         self._init_vllm()
 
     def _init_vllm(self):
+        # [FUNCTION DOC]
+        # HELPER: Create the vLLM backend.
+        # Behavior: require vLLM. Server mode: on the main process only, build a VLLMClient (server_base_url or
+        # http://host:port, server_timeout) and init its NCCL communicator on the accelerator device. Colocate mode:
+        # require num_processes divisible by tensor_parallel_size; when TP > 1 create consecutive-rank subgroups as
+        # tp_group; set RANK, LOCAL_RANK and WORLD_SIZE env vars and ensure MASTER_ADDR/PORT; detect bitsandbytes
+        # 4-bit layers (quantization "bitsandbytes") and reject 8-bit layers; build vllm.LLM from model.name_or_path
+        # with the colocate settings, external_launcher executor, seed equal to process index divided by TP size (same
+        # within a TP group), max_num_batched_tokens 4096, processed_logprobs mode; if sleep mode put the engine to sleep
+        # at level 2 and record that weights are sleeping. Any other mode raises. Finally wait for all processes.
+        # Inputs: none. Outputs: none.
+        # Exceptions: ImportError (no vLLM), ValueError (bad TP size, 8-bit model, unknown mode), connection errors.
+        # Side effects: mutates os.environ, creates process groups, allocates GPU memory, network/NCCL setup, barrier.
         """Initialize vLLM in server or colocate mode."""
         model = self.model
         accelerator = self.accelerator
@@ -375,6 +426,9 @@ class VLLMGeneration:
         accelerator.wait_for_everyone()
 
     def _fix_param_name_to_vllm(self, name: str, extra_prefixes: list[str] | None = None) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Remove "_checkpoint_wrapped_module." and any extra_prefixes substrings from a parameter name.
+        # Inputs: name, extra_prefixes (optional list). Outputs: str. Exceptions: none. Side effects: none.
         """Fix parameter name for vLLM compatibility."""
         extra_prefixes = extra_prefixes or []
         prefixes = ["_checkpoint_wrapped_module."] + extra_prefixes
@@ -383,6 +437,13 @@ class VLLMGeneration:
         return name
 
     def _iter_fsdp1_params(self, module: nn.Module, prefix: str = "", visited: set[str] | None = None):
+        # [FUNCTION DOC]
+        # HELPER: Generator over full parameters of an FSDP1-wrapped model in post-order.
+        # Behavior: recurse into children first (dotted prefixes), then if the module is FSDP, summon its full params
+        # without recursion or writeback and yield each parameter (name cleaned of FSDP and checkpoint wrapper
+        # prefixes) once, tracking names in visited.
+        # Inputs: module, prefix (default ""), visited (shared set). Outputs: yields (name, tensor).
+        # Exceptions: none explicit. Side effects: temporarily all-gathers FSDP shards (collective).
         """Memory-efficient post-order traversal of FSDP modules to extract full parameters."""
         # For FSDP1, we need to recurse into children and also use summon_full_params
         if visited is None:
@@ -406,6 +467,13 @@ class VLLMGeneration:
                     yield full_name, param.data
 
     def _iter_fsdp2_params(self, module: nn.Module):
+        # [FUNCTION DOC]
+        # HELPER: Generator over FSDP2 parameters as full tensors.
+        # Behavior: for each named parameter strip the PEFT "base_model.model." prefix and ".base_layer"; skip adapter
+        # parameters (containing the PEFT prefix) and "original_module" copies; remove "modules_to_save.default." and
+        # wrapper prefixes; move CPU-offloaded params to the accelerator device and call full_tensor on the DTensor.
+        # Inputs: module. Outputs: yields (name, tensor). Exceptions: none explicit.
+        # Side effects: all-gather collectives.
         """FSDP2-specific parameter iteration."""
         # For FSDP2, module.named_parameters() covers all parameters and yields tied weights once, as vLLM requires
         for name, param in module.named_parameters():
@@ -426,6 +494,9 @@ class VLLMGeneration:
             yield name, param
 
     def _iter_fsdp_params(self, model: nn.Module):
+        # [FUNCTION DOC]
+        # HELPER: Dispatch to the FSDP1 or FSDP2 iterator based on _dist.fsdp_version (yields nothing for other values).
+        # Inputs: model. Outputs: yields (name, tensor). Exceptions: none. Side effects: collectives.
         """Dispatch FSDP parameter iteration to the version-appropriate method."""
         if self._dist.fsdp_version == 1:
             yield from self._iter_fsdp1_params(model)
@@ -433,6 +504,15 @@ class VLLMGeneration:
             yield from self._iter_fsdp2_params(model)
 
     def _iter_named_params(self):
+        # [FUNCTION DOC]
+        # HELPER: Yield every model parameter, materialized, under the name vLLM expects. All ranks must iterate since
+        # gathering is collective.
+        # Behavior: PEFT: gather all parameters at once, merge adapters, then yield FSDP params via _iter_fsdp_params or,
+        # otherwise, named parameters with PEFT naming cleaned up and adapter / original_module entries skipped; unmerge
+        # adapters before leaving the gather. Non-PEFT: FSDP iterator, or each parameter gathered individually (ZeRO-3)
+        # with wrapper prefixes removed.
+        # Inputs: none. Outputs: yields (name, tensor).
+        # Exceptions: none explicit. Side effects: temporarily merges/unmerges adapters; collectives.
         """Iterate over the model parameters, materialized one at a time under the name vLLM expects.
 
         Handles FSDP, DeepSpeed and PEFT. Gathering a parameter is a collective operation, so every process must
@@ -479,6 +559,15 @@ class VLLMGeneration:
                         yield name, param.data
 
     def sync_weights(self):
+        # [FUNCTION DOC]
+        # Push the current training weights to vLLM.
+        # Behavior: colocate with sleep mode: empty the cache and wake the engine's weights (clear sleeping flag).
+        # Server: on first call collect _weight_metadata by iterating parameters; then the main process streams
+        # parameters with vllm_client.update_named_params while other ranks iterate to join the collectives.
+        # Colocate: load each parameter directly into the driver worker's model via load_weights. Finally reset the
+        # prefix cache (server: main process via the client; colocate: the local engine).
+        # Inputs: none. Outputs: none. Exceptions: NCCL/HTTP errors.
+        # Side effects: updates vLLM weights, clears prefix caches, may wake the engine.
         """Synchronize model weights to vLLM.
 
         Handles FSDP, DeepSpeed, PEFT weight synchronization.
@@ -517,6 +606,13 @@ class VLLMGeneration:
             self.llm.reset_prefix_cache()
 
     def _place_features(self, features: dict | None, prompt_ids: list[int]) -> dict | None:
+        # [FUNCTION DOC]
+        # HELPER: Rewrite image placeholder positions in server-rendered features to match this prompt.
+        # Behavior: return None for None features. Scan prompt_ids for runs of processing_class.image_token_id, recording
+        # offset and length of each run; require the number of runs to equal the number of processed images; return a
+        # copy of features with mm_placeholders["image"] replaced by those runs.
+        # Inputs: features (dict or None), prompt_ids (list of int). Outputs: dict or None.
+        # Exceptions: ValueError on run/image count mismatch. Side effects: none.
         """Point the image features at the image tokens of `prompt_ids`.
 
         The server reports where the images sit in the throwaway conversation it processed them in, which says nothing
@@ -554,6 +650,24 @@ class VLLMGeneration:
         num_generations: int,
         profiler: ProfilingContext | None = None,
     ) -> tuple:
+        # [FUNCTION DOC]
+        # Generate completions for this rank's tokenized prompts (already repeated num_generations times).
+        # Behavior: if colocate with sleeping weights, re-sync weights first. Server mode: gather prompts and images
+        # (images always gathered, None-filled, to avoid deadlocks) across processes; on the main process take every
+        # num_generations-th prompt as unique prompts, render image features (and place them) when any images exist,
+        # and call vllm_client.generate with n = num_generations and the sampling settings (min_p None treated as 0)
+        # inside the profiler; broadcast the result from rank 0, repeat prompt ids num_generations times, and keep this
+        # rank's contiguous slice. Colocate mode: build SamplingParams with n 1 plus generation_kwargs; the regex
+        # overrides any structured_outputs in generation_kwargs (warning), and a dict structured_outputs is converted
+        # to StructuredOutputsParams. With TP > 1, all-gather prompts and images within tp_group. Wake the KV cache if
+        # sleep mode, build prompt dicts (token ids plus multi_modal_data image list, or single image), barrier first
+        # when PEFT and TP > 1 (avoids NCCL hang), run llm.generate inside the profiler, extract ids/logprobs, keep this
+        # rank's TP slice, and put the engine back to sleep (level 2) when sleep mode.
+        # Inputs: prompts (list of token-id lists), images (list per prompt or None), num_generations (int),
+        # profiler (optional context manager).
+        # Outputs: tuple (prompt_ids, completion_ids, logprobs, logprob_token_ids); the last two may be None.
+        # Exceptions: ValueError from feature placement; HTTP/NCCL errors.
+        # Side effects: collectives, network calls, vLLM engine sleep/wake, profiling metrics.
         """Generate completions using vLLM.
 
         Args:

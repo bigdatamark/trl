@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Package exposing the built-in Harbor bash harness under the name BashEnv (an alias of
+# trl.experimental.harbor.HarborBashEnv); __all__ contains only BashEnv. Import side effect: imports
+# trl.experimental.harbor.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

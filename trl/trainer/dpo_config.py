@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Defines DPOConfig, the TrainingArguments-based configuration for DPOTrainer (preference optimization with
+# many loss variants). No import-time side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +25,16 @@ from .base_config import _BaseConfig
 
 @dataclass
 class DPOConfig(_BaseConfig):
+    # [CLASS DOC]
+    # Dataclass config (inherits _BaseConfig, hence TrainingArguments) for DPOTrainer.
+    # Field groups: model (model_init_kwargs, trust_remote_code, router_aux_loss_coef for MoE auxiliary loss,
+    # disable_dropout default True); data preprocessing (dataset_num_proc, max_length 1024, truncation_mode
+    # "keep_start" or deprecated "keep_end", padding_free, pad_to_multiple_of "auto", precompute_ref_log_probs,
+    # precompute_ref_batch_size); training (loss_type list default ["sigmoid"] with many variants, loss_weights,
+    # ld_alpha for LD-DPO, f_divergence_type "reverse_kl" and f_alpha_divergence_coef 0.5, label_smoothing, beta
+    # 0.1, use_weighting (WPO), discopop_tau 0.05, activation_offloading, sync_ref_model with ref_model_mixup_alpha
+    # 0.6 and ref_model_sync_steps 512 for TR-DPO); deprecated pad_token. learning_rate default 1e-6.
+    # _VALID_DICT_FIELDS adds model_init_kwargs (JSON string accepted from CLI).
     r"""
     Configuration class for the [`DPOTrainer`].
 
@@ -355,6 +369,14 @@ class DPOConfig(_BaseConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: wraps a string loss_type into a one-element list; checks loss_weights length equals loss_type
+        # length; FutureWarning for a set pad_token and for truncation_mode "keep_end"; runs the parent post-init;
+        # converts string pad_to_multiple_of ("none"/"null" to None, else int) and resolves "auto" to 128 on Neuron
+        # devices, None elsewhere.
+        # Inputs: none. Outputs: none.
+        # Exceptions: ValueError for mismatched loss_weights or non-integer pad string; parent validation errors.
+        # Side effects: mutates loss_type and pad_to_multiple_of; emits warnings.
         if isinstance(self.loss_type, str):
             self.loss_type = [self.loss_type]
         if self.loss_weights is not None and len(self.loss_weights) != len(self.loss_type):

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Example implementing block-diffusion SFT of DiffusionGemma (encoder-decoder diffusion LM) on GSM8K, optionally with
+# LoRA. The objective (one random response block per example, uniform random-token corruption, two-pass
+# self-conditioning, flat cross-entropy over the canvas, plus an autoregressive encoder co-loss, with an optional
+# leave-one-out logit conversion) is described in the module docstring and implemented in DiffusionGemmaSFTTrainer.
+# Contents: argument dataclasses with reference-recipe defaults, DiffusionGemmaSFTTrainer, main, make_parser.
+# Under the main guard parses the three dataclasses with TrlParser and calls main. Importing has no side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,6 +93,8 @@ from trl.trainer.utils import maybe_gather_lm_head_ctx
 
 @dataclass
 class DiffusionGemmaScriptArguments(ScriptArguments):
+    # [CLASS DOC]
+    # ScriptArguments subclass defaulting dataset_name to openai/gsm8k and dataset_config to main. No methods.
     r"""
     [`ScriptArguments`] with GSM8K as the default dataset.
 
@@ -100,6 +110,11 @@ class DiffusionGemmaScriptArguments(ScriptArguments):
 
 @dataclass
 class DiffusionGemmaSFTConfig(SFTConfig):
+    # [CLASS DOC]
+    # SFTConfig subclass with the released checkpoint's fine-tuning defaults (learning rate 1.5e-4, Adam betas 0.95/0.99,
+    # weight decay 1e-4, 25 warmup steps, cosine schedule down to 10% of the peak, 800 max steps, per-device batch 1 with
+    # gradient accumulation 8, max length 1024) and one new field model_prediction_type (mean or mean_loo, default mean).
+    # No methods.
     r"""
     [`SFTConfig`] whose defaults follow the reference fine-tuning configs of the released checkpoint.
 
@@ -145,6 +160,8 @@ class DiffusionGemmaSFTConfig(SFTConfig):
 
 @dataclass
 class DiffusionGemmaModelConfig(ModelConfig):
+    # [CLASS DOC]
+    # ModelConfig subclass defaulting to google/diffusiongemma-26B-A4B-it in bfloat16 with LoRA dropout 0. No methods.
     r"""
     [`ModelConfig`] with the released checkpoint and its reference LoRA settings as defaults.
 
@@ -161,6 +178,12 @@ class DiffusionGemmaModelConfig(ModelConfig):
 
 
 class DiffusionGemmaSFTTrainer(SFTTrainer):
+    # [CLASS DOC]
+    # SFTTrainer subclass that replaces the autoregressive loss with the DiffusionGemma block-diffusion loss.
+    # Class attributes: eps (1e-4, margin on sampled time t) and self_conditioning_p (0.5). Instance state set in
+    # __init__: canvas_length, vocab_size, final_logit_softcapping (from the model's text config), eos_token_id (from the
+    # tokenizer) and model_prediction_type. Expects batches from the default SFT collator with labels of -100 outside the
+    # assistant response; only compute_loss is overridden (used for both training and evaluation).
     """
     SFTTrainer with the block-diffusion objective of DiffusionGemma.
 
@@ -173,6 +196,11 @@ class DiffusionGemmaSFTTrainer(SFTTrainer):
     self_conditioning_p = 0.5
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Initializes the parent trainer, rejects packing, enables loss scaling for gradient accumulation (by setting
+        # model_accepts_loss_kwargs False) and caches canvas/vocab/softcap/eos/prediction-type settings.
+        # Inputs: same as SFTTrainer. Outputs: none. Exceptions: ValueError when packing is enabled.
+        # Side effects: sets instance attributes.
         super().__init__(*args, **kwargs)
         if self.args.packing:
             raise ValueError("Packing is not supported: the diffusion loss needs per-example response spans.")
@@ -190,6 +218,28 @@ class DiffusionGemmaSFTTrainer(SFTTrainer):
         self.model_prediction_type = self.args.model_prediction_type
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Computes diffusion loss plus encoder autoregressive loss for a batch.
+        # Behavior: (1) Response span: supervised positions are labels not equal to -100; span_end is the last supervised
+        # position (or -1); prefix_len is the start of the last supervised span (clamped at 0); response_len is span length
+        # (0 when nothing is supervised). (2) Truncation flag: when max_length is set, an example is truncated if its real
+        # length reaches max_length and its response ends at the last real token. (3) Block selection: number of blocks is
+        # ceil of response_len over canvas_length (at least 1); a random block index per example; encoder_len is prefix_len
+        # plus block index times block size. (4) Clean canvas: tokens at positions encoder_len plus 0..block_size-1 (indices
+        # clamped to the sequence), replaced by eos past the end of the response. (5) Corruption: per-example t uniform in
+        # [eps, 1-eps]; each canvas position is replaced by a uniform random vocab token with probability t. (6) Decoder mask:
+        # cache positions before encoder_len plus all canvas positions; decoder position ids continue from encoder_len.
+        # (7) Self-conditioning: a no-grad forward produces logits that are passed as self_conditioning_logits to the second
+        # (grad) forward, with a per-example Bernoulli(0.5) self_conditioning_mask. (8) Diffusion loss: mean cross-entropy
+        # between decoder logits and the clean canvas over all positions, excluding the eos fill of truncated examples; with
+        # mean_loo, logits are upcast to float32 and the observed (corrupted) token's logit is increased by
+        # log(1 + K times alpha over (1 - alpha)) with alpha = 1 - t and K the vocab size; if no target is valid, a zero loss
+        # connected to the graph is used. (9) AR co-loss: encoder last hidden states are projected through lm_head (inside a
+        # context that gathers sharded ZeRO-3 weights), upcast, soft-capped by tanh with final_logit_softcapping, and scored by
+        # next-token cross-entropy over positions where both the current and next token are real.
+        # Inputs: model, inputs (dict with input_ids, attention_mask, labels), return_outputs (bool), num_items_in_batch
+        # (unused). Outputs: scalar loss (diffusion plus AR), or (loss, outputs) when return_outputs.
+        # Exceptions: propagated from the model. Side effects: consumes RNG; two model forwards per call.
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         labels = inputs["labels"]
@@ -299,6 +349,17 @@ class DiffusionGemmaSFTTrainer(SFTTrainer):
 
 
 def main(script_args, training_args, model_args):
+    # [FUNCTION DOC]
+    # Loads the model, configures trainability, prepares GSM8K and trains.
+    # Behavior: loads DiffusionGemmaForBlockDiffusion (revision, dtype, attention implementation) and the tokenizer. With
+    # use_peft, builds a LoraConfig (rank, alpha, dropout from model_args) targeting by regex the q/k/v/o attention
+    # projections and gate/up/down MLP projections of encoder language-model and decoder layers only; otherwise freezes
+    # every parameter whose name contains .router. for full fine-tuning. Loads the train split, converts each row to a
+    # user question / assistant answer messages list (other columns removed), forces assistant_only_loss True (which also
+    # makes SFTTrainer use TRL's DiffusionGemma training chat template), builds DiffusionGemmaSFTTrainer, trains, saves,
+    # optionally pushes, calls end.
+    # Inputs: script_args, training_args (DiffusionGemmaSFTConfig), model_args (DiffusionGemmaModelConfig).
+    # Outputs: none. Exceptions: propagated. Side effects: downloads, multi-GPU training, file writes, optional upload.
     model = DiffusionGemmaForBlockDiffusion.from_pretrained(
         model_args.model_name_or_path,
         revision=model_args.model_revision,
@@ -329,6 +390,10 @@ def main(script_args, training_args, model_args):
     dataset = load_dataset(script_args.dataset_name, script_args.dataset_config, split=script_args.dataset_train_split)
 
     def to_messages(example):
+        # [FUNCTION DOC]
+        # HELPER: Map function turning a GSM8K row into a two-message conversation (user question, assistant answer).
+        # Inputs: example (dict with question, answer). Outputs: dict with messages. Exceptions: KeyError if missing.
+        # Side effects: none.
         return {
             "messages": [
                 {"role": "user", "content": example["question"]},
@@ -359,6 +424,9 @@ def main(script_args, training_args, model_args):
 
 
 def make_parser():
+    # [FUNCTION DOC]
+    # HELPER: Returns a TrlParser over DiffusionGemmaScriptArguments, DiffusionGemmaSFTConfig and
+    # DiffusionGemmaModelConfig. Inputs: none. Outputs: TrlParser. Exceptions: none. Side effects: none.
     dataclass_types = (DiffusionGemmaScriptArguments, DiffusionGemmaSFTConfig, DiffusionGemmaModelConfig)
     return TrlParser(dataclass_types)
 

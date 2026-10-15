@@ -1,3 +1,9 @@
+# [PACKAGE DOC]
+# Package of example custom Harbor agent harnesses for grpo_harbor.py. Re-exports BashEnv (alias of the built-in
+# HarborBashEnv), JupyterEnv (persistent Jupyter-kernel harness) and TerminalNotesEnv (bash plus a notes scratchpad);
+# __all__ lists these three. Importing it eagerly imports all subpackages (and thus trl.experimental.harbor); no
+# other side effects.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

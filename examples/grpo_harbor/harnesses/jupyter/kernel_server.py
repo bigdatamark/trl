@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Script uploaded into the Harbor sandbox by JupyterEnv: a tiny single-threaded HTTP server on 127.0.0.1:8765 acting
+# as a stateful Python kernel. POST with JSON {"code": ...} executes the code against one persistent globals dict G
+# and replies {"output", "ok"}; GET is a health check. Constants: PORT 8765, G (globals with __name__ "__main__").
+# Main contents: _exec, Handler; under the main guard prints a start line and serves forever.
+# KNOWN ISSUE: the docstring says it is uploaded by "JupyterToolAgent", but the uploader is JupyterEnv in env.py.
+# Import-time side effects: creates the G dict only.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -40,6 +48,14 @@ G: dict = {"__name__": "__main__"}
 
 
 def _exec(code: str) -> tuple[str, bool]:
+    # [FUNCTION DOC]
+    # HELPER: Executes a code cell in G with Jupyter-like semantics.
+    # Behavior: first compiles in "single" mode so a bare expression echoes its value; on SyntaxError recompiles in
+    # "exec" mode. Runs with stdout and stderr redirected to buffers. SystemExit is swallowed (ok stays True); any other
+    # BaseException sets ok False and appends the traceback to stderr. Returns stdout then stderr text concatenated.
+    # Inputs: code string. Outputs: (output string, ok bool).
+    # Exceptions: none propagated (syntax errors in "exec" mode are caught and reported). Side effects: mutates G and
+    # whatever the executed code does.
     out = io.StringIO()
     err = io.StringIO()
     ok = True
@@ -60,7 +76,16 @@ def _exec(code: str) -> tuple[str, bool]:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # [CLASS DOC]
+    # BaseHTTPRequestHandler subclass serving the kernel: do_POST executes code, do_GET answers health checks,
+    # log_message is silenced. Stateless itself; all state lives in module-level G.
     def do_POST(self):
+        # [FUNCTION DOC]
+        # Behavior: reads Content-Length bytes, decodes UTF-8 (replacing errors), parses JSON, runs the "code" field
+        # (default empty) via _exec; any exception yields the traceback with ok False. Truncates output beyond 8000 chars
+        # with a note of how many were dropped. Always responds 200 with a JSON body of output and ok.
+        # Inputs: HTTP request. Outputs: none (writes response).
+        # Exceptions: none propagated except socket write errors. Side effects: code execution, HTTP response.
         try:
             n = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(n).decode("utf-8", errors="replace")
@@ -80,6 +105,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body_out)
 
     def do_GET(self):
+        # [FUNCTION DOC]
+        # Behavior: health check; responds 200 with JSON body {"ready": true} for any path.
+        # Inputs: HTTP request. Outputs: none. Exceptions: socket errors only. Side effects: HTTP response.
         # Health check.
         msg = b'{"ready": true}'
         self.send_response(200)
@@ -89,6 +117,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(msg)
 
     def log_message(self, *a, **k):
+        # [FUNCTION DOC]
+        # HELPER: Overrides request logging to do nothing, keeping stderr quiet.
+        # Inputs: ignored. Outputs: none. Exceptions: none. Side effects: none.
         # Quiet — Harbor agent's exec captures stdout/stderr.
         pass
 

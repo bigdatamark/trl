@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for trl RLOOTrainer and RLOOConfig (REINFORCE Leave-One-Out online RL trainer).
+# Main contents: a large TestRLOOTrainer class covering construction, dataset handling, reward functions,
+# PEFT/quantization, generation backends (transformers, vLLM), metrics and logging, plus VLM tests.
+# Uses tiny models from trl-internal-testing and the zen prompt-only datasets. PEFT symbols are imported only
+# if peft is installed; optional-dependency tests are gated by require_* decorators.
+# Import-time side effects: conditional peft import.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,7 +58,17 @@ if is_peft_available():
 
 
 class TestRLOOTrainer(TrlTestCase):
+    # [CLASS DOC]
+    # End-to-end RLOOTrainer tests. Most use self.tmp_dir as output_dir and report_to none, and a "small RL config":
+    # per_device_train_batch_size 3, num_generations 3, max_completion_length 8, often learning_rate 0.1 so tiny
+    # gradients still move weights. The default reward model is the tiny Qwen2 sequence-classification checkpoint.
+    # Common "standard train check": snapshot named parameters, train, assert the last log entry has train_loss and
+    # every parameter changed. Common "PEFT train check": base-model parameters (prefixed base_model.model.)
+    # unchanged and other non-base_layer parameters changed. Inherits TrlTestCase.
     def test_init_minimal(self):
+        # [FUNCTION DOC]
+        # Asserts the trainer can be constructed from only a model id, a reward model id and a train dataset (default
+        # args). Inputs/Outputs: none. Exceptions: any construction error. Side effects: may create the default output dir.
         # Test that RLOOTrainer can be instantiated with only model, reward_model and train_dataset
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         RLOOTrainer(
@@ -83,6 +101,11 @@ class TestRLOOTrainer(TrlTestCase):
         ],
     )
     def test_train(self, model_id):
+        # [FUNCTION DOC]
+        # Runs the standard train check with the small RL config across causal LMs (Cohere2, GLM4 MoE, GPT-OSS, Qwen2,
+        # Qwen3 MoE, Nemotron-H; some skipped on old transformers); when aux_loss_enabled, also asserts aux_loss is
+        # logged. Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -117,6 +140,10 @@ class TestRLOOTrainer(TrlTestCase):
 
     @require_liger_kernel
     def test_train_with_liger(self):
+        # [FUNCTION DOC]
+        # Requires liger-kernel. Asserts use_liger_kernel True emits a deprecation FutureWarning and that
+        # fused_linear_cross_entropy is disabled in liger_kernel_config, then runs the standard train check.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -150,6 +177,13 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_logps_match_plain_forward(self):
+        # [FUNCTION DOC]
+        # Builds a trainer in full precision with temperature 0.7, creates random 2x16 input ids with left padding on
+        # row 0 and trailing padding on row 1, and calls the private _get_per_token_logps_and_entropies with
+        # logits_to_keep 10 and entropy. Compares against a plain forward: logits for the last 10 predicted positions
+        # divided by 0.7, log-softmax, gathered at the next tokens, and entropy of that distribution. Asserts closeness
+        # (1e-4) on unmasked positions and that masked positions have logps of exactly 0.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # The fused LM head scores the completion tokens like a plain forward of the model, at the sampling temperature
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         training_args = RLOOConfig(
@@ -188,11 +222,17 @@ class TestRLOOTrainer(TrlTestCase):
         assert (logps[~completion_mask] == 0).all()
 
     def test_reward_func_wrong_number_of_rewards(self):
+        # [FUNCTION DOC]
+        # Asserts training with a reward function returning a single reward per batch raises ValueError mentioning that
+        # it returned 1 rewards. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # A reward function that returns the wrong number of rewards should raise a clear error instead of silently
         # broadcasting (when it returns a single value) or failing later with an opaque shape error.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def wrong_length_reward(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Reward function that always returns a one-element list with 1.0, regardless of batch size.
+            # Inputs: completions and keyword arguments. Outputs: list. Exceptions: none. Side effects: none.
             return [1.0]  # too few: one reward is expected per completion
 
         training_args = RLOOConfig(
@@ -213,6 +253,9 @@ class TestRLOOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("config_name", ["standard_prompt_only", "conversational_prompt_only"])
     def test_train_dataset_format(self, config_name):
+        # [FUNCTION DOC]
+        # Runs the standard train check on standard and conversational prompt-only datasets.
+        # Inputs: config_name (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", config_name, split="train")
 
         training_args = RLOOConfig(
@@ -242,10 +285,16 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_trust_remote_code(self):
+        # [FUNCTION DOC]
+        # With a zero reward function, asserts a remote-code model id raises ValueError mentioning custom code without
+        # trust_remote_code and loads as RemoteForCausalLM with it. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: may download remote code.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         model_id = "trl-internal-testing/tiny-RemoteForCausalLM"
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns a list of 0.0 with one entry per completion. Exceptions: none. Side effects: none.
             return [0.0] * len(completions)
 
         with pytest.raises(ValueError, match="custom code"):
@@ -265,6 +314,9 @@ class TestRLOOTrainer(TrlTestCase):
         assert type(trainer.model).__name__ == "RemoteForCausalLM"
 
     def test_train_with_eval(self):
+        # [FUNCTION DOC]
+        # Smoke test: trains with an eval dataset evaluated every 2 steps (eval batch 3); passes if no exception.
+        # Inputs/Outputs: none. Exceptions: any training error. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
 
         training_args = RLOOConfig(
@@ -288,6 +340,9 @@ class TestRLOOTrainer(TrlTestCase):
         trainer.train()
 
     def test_train_with_num_generations_eval(self):
+        # [FUNCTION DOC]
+        # Smoke test like test_train_with_eval but with num_generations_eval 1 for evaluation.
+        # Inputs/Outputs: none. Exceptions: any training error. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")
 
         training_args = RLOOConfig(
@@ -312,6 +367,10 @@ class TestRLOOTrainer(TrlTestCase):
         trainer.train()
 
     def test_train_with_iterable_dataset(self):
+        # [FUNCTION DOC]
+        # On a streaming dataset with max_steps 4, asserts accelerator_config.dispatch_batches was forced to False,
+        # then runs the standard train check. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         # Iterable (streaming) datasets have no length, so `max_steps` is required.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train", streaming=True)
 
@@ -347,6 +406,11 @@ class TestRLOOTrainer(TrlTestCase):
 
     @pytest.mark.parametrize("train_dataset_type", ["dataset", "iterable_dataset", "none", "unsupported_dataset_dict"])
     def test_init_with_train_dataset(self, train_dataset_type):
+        # [FUNCTION DOC]
+        # Checks train_dataset validation: None raises ValueError (train_dataset is required), a DatasetDict raises
+        # TypeError (must be Dataset or IterableDataset); Dataset and streaming dataset (max_steps 4) are stored as the
+        # same object (no preprocessing). Inputs: train_dataset_type (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         streaming = "iterable" in train_dataset_type
         if train_dataset_type == "none":
             train_dataset = None
@@ -399,6 +463,10 @@ class TestRLOOTrainer(TrlTestCase):
         ],
     )
     def test_init_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Checks eval_dataset handling: None stays None; dict-like inputs give a dict with keys data1 and data2; single
+        # datasets are stored as the same object. Inputs: eval_dataset_type (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         if eval_dataset_type == "none":
@@ -433,6 +501,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert trainer.eval_dataset is eval_dataset
 
     def test_iterable_dataset_requires_dispatch_batches_false(self):
+        # [FUNCTION DOC]
+        # Asserts a streaming train dataset with accelerator_config dispatch_batches True raises ValueError (iterable
+        # datasets require dispatch_batches False). Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # `dispatch_batches=True` is incompatible with iterable datasets (see get_train_dataloader).
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train", streaming=True)
 
@@ -448,6 +519,9 @@ class TestRLOOTrainer(TrlTestCase):
             )
 
     def test_iterable_dataset_forces_num_workers_zero(self):
+        # [FUNCTION DOC]
+        # Asserts a streaming train dataset with dataloader_num_workers 4 has it forced to 0 (to keep generation groups
+        # together). Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # Multiple workers would shard and interleave the repeated stream, splitting num_generations groups, so
         # `dataloader_num_workers` is forced to 0 for iterable datasets.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train", streaming=True)
@@ -463,6 +537,10 @@ class TestRLOOTrainer(TrlTestCase):
         assert trainer.args.dataloader_num_workers == 0
 
     def test_iterable_eval_keeps_map_style_train_workers(self):
+        # [FUNCTION DOC]
+        # With a map-style train set, streaming eval set and 4 dataloader workers: asserts args keep 4 workers, the train
+        # dataloader has 4 workers, the eval dataloader has 0, and args still show 4 afterwards (override not persisted).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: builds dataloaders.
         # A map-style train set keeps its workers even when the eval set is iterable; the single-worker restriction is
         # scoped to the iterable eval loader and not persisted.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -501,6 +579,10 @@ class TestRLOOTrainer(TrlTestCase):
         ],
     )
     def test_evaluate_with_eval_dataset(self, eval_dataset_type):
+        # [FUNCTION DOC]
+        # Asserts evaluate accepts an eval dataset passed directly in six container forms (map/iterable, single, dataset
+        # dict, plain dict), yielding eval_loss or eval_data1_loss and eval_data2_loss.
+        # Inputs: eval_dataset_type (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: none.
         # `evaluate` accepts a dataset passed directly, not only an `eval_dataset` set at init. Iterable datasets passed
         # this way must still be configured for the iterable path, since they are absent at init.
         train_dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -540,6 +622,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert metrics["eval_data2_loss"] is not None
 
     def test_train_multiple_iterations(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with num_iterations 2 (reusing each generation batch twice).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -571,6 +656,9 @@ class TestRLOOTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_init_is_seeded(self):
+        # [FUNCTION DOC]
+        # Builds two LoRA trainers after different global torch seeds and asserts identical non-empty lora_A weights.
+        # Requires peft. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: changes the global seed.
         # Two trainers with the same seed start from the same adapter weights
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         adapters = []
@@ -591,6 +679,9 @@ class TestRLOOTrainer(TrlTestCase):
 
     @require_peft
     def test_train_peft_config(self):
+        # [FUNCTION DOC]
+        # Runs the PEFT train check passing a float32 model instance plus a default LoraConfig. Requires peft.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -628,6 +719,10 @@ class TestRLOOTrainer(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_peft_and_quantization(self):
+        # [FUNCTION DOC]
+        # With peft and bitsandbytes, loads the model id in 4-bit NF4 double-quant (bf16 compute) with LoRA; asserts
+        # 4-bit loading, trains, and asserts LoRA parameters are bfloat16 and changed (base params unchecked).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -674,6 +769,10 @@ class TestRLOOTrainer(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_peft_dora_and_quantization(self):
+        # [FUNCTION DOC]
+        # Same as the 4-bit LoRA test with DoRA: lora_magnitude_vector parameters must stay float32 and change, other
+        # LoRA parameters must be bfloat16 and change. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -724,6 +823,10 @@ class TestRLOOTrainer(TrlTestCase):
 
     @require_peft
     def test_peft_lm_head_raises(self):
+        # [FUNCTION DOC]
+        # Asserts a LoRA config targeting lm_head (plus q_proj, v_proj) raises ValueError mentioning lm_head, since the
+        # chunked projection reads lm_head weights directly. Sets ensure_weight_tying only for peft versions from 0.19.0
+        # up to before 0.19.2.dev0. Requires peft. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # The chunked projection reads `lm_head.weight` directly, so a LoRA adapter on `lm_head` is silently
         # ignored and never trained. The trainer must fail fast instead of training a silently-frozen head (#4612).
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype="float32")
@@ -749,6 +852,10 @@ class TestRLOOTrainer(TrlTestCase):
 
     @require_peft
     def test_train_peft_model(self):
+        # [FUNCTION DOC]
+        # Trains an already-wrapped PEFT model (default LoRA) with the small RL config; base parameters unchanged and
+        # all others except base_layer and ref adapter parameters changed. Requires peft. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
         lora_config = LoraConfig()
@@ -786,6 +893,10 @@ class TestRLOOTrainer(TrlTestCase):
 
     @require_peft_target_parameters
     def test_train_moe_peft_model(self):
+        # [FUNCTION DOC]
+        # Regression for issue 5222 on tiny GPT-OSS with LoRA target_parameters on expert weights: asserts a ref adapter
+        # exists in peft_config for peft 0.20.0 or newer and is absent before; then the same check as
+        # test_train_peft_model. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Regression test for https://github.com/huggingface/trl/issues/5222. Before PEFT 0.20.0, only one adapter per
         # model was supported when the LoRA config uses `target_parameters` (see peft#3340, fixed in peft#3350), so no
         # "ref" adapter could be created and the reference log probs were computed with adapters disabled instead.
@@ -834,6 +945,10 @@ class TestRLOOTrainer(TrlTestCase):
     # PEFT + gradient checkpointing, which has caused issues in the past.
     @require_peft
     def test_train_peft_with_gradient_checkpointing(self):
+        # [FUNCTION DOC]
+        # Runs the PEFT train check with a model instance, LoraConfig and gradient_checkpointing explicitly True
+        # (regression guard). Requires peft. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         model = AutoModelForCausalLM.from_pretrained("trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -871,6 +986,9 @@ class TestRLOOTrainer(TrlTestCase):
 
     @require_torch_accelerator
     def test_train_with_fp16(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with fp16; requires an accelerator. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -901,6 +1019,11 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_different_reward_model(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on conversational prompts with a tiny Llama sequence-classification reward model
+        # and its own tokenizer passed via reward_processing_classes, using a dedicated pad token (not eos) so reward
+        # scoring picks the correct last token. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         # Use a reward model different from the model: different chat template, tokenization, etc.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
         reward_model_id = "trl-internal-testing/tiny-LlamaForSequenceClassification-3.2"
@@ -940,10 +1063,15 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_reward_func_standard(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with a Python reward function on standard-format completions.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Test if trainer can handle reward function with standard format
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the character length of each completion as a float. Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion)) for completion in completions]
 
@@ -974,10 +1102,16 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_reward_func_conversational(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with a reward function on conversational completions.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Test if trainer can handle reward function with conversational format
         dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that gives higher scores to longer completion content."""
             completion_contents = [completion[0]["content"] for completion in completions]
             return [float(len(content)) for content in completion_contents]
@@ -1009,14 +1143,22 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_multiple_reward_funcs(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with two reward functions (length and unique-character count).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Test that RLOOTrainer can be instantiated with multiple reward functions
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def reward_func1(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns each completion length as a float. Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion)) for completion in completions]
 
         def reward_func2(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the number of distinct characters per completion as a float. Exceptions: none.
+            # Side effects: none.
             """Reward function that rewards completions with more unique letters."""
             return [float(len(set(completion))) for completion in completions]
 
@@ -1047,25 +1189,41 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_sync_and_async_reward_funcs(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with two sync reward functions, an async function and an instance of an async
+        # callable class, verifying mixed sync/async rewards are supported. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Test that RLOOTrainer can be instantiated with multiple reward functions, one of which is async, in both the
         # function and the callable class form.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def sync_reward_func1(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns each completion length as a float. Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion)) for completion in completions]
 
         def sync_reward_func2(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the integer 1 for every completion. Exceptions: none. Side effects: none.
             return [1 for _ in completions]
 
         async def async_reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Coroutine returning the distinct-character count per completion as a float. Exceptions: none.
+            # Side effects: none.
             """Async Reward function that rewards completions with more unique letters."""
             return [float(len(set(completion))) for completion in completions]
 
         class AsyncCallableReward:
+            # [CLASS DOC]
+            # HELPER: Reward written as a class whose instances are awaited when called; no state.
             """Async reward function written as a callable class."""
 
             async def __call__(self, completions, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Coroutine returning the number of spaces in each completion as a float.
+                # Inputs: completions, keyword arguments. Outputs: list of floats. Exceptions: none. Side effects: none.
                 return [float(completion.count(" ")) for completion in completions]
 
         training_args = RLOOConfig(
@@ -1095,14 +1253,22 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_multiple_reward_funcs_with_None_output(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check (on parameters requiring grad) with one applicable reward and one returning None
+        # for every sample, verifying None rewards are tolerated. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         """Test that a valid math reward function is processed correctly while the code reward function returns None."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def applicable_reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns each completion length as a float. Exceptions: none. Side effects: none.
             """A reward function that rewards longer completions."""
             return [float(len(completion)) for completion in completions]
 
         def non_applicable_reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns a list of None, one per completion. Exceptions: none. Side effects: none.
             """A reward function that returns None for all inputs, as it is not applicable to this sample."""
             return [None] * len(completions)
 
@@ -1139,14 +1305,22 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_multiple_reward_funcs_with_weights(self):
+        # [FUNCTION DOC]
+        # Trains with two reward functions and reward_weights 0.7 and 0.3; asserts train_loss and per-function
+        # rewards/NAME/mean and rewards/NAME/std metrics are in the last log entry, and all parameters changed.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         """Test that RLOOTrainer can handle multiple reward functions with weights."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def reward_func1(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns each completion length as a float. Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion)) for completion in completions]
 
         def reward_func2(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the distinct-character count per completion as a float. Exceptions: none. Side effects: none.
             """Reward function that rewards completions with more unique letters."""
             return [float(len(set(completion))) for completion in completions]
 
@@ -1183,13 +1357,21 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_reward_metric_reflects_reward_weights(self):
+        # [FUNCTION DOC]
+        # With constant rewards 1.0 and 0.0 weighted 0.7 and 0.3, asserts the logged reward metric is 0.7 (within 1e-5),
+        # i.e. weighted rather than an unweighted sum. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         """Test that the logged 'reward' metric uses reward_weights, not an unweighted sum."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def constant_reward_1(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns 1.0 for every completion. Exceptions: none. Side effects: none.
             return [1.0] * len(completions)
 
         def constant_reward_0(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns 0.0 for every completion. Exceptions: none. Side effects: none.
             return [0.0] * len(completions)
 
         training_args = RLOOConfig(
@@ -1220,10 +1402,15 @@ class TestRLOOTrainer(TrlTestCase):
         )
 
     def test_train_multiple_mixed_reward_funcs(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with a mix of a Python reward function and a reward model id.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Test if the trainer can handle a mix of reward functions and reward models
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns each completion length as a float. Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion)) for completion in completions]
 
@@ -1254,6 +1441,10 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_reward_func_additional_column(self):
+        # [FUNCTION DOC]
+        # Adds a some_values column (row index) and runs the standard train check with a reward that consumes it,
+        # verifying extra dataset columns are forwarded to reward functions as keyword arguments.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Test if trainer can handle reward function that rely on additional columns in the dataset
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -1262,6 +1453,10 @@ class TestRLOOTrainer(TrlTestCase):
         dataset = dataset.add_column("some_values", some_values)
 
         def reward_func(completions, some_values, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the absolute difference between each completion length and its some_values entry, as floats.
+            # Inputs: completions, some_values, keyword arguments. Exceptions: ValueError if lengths differ (strict zip).
+            # Side effects: none.
             """Reward function that rewards completions with lengths closer to the values in some_values."""
             return [
                 float(abs(len(completion) - value)) for completion, value in zip(completions, some_values, strict=True)
@@ -1294,6 +1489,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_ref_model_like_model_instance(self):
+        # [FUNCTION DOC]
+        # With beta 0.1 and a bfloat16 eager-attention model instance, asserts the built ref_model has bfloat16 dtype and
+        # eager attention. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # A policy passed as an instance has no `model_init_kwargs`: the reference is built with its dtype and attention
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         model = AutoModelForCausalLM.from_pretrained(
@@ -1315,6 +1513,10 @@ class TestRLOOTrainer(TrlTestCase):
         assert trainer.ref_model.config._attn_implementation == "eager"
 
     def test_train_with_sync_ref_model(self):
+        # [FUNCTION DOC]
+        # With beta 0.1 and sync_ref_model True, asserts a ref model exists and that after training both policy and
+        # reference parameters changed (reference synced from the policy). Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -1351,6 +1553,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(previous_ref_params[n], new_ref_param), f"Ref Parameter {n} has not changed."
 
     def test_train_beta_zero(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with beta 0.0 (no reference model / KL term).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         training_args = RLOOConfig(
             output_dir=self.tmp_dir,
@@ -1380,6 +1585,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_pad_to_multiple_of(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with pad_to_multiple_of 8. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -1411,6 +1619,9 @@ class TestRLOOTrainer(TrlTestCase):
 
     @require_vllm
     def test_train_vllm(self):
+        # [FUNCTION DOC]
+        # Requires vLLM. Runs the standard train check with use_vllm True on Qwen2.5-0.5B-Instruct (tiny models are too
+        # small for vLLM). Inputs/Outputs: none. Exceptions: AssertionError. Side effects: downloads a model, uses GPU.
         """Test that training works with vLLM for generation."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -1445,6 +1656,10 @@ class TestRLOOTrainer(TrlTestCase):
     @require_vllm
     @pytest.mark.skip(reason="We should add a mock for the vLLM server.")
     def test_train_vllm_and_peft(self):
+        # [FUNCTION DOC]
+        # Currently skipped (needs a vLLM server mock). Would train Qwen2.5-0.5B with vLLM and LoRA on all-linear
+        # modules plus modules_to_save embed_tokens and lm_head; base parameters unchanged, others except base_layer and
+        # original_module changed. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none while skipped.
         """Test that training works with vLLM for generation."""
         model = AutoModelForCausalLM.from_pretrained(
             "Qwen/Qwen2.5-0.5B-Instruct", dtype="float32"
@@ -1492,6 +1707,10 @@ class TestRLOOTrainer(TrlTestCase):
     @require_vllm
     @pytest.mark.skip(reason="We should add a mock for the vLLM server.")
     def test_train_vllm_structured_outputs(self):
+        # [FUNCTION DOC]
+        # Currently skipped (needs a vLLM server mock). Would run the standard train check with vLLM constrained by a
+        # reasoning/answer regex via vllm_structured_outputs_regex. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: none while skipped.
         """Test that training works with vLLM for generation with structured outputs."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -1524,6 +1743,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_additional_generation_kwargs(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with top_p 0.9, top_k 10, min_p 0.01 and repetition_penalty 1.1.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         """Test that training works with additional generation kwargs."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -1561,6 +1783,9 @@ class TestRLOOTrainer(TrlTestCase):
     @require_vllm
     @pytest.mark.skip(reason="We should add a mock for the vLLM server.")
     def test_train_vllm_with_additional_generation_kwargs(self):
+        # [FUNCTION DOC]
+        # Currently skipped (needs a vLLM server mock). Same sampling kwargs as the previous test but generating with
+        # vLLM. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none while skipped.
         """Test that training works with vLLM and additional generation kwargs."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -1607,6 +1832,10 @@ class TestRLOOTrainer(TrlTestCase):
         "newer GPU, or XPU (see https://github.com/huggingface/transformers/issues/47926)",
     )
     def test_train_with_transformers_continuous_batching(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check for 2 steps with use_transformers_continuous_batching on small Qwen3 (head size
+        # compatible with Flash Attention). Skipped before transformers 5.8.0 or without an Ampere-or-newer GPU or XPU.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -1638,6 +1867,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_normalized_advantages(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with normalize_advantages True. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -1668,6 +1900,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_clipped_rewards(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with reward_clip_range from -1 to 1. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -1699,12 +1934,21 @@ class TestRLOOTrainer(TrlTestCase):
 
     @patch("transformers.generation.utils.GenerationMixin.generate")
     def test_train_with_mask_truncated_completions(self, mock_generate):
+        # [FUNCTION DOC]
+        # Patches GenerationMixin.generate to return three fixed 8-token completions (one with no eos, one with eos then
+        # padding, one with eos as last token) so some completions are not truncated; runs the standard train check with
+        # mask_truncated_completions True. Inputs: mock_generate (patched mock). Outputs: none.
+        # Exceptions: AssertionError. Side effects: generate patched during the test.
         """Test that training works with mask_truncated_completions=True parameter."""
 
         # We mock the generate method because the model's random weights make it extremely unlikely to produce a
         # sequence containing the EOS token within the allowed max_completion_length. As a result, all tokens are
         # masked in the loss, the model doesn't update, and the final check (which verifies the update) fails.
         def fake_generate(input_ids, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Appends a fixed 3x8 completion tensor (on the input device) to input_ids along the sequence dimension.
+            # Assumes a generation batch of exactly 3 rows. Inputs: input_ids, other kwargs ignored.
+            # Outputs: concatenated tensor. Exceptions: shape errors if batch is not 3. Side effects: none.
             # pad_token_id = 151643; eos_token_id = 151645
             completion_ids = torch.tensor(
                 [
@@ -1748,6 +1992,10 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_mask_truncated_completions_all_masked(self):
+        # [FUNCTION DOC]
+        # With mask_truncated_completions True and an untrained model that almost never emits eos, asserts train_loss is
+        # logged and every parameter is unchanged (no learning signal). Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         """
         Test that when all generated completions are truncated (i.e., none contain an EOS token), and
         mask_truncated_completions=True, the model receives no effective learning signal and therefore does not update
@@ -1786,10 +2034,16 @@ class TestRLOOTrainer(TrlTestCase):
             assert torch.equal(param, new_param), f"Parameter {n} has changed."
 
     def test_warning_raised_all_rewards_none(self, caplog):
+        # [FUNCTION DOC]
+        # With a reward function returning None for everything, asserts training logs a WARNING from
+        # trl.trainer.rloo_trainer containing "All reward functions returned None for the following kwargs:".
+        # Inputs: caplog (pytest fixture). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         """Test that a proper warning is raised when all rewards are None."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def always_none_reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns None for every completion. Exceptions: none. Side effects: none.
             """Reward function that always returns None."""
             return [None] * len(completions)
 
@@ -1815,6 +2069,9 @@ class TestRLOOTrainer(TrlTestCase):
         assert expected_warning in caplog.text
 
     def test_train_num_generations_larger_than_batch_size(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with num_generations 6 larger than the per-device batch, made valid by
+        # gradient_accumulation_steps 2. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -1845,6 +2102,10 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_multiple_dataloader_workers(self):
+        # [FUNCTION DOC]
+        # Forces the torch multiprocessing spawn start method and runs the standard train check with 2 dataloader
+        # workers. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: changes the global multiprocessing start method; writes tmp_dir.
         # Pytest/CI often starts background threads before tests run. With Python 3.12, using the default "fork" start
         # method in a multi-threaded process emits a DeprecationWarning and may deadlock.
         #
@@ -1886,6 +2147,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_generation_kwargs(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check with generation_kwargs (sampling, top_k 50, 2 beams, length_penalty -0.1).
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -1917,9 +2181,15 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_reward_func_accessing_trainer_state(self):
+        # [FUNCTION DOC]
+        # Trains with a reward function that asserts a trainer_state keyword is passed and has global_step; passes if no
+        # exception. Inputs/Outputs: none. Exceptions: AssertionError from within training. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Asserts trainer_state kwarg is present with global_step, returns distinct-character counts as floats.
+            # Exceptions: AssertionError. Side effects: none.
             trainer_state = kwargs.get("trainer_state")
             assert trainer_state is not None
             # transformers.TrainerState instance should have a `global_step` property.
@@ -1942,9 +2212,16 @@ class TestRLOOTrainer(TrlTestCase):
         trainer.train()
 
     def test_train_reward_func_with_log_extra(self):
+        # [FUNCTION DOC]
+        # With log_completions True, trains with a reward function that calls the log_extra callback; asserts test_column
+        # appears in the trainer's extra logs. Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Asserts log_extra is provided, logs the first 5 characters of each completion under test_column, and
+            # returns completion lengths as floats. Exceptions: AssertionError. Side effects: writes to trainer extra logs.
             log_extra = kwargs.get("log_extra")
             assert log_extra is not None
             log_extra("test_column", [completion[:5] for completion in completions])
@@ -1968,9 +2245,15 @@ class TestRLOOTrainer(TrlTestCase):
         assert "test_column" in trainer._logs["extra"]
 
     def test_train_reward_func_with_log_metric(self):
+        # [FUNCTION DOC]
+        # Trains with a reward function calling the log_metric callback; asserts custom_accuracy appears in some log
+        # entry. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Asserts log_metric is provided, logs custom_accuracy 0.75, and returns completion lengths as floats.
+            # Exceptions: AssertionError. Side effects: records a trainer metric.
             log_metric = kwargs.get("log_metric")
             assert log_metric is not None
             log_metric("custom_accuracy", 0.75)
@@ -1995,6 +2278,12 @@ class TestRLOOTrainer(TrlTestCase):
         assert "custom_accuracy" in logged_keys
 
     def test_prepare_input_called_with_correct_data(self):
+        # [FUNCTION DOC]
+        # With batch 6, steps_per_generation 4, num_generations 4, num_iterations 2, gradient accumulation 3 and no
+        # shuffling, wraps training_step with a spy and trains. Asserts 48 calls (3 epochs x 2 iterations x 2
+        # generation batches x 4 steps) and that the first 8 calls receive the first generation batch (6 prompts each
+        # repeated 4 times, in dataset order) and calls 8 to 15 the second generation batch.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: training_step patched during training.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         training_args = RLOOConfig(
             output_dir=self.tmp_dir,
@@ -2046,6 +2335,12 @@ class TestRLOOTrainer(TrlTestCase):
                 assert mock_prepare.call_args_list[i].args[1] == expected_second_generation_batch
 
     def test_train_stops_on_every_eos_token_id(self):
+        # [FUNCTION DOC]
+        # With tiny Phi-3.5 (whose generation config, not tokenizer, lists the end-of-turn token 32007 as eos), asserts
+        # 32007 is in generation_config.eos_token_id; patches model.generate to append a 4-token completion with 32007 in
+        # second position; after training asserts completions/mean_length is 2.0 and completions/clipped_ratio is 0.0
+        # (cut after the eos and counted as terminated). Inputs/Outputs: none. Exceptions: AssertionError.
+        # Side effects: generate patched during training.
         # Phi-3.5 ends a turn with `<|end|>`, which only its generation config declares as eos, not its tokenizer
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -2065,6 +2360,9 @@ class TestRLOOTrainer(TrlTestCase):
         assert 32007 in trainer.generation_config.eos_token_id  # `<|end|>`
 
         def fake_generate(input_ids, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Appends the fixed token ids for Blue, end-of-turn, and, green to every row of input_ids along the last
+            # dimension. Inputs: input_ids, kwargs ignored. Outputs: tensor. Exceptions: none. Side effects: none.
             # 'Blue<|end|>and green': the turn ends on `<|end|>`, and generation goes on after it
             completion_ids = torch.tensor([[10924, 32007, 322, 7933]] * input_ids.shape[0], device=input_ids.device)
             return torch.cat([input_ids, completion_ids], dim=-1)
@@ -2077,6 +2375,9 @@ class TestRLOOTrainer(TrlTestCase):
         assert trainer.state.log_history[-1]["completions/clipped_ratio"] == 0.0
 
     def test_train_with_chat_template_kwargs(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on tiny Qwen3 with conversational prompts and chat_template_kwargs
+        # enable_thinking False. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen", "conversational_prompt_only", split="train")
 
         training_args = RLOOConfig(
@@ -2107,6 +2408,9 @@ class TestRLOOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_mismatched_reward_processing_classes_length(self):
+        # [FUNCTION DOC]
+        # Asserts two reward model ids with a single reward processing class raises ValueError containing must match.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test that mismatched length between reward_funcs and reward_processing_classes raises error."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -2133,6 +2437,9 @@ class TestRLOOTrainer(TrlTestCase):
             )
 
     def test_correct_reward_processing_classes_list(self):
+        # [FUNCTION DOC]
+        # Asserts two reward models with a list of two tokenizers yields reward_processing_classes of length 2.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test that correct list of reward_processing_classes works properly."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -2164,6 +2471,9 @@ class TestRLOOTrainer(TrlTestCase):
         assert len(trainer.reward_processing_classes) == len(reward_models)
 
     def test_single_reward_model_with_single_processing_class(self):
+        # [FUNCTION DOC]
+        # Asserts one reward model with a single tokenizer object yields a one-element list holding that tokenizer.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         """Test that single reward model with single processing class works."""
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
@@ -2189,11 +2499,17 @@ class TestRLOOTrainer(TrlTestCase):
         assert trainer.reward_processing_classes[0] == single_processing_class
 
     def test_pad_token_id_synced_with_model_config(self):
+        # [FUNCTION DOC]
+        # With tiny Mistral (no pad token, eos used instead) and a zero reward, asserts the pad id is set and matches
+        # model.config.pad_token_id and model.generation_config.pad_token_id. Inputs/Outputs: none.
+        # Exceptions: AssertionError. Side effects: none.
         # This model's tokenizer has no pad token, so the trainer falls back to the eos token. The model configs must
         # follow: otherwise `Trainer` realigns them at train time and reports it as a change the user did not make.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns 0.0 per completion. Exceptions: none. Side effects: none.
             return [0.0] * len(completions)
 
         training_args = RLOOConfig(output_dir=self.tmp_dir, report_to="none")
@@ -2210,6 +2526,10 @@ class TestRLOOTrainer(TrlTestCase):
         assert trainer.model.generation_config.pad_token_id == pad_token_id
 
     def test_reward_model_pad_token_id_synced_with_text_config(self):
+        # [FUNCTION DOC]
+        # With a composite Gemma3 sequence-classification reward model (num_labels 1) and its tokenizer with pad set to
+        # eos, asserts the reward pad id is set and equals the reward model text config pad_token_id.
+        # Inputs/Outputs: none. Exceptions: AssertionError. Side effects: mutates the reward model config.
         # A composite reward model resolves the pad token through its text config, not the top-level one.
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
         reward_model = AutoModelForSequenceClassification.from_pretrained(
@@ -2236,6 +2556,10 @@ class TestRLOOTrainer(TrlTestCase):
 
 @require_vision
 class TestRLOOTrainerVLM(TrlTestCase):
+    # [CLASS DOC]
+    # RLOOTrainer tests on tiny vision-language models with zen-image / zen-multi-image conversational prompt-only
+    # datasets (requires vision extras). Most use a length-based reward on the first message content, lr 0.1, batch
+    # 2 and num_generations 2. Uses the standard and PEFT train checks described on TestRLOOTrainer.
     @pytest.mark.parametrize(
         "model_id",
         [
@@ -2269,9 +2593,17 @@ class TestRLOOTrainerVLM(TrlTestCase):
         ],
     )
     def test_train_vlm(self, model_id):
+        # [FUNCTION DOC]
+        # Runs the standard train check for each listed VLM (Gemma3/4, InternVL, LLaVA-Next, Qwen2/2.5-VL, Qwen3.5 dense
+        # and MoE; newer ones skipped on old transformers), except that for LLaVA models vision encoder layers.1 and
+        # post_layernorm must stay unchanged. Inputs: model_id (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each conversational completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion[0]["content"])) for completion in completions]
 
@@ -2312,6 +2644,9 @@ class TestRLOOTrainerVLM(TrlTestCase):
                 assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_generation_suppresses_image_token(self):
+        # [FUNCTION DOC]
+        # With Gemma3, asserts generation_config.suppress_tokens is exactly the config image_token_id (not the
+        # processor's). Inputs/Outputs: none. Exceptions: AssertionError. Side effects: none.
         # Gemma3: its processor's `image_token_id` is not the placeholder token, unlike its config's
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
         training_args = RLOOConfig(output_dir=self.tmp_dir, report_to="none")
@@ -2325,11 +2660,17 @@ class TestRLOOTrainerVLM(TrlTestCase):
         assert trainer.generation_config.suppress_tokens == [trainer.model.config.image_token_id]
 
     def test_train_vlm_with_pad_to_multiple_of(self):
+        # [FUNCTION DOC]
+        # Runs the standard train check on Gemma3 with pad_to_multiple_of 7, verifying extra inputs such as
+        # token_type_ids are padded too. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         # Models like Gemma3 use other forward keyword arguments like token_type_ids that also need to be padded when
         # using pad_to_multiple_of, so we test that the trainer correctly pads all the necessary inputs in this case.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each conversational completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion[0]["content"])) for completion in completions]
 
@@ -2368,9 +2709,15 @@ class TestRLOOTrainerVLM(TrlTestCase):
         ],
     )
     def test_train_vlm_beta_non_zero(self, model_id):
+        # [FUNCTION DOC]
+        # Runs the standard train check on Qwen2.5-VL with beta 0.1 (reference model used).
+        # Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each conversational completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion[0]["content"])) for completion in completions]
 
@@ -2410,11 +2757,17 @@ class TestRLOOTrainerVLM(TrlTestCase):
     )
     @require_peft
     def test_train_vlm_peft(self, model_id):
+        # [FUNCTION DOC]
+        # Runs the PEFT train check on a float32 Qwen2.5-VL instance with LoRA on q_proj and v_proj. Requires peft.
+        # Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         model = AutoModelForImageTextToText.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each conversational completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion[0]["content"])) for completion in completions]
 
@@ -2458,9 +2811,16 @@ class TestRLOOTrainerVLM(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_vlm_peft_and_quantization(self, model_id):
+        # [FUNCTION DOC]
+        # Loads Qwen2.5-VL by id in 4-bit NF4 (bf16 compute) with LoRA on q_proj and v_proj; asserts 4-bit loading and
+        # that LoRA parameters are bfloat16 and changed. Requires peft and bitsandbytes.
+        # Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each conversational completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion[0]["content"])) for completion in completions]
 
@@ -2515,9 +2875,16 @@ class TestRLOOTrainerVLM(TrlTestCase):
     @require_peft
     @require_bitsandbytes
     def test_train_vlm_peft_dora_and_quantization(self, model_id):
+        # [FUNCTION DOC]
+        # Same as the 4-bit VLM LoRA test with DoRA: magnitude vectors stay float32 and change, other LoRA parameters are
+        # bfloat16 and change. Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each conversational completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion[0]["content"])) for completion in completions]
 
@@ -2585,9 +2952,16 @@ class TestRLOOTrainerVLM(TrlTestCase):
     @require_vllm
     @pytest.mark.skip(reason="We should add a mock for the vLLM server.")
     def test_train_vlm_and_vllm(self, model_id) -> None:
+        # [FUNCTION DOC]
+        # Currently skipped (needs a vLLM server mock). Would run the standard train check for Qwen2.5-VL, Gemma3 and
+        # Gemma4 using vLLM in server mode. Inputs: model_id (str, parametrized). Outputs: none.
+        # Exceptions: AssertionError. Side effects: none while skipped.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each conversational completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion[0]["content"])) for completion in completions]
 
@@ -2629,9 +3003,17 @@ class TestRLOOTrainerVLM(TrlTestCase):
         ],
     )
     def test_train_vlm_multi_image(self, model_id):
+        # [FUNCTION DOC]
+        # On the multi-image dataset (some samples without images) for Idefics3, LLaVA, LLaVA-Next and Qwen2.5-VL:
+        # asserts ddp_find_unused_parameters is enabled, then the standard train check with the LLaVA frozen-layer
+        # exception. Inputs: model_id (str, parametrized). Outputs: none. Exceptions: AssertionError.
+        # Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-multi-image", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each conversational completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion[0]["content"])) for completion in completions]
 
@@ -2673,9 +3055,15 @@ class TestRLOOTrainerVLM(TrlTestCase):
                 assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_vlm_log_multimodal_false(self):
+        # [FUNCTION DOC]
+        # Trains Gemma3 with log_completions True and log_multimodal False and asserts no images were logged in the
+        # trainer's internal logs. Inputs/Outputs: none. Exceptions: AssertionError. Side effects: writes tmp_dir.
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_prompt_only", split="train")
 
         def reward_func(completions, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the length of the first message content of each conversational completion as a float.
+            # Exceptions: none. Side effects: none.
             """Reward function that rewards longer completions."""
             return [float(len(completion[0]["content"])) for completion in completions]
 

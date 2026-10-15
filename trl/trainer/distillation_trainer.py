@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# On-policy knowledge distillation trainer (On-Policy Distillation of Language Models, paper 2306.13649).
+# Contents: _chunked_divergence_loss (memory-efficient generalized JSD between student and teacher computed from
+# hidden states and lm_head weights, tiled by ChunkedDivergenceFunction) and DistillationTrainer.
+# Flow: the student generates completions for dataset prompts (transformers generate or vLLM, optional
+# multi-turn tool calling); both models run their backbones on prompt plus completion; the loss is the
+# generalized JSD (interpolated by beta) over completion tokens, never materializing full vocab logits.
+# Self-contained by design: generation, tool loop, dataloader and logging code mirror GRPO/RLOO.
+# Import-time side effects: imports peft, trackio, wandb when available; creates an accelerate logger.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -114,6 +124,21 @@ def _chunked_divergence_loss(
     teacher_final_logit_softcapping: float | None = None,
     temperature: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Computes the per-batch generalized JSD loss from hidden states without full logits.
+    # Behavior: under FSDP2, if a lm_head weight is a DTensor it is gathered once into a full tensor (cast to the
+    # matching hidden-state dtype; bias gathered too) so chunks do not re-gather. Flattens batch and sequence
+    # dims of each model's hidden states (each with its own hidden width), builds the validity mask from
+    # completion_mask. On Triton-capable devices keeps only valid rows ("compact"); elsewhere (e.g. Neuron)
+    # projects all rows to keep shapes static and zeroes invalid positions afterwards. ChunkedDivergenceFunction
+    # returns per-token divergence and per-token student entropy, given weights, biases, beta, temperature, logit
+    # scales and final logit softcapping for each side. Loss = sum of divergences divided by num_items_in_batch
+    # (moved to the loss device if a tensor) or, if None, by the number of valid positions clamped to at least 1.
+    # Inputs: student/teacher hidden states (B, K, H_s / H_t), lm_head weights (V, H), completion_mask (B, K),
+    # beta, num_items_in_batch, optional biases, logit scales (default 1.0), softcapping values, temperature (1.0).
+    # Outputs: tuple (scalar loss, local entropy sum in nats, local count of valid positions).
+    # Exceptions: shape mismatches propagate from the kernel.
+    # Side effects: FSDP all-gather when DTensor weights are used.
     """
     Memory-efficient generalized JSD over student/teacher hidden states and their `lm_head` weights.
 
@@ -214,6 +239,21 @@ def _chunked_divergence_loss(
 
 
 class DistillationTrainer(_BaseTrainer):
+    # [CLASS DOC]
+    # Trainer (inherits _BaseTrainer) for on-policy distillation of a student toward a teacher sharing the same
+    # vocabulary. Class attributes: loss_is_scaled_for_ga True (compute_loss divides by global token count),
+    # _tag_names ["trl", "distillation"], _name "Distillation", _paper (title, id, BibTeX).
+    # Key state: model (student, possibly PEFT), teacher_model (prepared via DeepSpeed or accelerator in eval
+    # mode, or None for subclasses with remote teachers), _tokenizer, _is_vlm, eos_token_ids, image/video pad
+    # token ids, tools / _tool_dict / chat_template, beta, sampling settings, generation_config and
+    # generation_kwargs, vllm_generation (when use_vllm) and _last_loaded_step, _step (micro-step counter),
+    # _buffered_inputs (generation batch split into accumulation slices), _metrics per mode, _logs deques of
+    # prompts/completions, _dist (DistributedBackend), _forward_redirection.
+    # Method flow: get_train_dataloader yields a generation batch (per-device batch times grad-accum steps) with
+    # RepeatSampler; _prepare_inputs generates once per accumulation window via _generate_and_score_completions
+    # (which uses _generate, _tokenize_prompts, _generate_single_turn, _tool_call_loop) and buffers slices;
+    # compute_loss/_compute_loss compute the chunked JSD; training_step tracks timing; log averages metrics and
+    # writes completion tables; _save_checkpoint also writes the model card.
     """
     Trainer for knowledge distillation. The student is trained on-policy — it generates the completions itself — to
     match the teacher's next-token distribution under a generalized Jensen-Shannon divergence (interpolating forward
@@ -331,6 +371,49 @@ class DistillationTrainer(_BaseTrainer):
         peft_config: "PeftConfig | None" = None,
         tools: list[Callable] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior, in order:
+        # - Default args: DistillationConfig with output dir "<model basename>-Distillation".
+        # - set_seed(args.seed) before creating the model (PEFT init reproducibility). Copies model_init_kwargs and
+        #   teacher_model_init_kwargs.
+        # - Student from string: inject quantization_config (error if also in model_init_kwargs), device_map None for
+        #   multi-GPU/DeepSpeed, default trust_remote_code, load with create_model_from_path. Instantiated model:
+        #   warn that model_init_kwargs / quantization_config are ignored. Detects 4/8-bit quantization.
+        # - Records forward signature keys (of the base model for PEFT) in model_kwarg_keys.
+        # - Processing class: AutoProcessor with left padding/truncation if not given; ProcessorMixin means VLM (uses
+        #   its tokenizer), tokenizer means text-only, else TypeError. For VLMs without reentrant checkpointing, sets
+        #   ddp_find_unused_parameters True when unset. Pad token defaults to EOS and is mirrored into model config and
+        #   generation config. eos_token_ids = all model generation EOS ids plus the tokenizer EOS (first).
+        # - VLM: resolves image pad token ("<|image_pad|>" or "<|image|>") and video pad token ids.
+        # - Tools: require transformers 5.0.0+, jmespath on transformers without response templates, a tool-capable
+        #   chat template, and no async tools. Adds a response schema/template if missing (FutureWarning for legacy
+        #   schema only). Uses a prefix-preserving training chat template if the original is not prefix-preserving.
+        # - PEFT: requires peft, a PeftConfig, and a non-PEFT model; under ZeRO-3 with non-quantized models passes
+        #   autocast_adapter_dtype False; rejects prefix tuning on peft 0.17.1 or older with hf_device_map; wraps model.
+        #   PEFT plus ZeRO-3 plus checkpointing forces use_reentrant True (warns if user set False). Enables input
+        #   grads for PEFT plus checkpointing. For quantized models casts trainable non-DoRA-magnitude params to bf16.
+        #   Rejects PEFT adapters on lm_head and prompt-learning methods (the loss bypasses PeftModel.forward).
+        # - Teacher from string: dtype string converted to a torch dtype (except "auto"/None), revision default from
+        #   teacher_model_revision, device_map None when distributed, default trust_remote_code; instantiated teacher
+        #   plus teacher_model_init_kwargs is an error.
+        # - Iterable datasets: require dispatch_batches not True and force it False; iterable train forces
+        #   dataloader_num_workers 0 (warning). On transformers below 5.0.0 defaults use_reentrant False.
+        # - Calls Trainer init with identity collator. Rejects n_gpu > 1 (nn.DataParallel). Adds model tags.
+        # - Teacher: vocab sizes must match; prepared with DeepSpeed or accelerator (eval mode).
+        # - Optional dropout disabling; stores sampling settings; max_tool_calling_iterations defaults to
+        #   sys.maxsize. Device-specific reseed. Builds generation kwargs (max_new_tokens, sampling, pad/bos/eos,
+        #   temperature, top_p, top_k, min_p, repetition_penalty, cache_implementation; VLMs suppress the image token)
+        #   updated by args.generation_kwargs, and a GenerationConfig with compile disabled.
+        # - Metrics/logging state; completion deques sized to the global generation batch; creates
+        #   output_dir/completions on the main process when log_completions.
+        # - vLLM: requires vllm; builds VLLMGeneration with server/colocate settings, max_num_seqs = per-device batch
+        #   times TP size times grad-accum steps, sampling params, logprobs None; sets _last_loaded_step -1.
+        # Inputs: model, teacher_model, args, train_dataset, eval_dataset, processing_class, callbacks, optimizers,
+        # quantization_config, peft_config, tools.
+        # Outputs: none.
+        # Exceptions: ValueError, TypeError, ImportError for the invalid combinations listed above.
+        # Side effects: loads models (network/disk), mutates args fields, tokenizer pad token and model configs,
+        # creates directories, telemetry via base class.
         if args is None:
             model_name = model if isinstance(model, str) else get_config_model_id(model.config)
             model_name = model_name.split("/")[-1]
@@ -822,6 +905,9 @@ class DistillationTrainer(_BaseTrainer):
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
 
     def _set_signature_columns_if_needed(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets _signature_columns to "prompt", "image", "images" when unset so Trainer column removal keeps
+        # the raw prompt and image columns. Inputs: none. Outputs: none. Exceptions: none. Side effects: sets attribute.
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
         # By default, this method sets `self._signature_columns` to the model's expected inputs (usually, "input_ids"
         # and "attention_mask"). In DistillationTrainer, we preprocess data, so using the model's signature columns
@@ -838,6 +924,11 @@ class DistillationTrainer(_BaseTrainer):
     # batch size is multiplied by `gradient_accumulation_steps`, and iterable datasets are wrapped (see
     # `repeat_iterable_dataset`).
     def get_train_dataloader(self):
+        # [FUNCTION DOC]
+        # Behavior: copy of Trainer.get_train_dataloader with a batch size multiplied by gradient_accumulation_steps
+        # (a generation batch). For iterable datasets, optionally shuffles (buffered, seeded) and wraps the stream with
+        # repeat_iterable_dataset (batch = global generation batch, repeated grad-accum times) to emulate RepeatSampler.
+        # Inputs: none. Outputs: DataLoader. Exceptions: from Trainer internals. Side effects: none beyond building it.
         dataset = self.train_dataset
         if isinstance(dataset, IterableDataset):
             # Iterable datasets can't be indexed, so RepeatSampler can't be attached. Reproduce its ordering by
@@ -866,6 +957,11 @@ class DistillationTrainer(_BaseTrainer):
         )
 
     def _get_train_sampler(self, dataset: Dataset | None = None) -> Sampler:
+        # [FUNCTION DOC]
+        # HELPER: Returns a RepeatSampler over the dataset (default train_dataset) with mini_repeat_count 1, batch size
+        # equal to the global generation batch (per-device batch times processes times grad-accum), repeat_count equal
+        # to grad-accum steps, shuffle per shuffle_dataset and seed args.seed, so each generation batch is reused across
+        # the accumulation window. Inputs: dataset (optional). Outputs: Sampler. Exceptions: none. Side effects: none.
         # Repeat each generation batch `gradient_accumulation_steps` times so the completions generated once per
         # generation batch (see `_prepare_inputs`) are reused across the accumulation window. Distillation is n=1,
         # so there is no per-prompt repeat (`mini_repeat_count=1`).
@@ -888,6 +984,9 @@ class DistillationTrainer(_BaseTrainer):
         )
 
     def _get_eval_sampler(self, eval_dataset) -> Sampler:
+        # [FUNCTION DOC]
+        # HELPER: Returns a RepeatSampler over eval_dataset with mini_repeat_count 1 and seed args.seed (shuffled).
+        # Inputs: eval_dataset. Outputs: Sampler. Exceptions: none. Side effects: none.
         # See _get_train_sampler for an explanation of the sampler.
         return RepeatSampler(
             data_source=eval_dataset,
@@ -902,6 +1001,14 @@ class DistillationTrainer(_BaseTrainer):
     # Maintenance note: this method is a copy-paste of the original `Trainer.get_eval_dataloader`, with the iterable
     # wrapping as the only addition.
     def get_eval_dataloader(self, eval_dataset: str | Dataset | IterableDataset | None = None) -> DataLoader:
+        # [FUNCTION DOC]
+        # Behavior: copy of Trainer.get_eval_dataloader: errors without an eval dataset; returns a cached loader when
+        # persistent workers are enabled; resolves a named eval dataset. For iterable eval datasets: requires
+        # dispatch_batches not True, sets the accelerator dataloader dispatch_batches False, shuffles with the seed,
+        # wraps with repeat_iterable_dataset, and temporarily forces 0 workers (restored in finally).
+        # Inputs: eval_dataset (name, dataset or None). Outputs: DataLoader.
+        # Exceptions: ValueError for missing eval dataset or dispatch_batches True.
+        # Side effects: may cache the dataloader; mutates accelerator dataloader_config.
         if eval_dataset is None and self.eval_dataset is None:
             raise ValueError("Trainer: evaluation requires an eval_dataset.")
 
@@ -950,6 +1057,15 @@ class DistillationTrainer(_BaseTrainer):
                 self.args.dataloader_num_workers = num_workers
 
     def _tokenize_prompts(self, prompts: list):
+        # [FUNCTION DOC]
+        # HELPER: Tokenizes a batch of prompts for generation.
+        # Behavior: conversational prompts (detected from the first): for VLMs normalizes message contents to blocks;
+        # collects images from image content parts per prompt (None list when none at all); applies the chat template
+        # with tools, training chat template, generation prompt, tokenization and chat_template_kwargs (with padding
+        # on transformers 5.3.x as a workaround, then unpadded via the attention mask). Extra processor outputs
+        # (pixel_values, grid info, ...) are returned as multimodal fields. Standard text prompts are tokenized plainly.
+        # Inputs: prompts (list). Outputs: tuple (list of prompt id lists, images or None, multimodal fields dict).
+        # Exceptions: tokenizer/processor errors. Side effects: none.
         """Tokenize prompts and extract images/multimodal fields for generation."""
         if is_conversational({"prompt": prompts[0]}):
             # Normalize string content to content blocks for VLM processors that don't handle plain strings.
@@ -1001,6 +1117,20 @@ class DistillationTrainer(_BaseTrainer):
         return prompt_ids, images, multimodal_fields
 
     def _generate_single_turn(self, prompt_ids, images, multimodal_fields, has_tool_images=False):
+        # [FUNCTION DOC]
+        # HELPER: Generates one completion per prompt (n = 1).
+        # Behavior: vLLM path syncs weights into vLLM when global_step changed since the last sync (profiled), then
+        # generates from raw token ids with num_generations 1 and keeps only completion ids. Transformers path: left
+        # pads prompt ids and attention masks (pad_to_multiple_of honored), adds multimodal fields (tensors as is,
+        # per-token lists left-padded, others converted via numpy), and for VLM tool images builds a token type id
+        # tensor (1 for image pad, 2 for video pad) under mm_token_type_ids when image_grid_thw is present else
+        # token_type_ids; moves to device; generates without grad inside unwrap_model_for_generation (DeepSpeed-3
+        # gathering per ds3_gather_for_generation, generation_kwargs override) and summon_full_params; strips the
+        # prompt part, keeps tokens up to and including the first EOS (any of eos_token_ids), returns lists.
+        # Inputs: prompt_ids (list of id lists), images, multimodal_fields, has_tool_images (default False).
+        # Outputs: list of completion id lists.
+        # Exceptions: generation errors.
+        # Side effects: vLLM weight sync and _last_loaded_step update; profiling records.
         device = self.accelerator.device
 
         # Generate completions using either vLLM or regular generation
@@ -1100,6 +1230,15 @@ class DistillationTrainer(_BaseTrainer):
         return completion_ids
 
     def _get_tool_suffix_ids(self, tool_messages):
+        # [FUNCTION DOC]
+        # HELPER: Computes the token ids the chat template inserts for tool result messages plus the next generation
+        # prompt.
+        # Behavior: renders a dummy conversation (user, assistant with a tool call named after the first tool message)
+        # with and without the tool messages (generation prompt added only on the latter), normalized for VLMs and
+        # unbatched; trims the prefix after its last EOS token (templates that append a newline after EOS); verifies the
+        # prefix is a prefix of the full ids and returns the remaining ids.
+        # Inputs: tool_messages (list of tool message dicts, non-empty). Outputs: list of token ids.
+        # Exceptions: ValueError if the prefix check fails. Side effects: none.
         """Get token IDs for tool result formatting by using a minimal dummy conversation."""
         # Use the real tool name instead of a dummy: some templates (e.g. GPT-OSS) derive the tool response
         # header from the assistant's tool call name.
@@ -1152,6 +1291,26 @@ class DistillationTrainer(_BaseTrainer):
         return full_ids[len(prefix_ids) :]
 
     def _tool_call_loop(self, prompts, prompt_ids, completion_ids, completions, images, multimodal_fields):
+        # [FUNCTION DOC]
+        # HELPER: Executes tool calls and regenerates until no tool calls remain or max_tool_calling_iterations.
+        # Behavior per iteration, over samples whose last completion message has tool_calls:
+        # - Appends the assistant message to that sample's prompt (in place), executes each function call from
+        #   _tool_dict with its arguments (unknown tools, exceptions and non-function call types become
+        #   {"error": ...} results and count as failures), and appends tool messages (list results kept as content
+        #   blocks, collecting image parts into tool_images; others stringified) to prompt and completion.
+        # - Builds new ids by concatenating prompt ids, current completion ids and _get_tool_suffix_ids.
+        # - Drops (and rolls back the messages/images added this iteration for) samples whose completion part would
+        #   exceed max_completion_length or whose total length reaches the model max length (vLLM colocate engine
+        #   max_model_len, else config max_position_embeddings).
+        # - Selects images and multimodal fields for remaining samples (processing tool images with the image
+        #   processor for VLMs, or splitting/padding/reassembling original fields), then calls _generate_single_turn.
+        # - Truncates post-tool ids to keep the completion within max_completion_length; extends tool_mask with 0 for
+        #   tool-result tokens and 1 for new tokens; completion ids become everything after the prompt; parses new
+        #   outputs with parse_response and appends non-empty ones to completions; continues with those that call tools.
+        # Inputs: prompts, prompt_ids, completion_ids, completions (conversational lists), images, multimodal_fields.
+        # Outputs: tuple (tool_mask, completions, completion_ids, tool_call_count, tool_failure_count, tool_images).
+        # Exceptions: errors from tool suffix computation or generation (tool exceptions are caught).
+        # Side effects: mutates prompts, completions and completion_ids in place; runs user tool functions.
         # Tool execution loop: execute tools, then regenerate completions with tool results appended to the prompt
         tool_calls = [completion[0].get("tool_calls") for completion in completions]
         idxs_with_tool = [idx for idx, tool_call in enumerate(tool_calls) if tool_call]
@@ -1366,6 +1525,21 @@ class DistillationTrainer(_BaseTrainer):
         return tool_mask, completions, completion_ids, tool_call_count, tool_failure_count, tool_images
 
     def _generate(self, prompts: list):
+        # [FUNCTION DOC]
+        # HELPER: Full generation for a batch plus generation metrics.
+        # Behavior: deep-copies prompts, tokenizes, generates one turn. With tools: decodes completions (parse_response
+        # on transformers 5+ when a response template/schema exists, else plain assistant messages; plain strings for
+        # non-conversational prompts), runs _tool_call_loop and merges tool images into images. Gathers prompt and
+        # completion lengths (tool tokens excluded via tool_mask); raises if none. Metrics to _metrics[mode]:
+        # num_tokens (adds prompt plus completion tokens to state.num_input_tokens_seen in train mode),
+        # completions/mean_length, min_length, max_length, clipped_ratio (last token not EOS/pad), mean/min/max
+        # terminated length (zero when none terminated), and with tools tools/call_frequency (calls per sample) and
+        # tools/failure_frequency.
+        # Inputs: prompts (list). Outputs: tuple (prompt_ids, completion_ids, tool_mask or None, images, tool_images).
+        # Exceptions: RuntimeError when no completions were generated.
+        # Side effects: metrics and state.num_input_tokens_seen updates; collective gathers.
+        # KNOWN ISSUE: with tools and non-conversational prompts, completions are plain strings, but _tool_call_loop
+        # reads them as message lists (indexing the first element and calling get), which would fail.
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
@@ -1477,6 +1651,15 @@ class DistillationTrainer(_BaseTrainer):
         mm_token_type_ids=None,
         image_position_ids=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Runs the backbone (no lm_head) and returns completion-aligned hidden states.
+        # Behavior: unwraps PEFT to the underlying model; builds inputs from ids, mask and whichever multimodal fields
+        # are given (image_grid_thw only together with pixel_values); adds logits_to_keep + 1 if the forward accepts
+        # it; use_cache False. Backbone is model.model for VLMs on transformers below 5.0.0, else base_model. Drops the
+        # final position (next-token prediction) and keeps the last logits_to_keep positions.
+        # Inputs: unwrapped_model, input_ids, attention_mask, logits_to_keep, optional multimodal tensors.
+        # Outputs: tensor (B, logits_to_keep, H).
+        # Exceptions: model forward errors. Side effects: profiling record (decorator).
         if is_peft_model(unwrapped_model):
             unwrapped_model = unwrapped_model.base_model.model
 
@@ -1530,6 +1713,23 @@ class DistillationTrainer(_BaseTrainer):
 
     # Name kept aligned with GRPO/RLOO for consistency; distillation has no rewards, so nothing is actually scored.
     def _generate_and_score_completions(self, inputs: list[dict[str, torch.Tensor | Any]]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Builds a training batch from raw inputs (name aligned with GRPO; no rewards here).
+        # Behavior: extracts prompts and images ("images" column, or single "image" wrapped in a list; dropped when all
+        # empty); multimodal requires conversational prompts, which get images injected. Calls _generate, then pads
+        # prompts left and completions right (pad_to_multiple_of honored) with masks, tool_mask padded with 1.
+        # num_items_in_batch = global sum of the completion mask times tool mask. Multimodal forward kwargs: from the
+        # image processor when tool images exist on a VLM, else from the full processor on chat-templated text. Recovers
+        # per-sample tile counts for LFM2-VL (spatial_shapes, row/col info, thumbnails) and InternVL (4-D tile-indexed
+        # pixel_values). Extends token_type_ids / mm_token_type_ids with zeros for completion positions (left-padding
+        # them first when pad_to_multiple_of is set). With VLM tool images, rebuilds the type ids over prompt plus
+        # completion and, for image_grid_thw models, drops all images if any sample's image token count no longer
+        # matches its expected features (truncation). Optionally records decoded prompts/completions (gathered) in _logs.
+        # Inputs: inputs (list of dataset rows with "prompt" and optional "image"/"images").
+        # Outputs: dict with prompt_ids, prompt_mask, completion_ids, completion_mask, num_items_in_batch, available
+        # multimodal tensors, num_images / num_tiles (with images) and tool_mask (with tools).
+        # Exceptions: ValueError for multimodal non-conversational prompts.
+        # Side effects: generation, metrics, _logs updates, collectives.
         device = self.accelerator.device
 
         prompts = [x["prompt"] for x in inputs]
@@ -1757,6 +1957,13 @@ class DistillationTrainer(_BaseTrainer):
 
     @profiling_decorator
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
+        # [FUNCTION DOC]
+        # Behavior: in training, every gradient_accumulation_steps micro-steps (or when no buffer exists, e.g. after
+        # resume) generates for the whole generation batch, splits pixel values by grid, shuffles along the batch,
+        # splits into grad-accum slices (re-merging pixel values) and buffers them; returns the slice for
+        # _step modulo grad-accum. In eval generates directly for the batch.
+        # Inputs: generation_batch (list of rows). Outputs: dict batch for one micro-step.
+        # Exceptions: from generation. Side effects: updates _buffered_inputs; profiling record.
         # Prepares inputs for model training/evaluation by managing completion generation and batch handling.
         # During training:
         #   - Receives the local generation batch (Per-GPU batch size × gradient accumulation steps)
@@ -1789,6 +1996,14 @@ class DistillationTrainer(_BaseTrainer):
 
     @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # [FUNCTION DOC]
+        # Behavior: in training, replaces num_items_in_batch with the batch's generated-token count (clamped to at least
+        # 1) divided by the number of processes (compensates DDP gradient averaging). Runs _compute_loss through
+        # _forward_redirection on the wrapped model so DDP/FSDP hooks fire. Gathers entropy sum and valid-token count
+        # and appends mean entropy (0 when no tokens) to _metrics[mode]["entropy"].
+        # Inputs: model, inputs, return_outputs (False), num_items_in_batch.
+        # Outputs: loss, or (loss, None) when return_outputs.
+        # Exceptions: from _compute_loss. Side effects: metrics; collective gathers; profiling record.
         # transformers computes `num_items_in_batch` from the raw dataloader labels, before on-policy generation
         # replaces the completions; use the count over the generated completions instead (computed in
         # `_generate_and_score_completions`). Divide by the process count so the per-process loss compensates for DDP
@@ -1816,6 +2031,19 @@ class DistillationTrainer(_BaseTrainer):
         return (loss, None) if return_outputs else loss
 
     def _compute_loss(self, unwrapped_student, inputs, num_items_in_batch):
+        # [FUNCTION DOC]
+        # HELPER: Computes the chunked generalized JSD for one micro-batch.
+        # Behavior: concatenates prompt and completion ids/masks; loss mask = completion mask times tool_mask if present;
+        # logits_to_keep = completion length. Gets student hidden states and, without grad and in eval mode, teacher
+        # hidden states (through the teacher wrapper via _forward_redirection). Requires both lm_heads on the same device
+        # and moves hidden states/mask there. Logit scale per model from text config: logit_scale, else
+        # output_multiplier, else lm_head_multiplier, else logits_scaling (multiplied for hyperclovax, reciprocal
+        # otherwise), else 1.0; final_logit_softcapping read if present. Calls _chunked_divergence_loss with beta and
+        # temperature.
+        # Inputs: unwrapped_student, inputs (batch dict), num_items_in_batch.
+        # Outputs: tuple (loss, detached entropy sum, valid token count).
+        # Exceptions: ValueError when the lm_heads are on different devices; AttributeError if teacher_model is None.
+        # Side effects: sets the teacher to eval mode.
         # Chunked JSD path: project the teacher/student hidden states to vocab logits one chunk at a time (never
         # materializing the full `(B, C, V)` logits), so the teacher's dense distribution can be matched without
         # buffering it. Runs inside the student wrapper's forward (see `compute_loss`).
@@ -1922,6 +2150,11 @@ class DistillationTrainer(_BaseTrainer):
         return loss, entropy_sum.detach(), n_valid
 
     def training_step(self, model, inputs, num_items_in_batch):
+        # [FUNCTION DOC]
+        # Behavior: runs Trainer.training_step, increments _step, accumulates wall time and, at each completed
+        # accumulation window, appends it to _metrics["train"]["step_time"] and resets the accumulator.
+        # Inputs: model, inputs, num_items_in_batch. Outputs: Trainer's returned loss.
+        # Exceptions: from training. Side effects: counters and metrics.
         time_before = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
         self._step += 1
@@ -1935,6 +2168,11 @@ class DistillationTrainer(_BaseTrainer):
     # During eval, Trainer calls prediction_step. If no labels are present in the inputs, it only runs forward and
     # returns logits. We override prediction_step to force compute_loss, because this trainer doesn't involve labels.
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Behavior: prepares inputs (generating completions), computes the loss without grad under the loss context
+        # manager and returns the detached mean loss with no logits or labels.
+        # Inputs: model, inputs, prediction_loss_only (ignored), ignore_keys (ignored).
+        # Outputs: tuple (loss, None, None). Exceptions: from generation/loss. Side effects: generation metrics.
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
             with self.compute_loss_context_manager():
@@ -1943,6 +2181,15 @@ class DistillationTrainer(_BaseTrainer):
         return loss, None, None
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
+        # [FUNCTION DOC]
+        # Behavior: averages each metric in _metrics[mode] ignoring NaNs (None if no valid values), prefixes keys with
+        # "eval_" in eval mode, merges into logs, calls Trainer.log and clears metrics. On the main process with
+        # log_completions: prints a rich sample table (when rich is installed), writes a parquet of step/prompt/
+        # completion to output_dir/completions/completions_<step>.parquet, and logs a "completions" table to wandb (if
+        # reported and a run exists) and trackio, deduplicated by prompt when log_unique_prompts.
+        # Inputs: logs dict, start_time (optional). Outputs: none.
+        # Exceptions: I/O or logging backend errors.
+        # Side effects: external logging, file writes, clears metrics.
         mode = "train" if self.model.training else "eval"
         # Average the metrics
         metrics = {}
@@ -2003,6 +2250,11 @@ class DistillationTrainer(_BaseTrainer):
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
+        # [FUNCTION DOC]
+        # Behavior: creates the model card (model name from hub_model_id basename or output_dir name) before delegating
+        # to Trainer._save_checkpoint.
+        # Inputs: model, trial. Outputs: none. Exceptions: I/O errors.
+        # Side effects: writes README.md and checkpoint files.
         if self.args.hub_model_id is None:
             model_name = Path(self.args.output_dir).name
         else:

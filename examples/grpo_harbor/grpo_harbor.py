@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Example script: GRPO against a Harbor task suite using trl.experimental.harbor.HarborSpec, which supplies the
+# train dataset, environment factory and reward functions from one object. The agent harness is chosen with --agent
+# (built-in "bash" or an import/file path to a HarborEnv subclass) and the sandbox backend with --env.
+# Main contents: parse_args, main. Import-time side effects: none beyond imports.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +54,12 @@ from trl.experimental.harbor import HarborSpec
 
 
 def parse_args() -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Behavior: argparse for model (Qwen/Qwen3-4B), dataset (HF repo or local path with tasks/), agent, sandbox backend
+    # (stored as environment_type, default docker), number of tasks (64), learning rate, batch size, generations,
+    # completion length, max steps, max tool-calling iterations (25), vLLM mode/server URL/GPU memory fraction (0.3),
+    # output dir and comma-separated report_to (default "none").
+    # Inputs: command line. Outputs: Namespace. Exceptions: SystemExit on bad args. Side effects: may print usage.
     parser = argparse.ArgumentParser(description="GRPO training against a Harbor task suite.")
 
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B")
@@ -90,6 +102,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Behavior: builds a HarborSpec from dataset, agent, backend and task count; assembles GRPOConfig kwargs (thinking
+    # disabled, completion logging, vLLM always on, report_to parsed into a list excluding blanks and "none", falling
+    # back to "none"); adds output_dir if given, GPU memory fraction for colocate mode or server base URL for server mode;
+    # trains GRPOTrainer with the spec's dataset, environment factory and reward functions; calls trainer.end().
+    # Inputs: command line. Outputs: none. Exceptions: propagates Harbor/sandbox/training errors.
+    # Side effects: dataset download, sandbox creation, GPU training, logging, output files.
     args = parse_args()
 
     # One spec object — fans out into TRL's three slots.

@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Module trl.generation.vllm_client: HTTP + NCCL client for an external vLLM server started with vllm serve
+# (OpenAI-compatible endpoints plus the dev-mode weight-transfer endpoints).
+# Main contents: pil_to_base64 and to_openai_messages (image inlining), parse_logprobs (OpenAI logprob payloads
+# to nested lists), and VLLMClient (generation, chat, teacher sequence scoring, image feature rendering, and
+# weight synchronization from the trainer to the server over vLLM's NCCL weight-transfer engine).
+# Import-time side effects: imports requests/urllib3 and vLLM helpers when available; picks the weight-transfer
+# API by vLLM version (_HAS_STATEFUL_TRAINER_ENGINE for 0.28.0 and later, otherwise the static
+# NCCLWeightTransferEngine API) and records _HAS_RESET_PREFIX_CACHE_SUCCESS (0.26.0 and later); defines
+# _DEFAULT_GENERATION_CONCURRENCY (64) and a module logger. Running the file as a script performs an example
+# generate and weight update against a local server.
+
 # Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -63,6 +75,9 @@ logger = logging.getLogger(__name__)
 
 
 def pil_to_base64(image):
+    # [FUNCTION DOC]
+    # HELPER: Encode a PIL image as PNG and return the base64 string.
+    # Inputs: image (PIL.Image). Outputs: str. Exceptions: PIL save errors. Side effects: none.
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     img_bytes = buffer.getvalue()
@@ -70,6 +85,11 @@ def pil_to_base64(image):
 
 
 def to_openai_messages(messages: list[dict]) -> list[dict]:
+    # [FUNCTION DOC]
+    # HELPER: Deep-copy messages and replace content parts of type "image" or "image_pil" with OpenAI image_url
+    # parts holding a PNG data URL; string contents and other parts are untouched.
+    # Inputs: messages (list of dicts). Outputs: new list of messages.
+    # Exceptions: KeyError if a list-content part lacks "type". Side effects: none (input not mutated).
     """
     Convert TRL-style messages to the OpenAI format understood by the vLLM server, by inlining images as data URLs.
 
@@ -93,6 +113,17 @@ def to_openai_messages(messages: list[dict]) -> list[dict]:
 
 
 def parse_logprobs(choices_logprobs: list[dict | None]) -> tuple[list | None, list | None]:
+    # [FUNCTION DOC]
+    # Convert per-choice logprob payloads into nested lists of logprobs and token ids.
+    # Behavior: return (None, None) if the first choice has no logprobs. For chat-style payloads ("content" key)
+    # each position gives token, logprob and a top_logprobs list; for completion-style payloads zip tokens,
+    # token_logprobs and top_logprobs dicts. Per position merge the sampled token with the top entries (sampled
+    # token always included), sort by descending logprob, strip the "token_id:" prefix to get int ids, and map NaN
+    # logprobs to None.
+    # Inputs: choices_logprobs (list of dicts or None). Outputs: (logprobs, token_ids), each
+    # (num_sequences, seq_len, num_entries), or (None, None).
+    # Exceptions: KeyError/ValueError on malformed payloads; TypeError if later choices are None.
+    # Side effects: none.
     """
     Parse the logprobs of a batch of choices into two lists of shape (num_sequences, seq_len, num_logprobs).
 
@@ -137,6 +168,15 @@ def parse_logprobs(choices_logprobs: list[dict | None]) -> tuple[list | None, li
 
 
 class VLLMClient:
+    # [CLASS DOC]
+    # Client for a running vLLM server. State: session (requests.Session with a retrying HTTPAdapter: up to 5
+    # retries, status retries 3 on 500/502/503, backoff factor 2, GET and POST, pool size 64), host, base_url,
+    # server_port (only when base_url not given), group_port, communicator (NCCL group or None),
+    # _updating_weights flag, model (served model id from /v1/models).
+    # Flow: construction waits for /health; generate/chat/get_sequence_logprobs/image_features issue HTTP calls
+    # (concurrently via thread pools where the endpoint takes one item per request); init_communicator joins the
+    # server's NCCL group as rank 0; update_named_params / update_model_params / weight_update stream weights;
+    # reset_prefix_cache and close_communicator handle cleanup.
     """
     A client class to interact with a vLLM server.
 
@@ -210,6 +250,17 @@ class VLLMClient:
         group_port: int = 51216,
         connection_timeout: float = 0.0,
     ):
+        # [FUNCTION DOC]
+        # Behavior: require requests and vLLM. Build the retrying session. With base_url, parse it (host from the
+        # hostname, default scheme http, keep netloc and path); otherwise base_url is http://host:server_port. Store
+        # group_port, set communicator None and _updating_weights False, wait for the server with check_server
+        # (connection_timeout), and fetch the first model id from /v1/models.
+        # Inputs: base_url (optional), host (default "0.0.0.0"), server_port (8000), group_port (51216),
+        # connection_timeout (0.0 seconds).
+        # Outputs: none.
+        # Exceptions: ImportError for missing deps; ConnectionError when the server is unreachable; Exception on
+        # non-200 model listing.
+        # Side effects: network requests; logging.
         if not is_requests_available():
             raise ImportError("requests is not installed. Please install it with `pip install requests`.")
         if not is_vllm_available():
@@ -253,18 +304,34 @@ class VLLMClient:
         self.model = self._get(f"{self.base_url}/v1/models")["data"][0]["id"]
 
     def _get(self, url: str, **kwargs) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: GET url through the session; raise a generic Exception with status and body when status is not 200;
+        # return the parsed JSON. Inputs: url, kwargs for requests. Outputs: dict.
+        # Exceptions: Exception, requests errors. Side effects: network request.
         response = self.session.get(url, **kwargs)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
         return response.json()
 
     def _post(self, url: str, **kwargs) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: POST counterpart of _get with identical error handling. Inputs: url, kwargs. Outputs: dict.
+        # Exceptions: Exception, requests errors. Side effects: network request.
         response = self.session.post(url, **kwargs)
         if response.status_code != 200:
             raise Exception(f"Request failed: {response.status_code}, {response.text}")
         return response.json()
 
     def check_server(self, total_timeout: float = 0.0, retry_interval: float = 2.0):
+        # [FUNCTION DOC]
+        # Poll the /health endpoint until it answers 200.
+        # Behavior: loop: GET (plain requests, not the session). On a request exception, raise ConnectionError if the
+        # elapsed time reached total_timeout. On 200, adopt the X-Forwarded-For header as host if present, log and
+        # return. Otherwise log and sleep retry_interval before retrying.
+        # KNOWN ISSUE: the timeout is only checked when the request raises; if the server keeps answering with a
+        # non-200 status, the loop never times out.
+        # Inputs: total_timeout (default 0.0), retry_interval (default 2.0). Outputs: none.
+        # Exceptions: ConnectionError. Side effects: network requests, sleeps, may change self.host, logging.
         """
         Check server availability with retries on failure, within a total timeout duration. If the server is not up
         after the total timeout duration, raise a `ConnectionError`.
@@ -301,6 +368,11 @@ class VLLMClient:
             time.sleep(retry_interval)
 
     def get_server_info(self) -> dict:
+        # [FUNCTION DOC]
+        # Fetch /server_info with JSON config format and return its vllm_config entry.
+        # Inputs: none. Outputs: dict.
+        # Exceptions: RuntimeError on 404 (server not started with VLLM_SERVER_DEV_MODE=1); Exception on other non-200.
+        # Side effects: network request.
         """
         Returns the resolved configuration of the vLLM server, as reported by its `/server_info` endpoint.
 
@@ -318,6 +390,9 @@ class VLLMClient:
         return response.json()["vllm_config"]
 
     def get_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Return the world_size reported by /get_world_size (tensor parallel times data parallel workers).
+        # Inputs: none. Outputs: int. Exceptions: as _get. Side effects: network request.
         """
         Returns the number of workers of the vLLM server, i.e. `tensor_parallel_size * data_parallel_size`.
         """
@@ -326,6 +401,16 @@ class VLLMClient:
     def image_features(
         self, images: list[list | None], max_concurrent_requests: int = _DEFAULT_GENERATION_CONCURRENCY
     ) -> list[dict | None]:
+        # [FUNCTION DOC]
+        # Render images server-side into processed features usable by generate.
+        # Behavior: for each prompt, concurrently (thread pool of up to max_concurrent_requests) POST a single user
+        # message containing its images to /v1/chat/completions/render with max_tokens 1 and return the response's
+        # "features"; prompts without images yield None.
+        # Inputs: images (list of image lists or None), max_concurrent_requests (default 64).
+        # Outputs: list of feature dicts or None, aligned with images.
+        # Exceptions: RuntimeError on 404 (needs --enable-scale-out from vLLM 0.30.0); Exception on other errors;
+        # ValueError from ThreadPoolExecutor when images is empty (zero workers).
+        # Side effects: network requests.
         """
         Processes images server-side into the features that pair with token IDs in
         [`~generation.vllm_client.VLLMClient.generate`].
@@ -346,6 +431,9 @@ class VLLMClient:
         """
 
         def send(images_for_prompt):
+            # [FUNCTION DOC]
+            # HELPER: Render one prompt's images; returns None for an empty/None list, else the features from the server.
+            # Inputs: images_for_prompt. Outputs: dict or None. Exceptions: as image_features. Side effects: HTTP POST.
             if not images_for_prompt:
                 return None
             messages = [
@@ -382,6 +470,19 @@ class VLLMClient:
         structured_outputs_regex: str | None = None,
         generation_kwargs: dict | None = None,
     ) -> dict[str, list[list[int]]]:
+        # [FUNCTION DOC]
+        # Generate completions from text or token-id prompts.
+        # Behavior: build sampling params (n, repetition_penalty, temperature, top_p, top_k, min_p, max_tokens,
+        # logprobs, plus structured_outputs regex when given), then overlay generation_kwargs. If features are given,
+        # delegate to _generate_from_features. Otherwise POST one /v1/completions request with return_token_ids and
+        # return_tokens_as_token_ids enabled. Choices are prompt-major, so prompt ids are taken from every n-th choice;
+        # completion ids from every choice; logprobs parsed with parse_logprobs.
+        # Inputs: prompts, features (optional), sampling arguments (defaults n 1, repetition_penalty 1.0, temperature
+        # 1.0, top_p 1.0, top_k 0, min_p 0.0, max_tokens 16, logprobs 0), structured_outputs_regex,
+        # generation_kwargs.
+        # Outputs: dict with prompt_ids, completion_ids, logprobs, logprob_token_ids (the last two None when
+        # logprobs is None).
+        # Exceptions: Exception on non-200. Side effects: network request.
         """
         Generates model completions for the provided prompts.
 
@@ -472,12 +573,23 @@ class VLLMClient:
         sampling_params: dict,
         max_concurrent_requests: int = _DEFAULT_GENERATION_CONCURRENCY,
     ) -> dict[str, list[list[int]]]:
+        # [FUNCTION DOC]
+        # HELPER: Generate from token ids paired with multimodal features, one request per prompt.
+        # Behavior: force output_kind 2 (final-only) in the sampling params so all n sequences are returned; POST each
+        # prompt concurrently to /inference/v1/generate with a random request id, token ids, features and sampling
+        # params; flatten all choices, parse logprobs, and echo the prompts as prompt_ids.
+        # Inputs: prompts (token-id lists), features, sampling_params, max_concurrent_requests (64).
+        # Outputs: dict as in generate. Exceptions: Exception on non-200; ValueError for empty prompts.
+        # Side effects: network requests.
         """Generate from token IDs paired with multimodal features, one request per prompt."""
         # The server leaves the default output kind on non-streaming requests, under which it returns only the
         # sequences that finished last, silently dropping the others when n > 1. See vLLM PR #52399.
         sampling_params = {**sampling_params, "output_kind": 2}  # FINAL_ONLY
 
         def send(index):
+            # [FUNCTION DOC]
+            # HELPER: POST the generate request for the prompt at the given index and return the JSON response.
+            # Inputs: index (int). Outputs: dict. Exceptions: as _post. Side effects: HTTP POST.
             return self._post(
                 f"{self.base_url}/inference/v1/generate",
                 json={
@@ -519,6 +631,18 @@ class VLLMClient:
         chat_template: str | None = None,
         max_concurrent_requests: int = _DEFAULT_GENERATION_CONCURRENCY,
     ) -> dict[str, list[list[int]]]:
+        # [FUNCTION DOC]
+        # Generate completions for chat conversations (server renders the template; supports images).
+        # Behavior: build a chat payload with sampling settings, logprobs flag (logprobs not None) and top_logprobs,
+        # return_token_ids and return_tokens_as_token_ids. When tools are given, convert callables to JSON schemas and
+        # set tool_choice "none" (tool calls are parsed by the caller). Add chat_template, chat_template_kwargs and
+        # structured_outputs when given, then overlay generation_kwargs. POST each conversation concurrently to
+        # /v1/chat/completions with images inlined via to_openai_messages. prompt_ids come from each response,
+        # completion ids and parsed logprobs from all choices in order.
+        # Inputs: messages (list of conversations), sampling args as in generate, generation_kwargs,
+        # chat_template_kwargs, tools, chat_template, max_concurrent_requests (64).
+        # Outputs: dict with prompt_ids, completion_ids, logprobs, logprob_token_ids.
+        # Exceptions: Exception on non-200; ValueError for empty messages. Side effects: network requests.
         """
         Generates model completions for the provided chat messages.
 
@@ -605,6 +729,9 @@ class VLLMClient:
         payload.update(generation_kwargs or {})
 
         def send(conversation):
+            # [FUNCTION DOC]
+            # HELPER: POST one conversation (payload plus OpenAI-formatted messages) and return the JSON response.
+            # Inputs: conversation. Outputs: dict. Exceptions: as _post. Side effects: HTTP POST.
             return self._post(
                 f"{self.base_url}/v1/chat/completions", json={**payload, "messages": to_openai_messages(conversation)}
             )
@@ -632,6 +759,18 @@ class VLLMClient:
         chunk_size: int = 0,
         max_concurrent_requests: int = 4,
     ) -> dict[str, list]:
+        # [FUNCTION DOC]
+        # Score existing token sequences with the served model (teacher) without generating.
+        # Behavior: require temperature > 0. Split sequences and prompt lengths into chunks of chunk_size (whole batch
+        # when 0). For each chunk (concurrently, up to max_concurrent_requests) POST /v1/completions with max_tokens 1,
+        # the temperature and prompt_logprobs = top_logprobs, then format each choice with _format_sequence_logprobs.
+        # Merge per-sample results into a dict of lists.
+        # Inputs: sequences, prompt_lengths, top_logprobs (100), temperature (1.0), chunk_size (0),
+        # max_concurrent_requests (4).
+        # Outputs: dict with logprobs and logprob_token_ids (batch, completion_len, top_logprobs) and actual_logprobs
+        # and actual_token_ids (batch, completion_len, 1).
+        # Exceptions: ValueError for non-positive temperature or empty sequences; Exception on non-200.
+        # Side effects: network requests.
         """
         Computes teacher logprobs for existing token sequences without generating new tokens.
 
@@ -680,6 +819,9 @@ class VLLMClient:
         ]
 
         def send(chunk):
+            # [FUNCTION DOC]
+            # HELPER: Score one chunk and return the formatted per-sample results.
+            # Inputs: chunk (sequences, prompt lengths). Outputs: list of dicts. Exceptions: as _post. Side effects: HTTP.
             chunk_sequences, chunk_prompt_lengths = chunk
             payload = {
                 "model": self.model,
@@ -701,6 +843,14 @@ class VLLMClient:
 
     @staticmethod
     def _format_sequence_logprobs(choice: dict, sequence: list[int], prompt_length: int, top_logprobs: int) -> dict:
+        # [FUNCTION DOC]
+        # HELPER (staticmethod): Extract completion-region logprobs from a choice's prompt_logprobs.
+        # Behavior: for each position from prompt_length to the end of prompt_logprobs, take the position dict (empty
+        # if None), sort entries by rank and keep top_logprobs; NaN becomes negative infinity; pad values with negative
+        # infinity and ids with 0 to exactly top_logprobs. Actual logprob is the entry for the sequence's token at that
+        # position (negative infinity when missing or NaN), with its id.
+        # Inputs: choice dict, sequence, prompt_length, top_logprobs. Outputs: dict of four nested lists.
+        # Exceptions: none explicit. Side effects: none.
         """Slice the completion region out of a choice's prompt logprobs, sort it by rank and pad it to `top_logprobs`."""
         logprobs, logprob_token_ids, actual_logprobs, actual_token_ids = [], [], [], []
         for position in range(prompt_length, len(choice["prompt_logprobs"])):
@@ -724,6 +874,18 @@ class VLLMClient:
         }
 
     def init_communicator(self, device: torch.device | str | int = 0):
+        # [FUNCTION DOC]
+        # Join the server's NCCL weight-transfer group as rank 0.
+        # Behavior: raise if the server has no weight_transfer_config. World size is the server world size plus one;
+        # init info holds this host's IP, group_port, rank_offset 1 and world_size (plus packed True for the stateful
+        # engine). Resolve the device (int means cuda index); raise unless CUDA; set the current CUDA device when an
+        # index is given. Concurrently POST /init_weight_transfer_engine in a worker thread while creating the trainer
+        # endpoint (open_trainer_endpoint or NCCLWeightTransferEngine.trainer_init), then wait for the POST. Register
+        # close_communicator at exit.
+        # Inputs: device (torch.device, str or int; default 0). Outputs: none.
+        # Exceptions: RuntimeError (no weight-transfer engine or dev endpoints), NotImplementedError (non-CUDA),
+        # NCCL/HTTP errors.
+        # Side effects: sets self.communicator, changes the current CUDA device, registers an atexit hook, network.
         """
         Initializes the weight update group in a distributed setup for model synchronization.
 
@@ -778,6 +940,11 @@ class VLLMClient:
 
     @contextmanager
     def weight_update(self):
+        # [FUNCTION DOC]
+        # Context manager grouping several parameter updates into one server-side update: calls
+        # _start_weight_update, sets _updating_weights during the block, and in finally clears the flag and calls
+        # _finish_weight_update.
+        # Inputs: none. Outputs: yields None. Exceptions: HTTP errors. Side effects: server state transitions.
         """
         Groups several [`~generation.vllm_client.VLLMClient.update_named_param`] calls into a single weight update.
 
@@ -800,12 +967,21 @@ class VLLMClient:
             self._finish_weight_update()
 
     def _start_weight_update(self):
+        # [FUNCTION DOC]
+        # HELPER: POST /start_weight_update. Inputs/Outputs: none. Exceptions: as _post. Side effects: network.
         self._post(f"{self.base_url}/start_weight_update", json={})
 
     def _finish_weight_update(self):
+        # [FUNCTION DOC]
+        # HELPER: POST /finish_weight_update. Inputs/Outputs: none. Exceptions: as _post. Side effects: network.
         self._post(f"{self.base_url}/finish_weight_update", json={})
 
     def update_named_param(self, name: str, weights: torch.Tensor):
+        # [FUNCTION DOC]
+        # Send one named tensor to the server: build its (name, dtype without "torch." prefix, shape) metadata and call
+        # update_named_params with a one-item iterator.
+        # Inputs: name, weights (tensor). Outputs: none. Exceptions: as update_named_params.
+        # Side effects: updates server weights.
         """
         Updates a specific named parameter in the model and broadcasts it to other processes.
 
@@ -821,6 +997,16 @@ class VLLMClient:
     def update_named_params(
         self, metadata: list[tuple[str, str, list[int]]], named_params: Iterator[tuple[str, torch.Tensor]]
     ):
+        # [FUNCTION DOC]
+        # Stream a set of tensors to the server.
+        # Behavior: split metadata into names, dtype names and shapes for update_info (plus packed True for the old
+        # static engine). If not inside weight_update, start an update. In a worker thread POST /update_weights with
+        # the info while the main thread broadcasts tensors from rank 0 (packed_nccl_broadcast_producer for the
+        # stateful engine, else NCCLWeightTransferEngine.trainer_send_weights with packed True); wait for the POST.
+        # Finish the update if not inside weight_update.
+        # Inputs: metadata (list of (name, dtype, shape)), named_params (iterator of (name, tensor) in the same order).
+        # Outputs: none. Exceptions: HTTP/NCCL errors; ValueError when metadata is empty.
+        # Side effects: NCCL broadcast and server weight changes.
         """
         Updates the model weights of the server, by streaming them over the weight update group.
 
@@ -859,6 +1045,9 @@ class VLLMClient:
             self._finish_weight_update()
 
     def update_model_params(self, model: nn.Module):
+        # [FUNCTION DOC]
+        # Send every named parameter of a model: build metadata from named_parameters and stream their data.
+        # Inputs: model (nn.Module). Outputs: none. Exceptions: as update_named_params. Side effects: as above.
         """
         Updates all parameters of the given model.
 
@@ -873,6 +1062,10 @@ class VLLMClient:
         self.update_named_params(metadata, ((name, param.data) for name, param in model.named_parameters()))
 
     def reset_prefix_cache(self):
+        # [FUNCTION DOC]
+        # POST /reset_prefix_cache; for vLLM 0.26.0 and later via _post (JSON body expected), otherwise a raw POST
+        # that only checks for status 200 (older servers return an empty body).
+        # Inputs: none. Outputs: none. Exceptions: Exception on non-200. Side effects: clears the server prefix cache.
         """
         Resets the prefix cache for the model.
         """
@@ -884,6 +1077,11 @@ class VLLMClient:
                 raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
     def close_communicator(self):
+        # [FUNCTION DOC]
+        # Drop the NCCL group: when a communicator exists, clear its group's store and socket references and set
+        # communicator to None. Idempotent.
+        # Inputs: none. Outputs: none. Exceptions: AttributeError if the communicator has no group attribute.
+        # Side effects: releases the connection the server waits on.
         """
         Closes the weight update group and cleans up the communication group.
         """
